@@ -1,0 +1,92 @@
+{
+  "972547778005": {
+    "preferences": {
+      "status": "active",
+      "Work_Days": [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday"
+      ],
+      "Morning_Summary_Time": "09:00",
+      "Evening_Summary_Time": "19:00",
+      "Enable_Morning": true,
+      "Enable_Evening": true,
+      "TimeZone": "Asia/Jerusalem",
+      "Calendar_Enabled": true,
+      "Enable_Weekly_Reflection": false,
+      "Calendar_Type": "",
+      "Last_Sync": "",
+      "Holiday_Dates": [],
+      "token_file": "data\\tokens_972547778005.json.enc",
+      "email": "",
+      "Work_Start_Time": "09:00",
+      "Work_End_Time": "18:00",
+      "Preferred_Session_Length": "60m",
+      "Notification_Lead_Time": "15m",
+      "last_morning_trigger_date": "2025-04-24",
+      "last_evening_trigger_date": "2025-04-23"
+    }
+  },
+  "1234": {
+    "preferences": {
+      "status": "active",
+      "Work_Days": [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday"
+      ],
+      "Morning_Summary_Time": null,
+      "Evening_Summary_Time": null,
+      "Enable_Morning": true,
+      "Enable_Evening": true,
+      "TimeZone": "Asia/Tel_Aviv",
+      "Calendar_Enabled": true,
+      "Enable_Weekly_Reflection": false,
+      "Calendar_Type": "",
+      "Last_Sync": "",
+      "Holiday_Dates": [],
+      "token_file": "data\\tokens_1234.json.enc",
+      "Work_Start_Time": "09:00",
+      "Work_End_Time": "18:00",
+      "Preferred_Session_Length": "60m",
+      "email": "",
+      "Notification_Lead_Time": "15m",
+      "last_morning_trigger_date": "",
+      "last_evening_trigger_date": ""
+    }
+  },
+  "12345": {
+    "preferences": {
+      "status": "active",
+      "Work_Days": [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday"
+      ],
+      "Morning_Summary_Time": null,
+      "Evening_Summary_Time": null,
+      "Enable_Morning": true,
+      "Enable_Evening": true,
+      "TimeZone": "Asia/Jerusalem",
+      "Calendar_Enabled": true,
+      "Enable_Weekly_Reflection": false,
+      "Calendar_Type": "",
+      "Last_Sync": "",
+      "Holiday_Dates": [],
+      "token_file": "data\\tokens_12345.json.enc",
+      "Work_Start_Time": "09:00",
+      "Work_End_Time": "18:00",
+      "Preferred_Session_Length": "60m",
+      "email": "",
+      "Notification_Lead_Time": "15m",
+      "last_morning_trigger_date": "",
+      "last_evening_trigger_date": ""
+    }
+  }
+}

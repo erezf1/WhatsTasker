@@ -1,0 +1,118 @@
+﻿# --- START OF FILE WhatsTasker_SRS_08.txt ---
+﻿WhatsTasker: SRS (v0.8k - WhatsApp Bridge & Active Scheduler)
+
+**1. Goals & Principles**
+
+*   **Primary Goal:** Create a WhatsApp-based personal productivity assistant that acts as an intelligent Time Management Expert. It should understand user context, facilitate task/schedule management via natural language, and integrate seamlessly with the user's primary calendar (Google Calendar initially).
+*   **Core Architecture:**
+    *   **Interface Layer:** User interaction occurs via WhatsApp. An external **Node.js bridge (`wa_bridge.js`)** utilizes `whatsapp-web.js` to connect to WhatsApp, receive messages, and send messages. This bridge communicates with the Python backend via a dedicated FastAPI interface (`bridge/whatsapp_interface.py`). An alternative CLI interface (`bridge/cli_interface.py`) exists for debugging/testing. The active interface is selected at runtime (via `main.py` using environment variables or command-line args).
+    *   **Backend Entry Point:** The selected FastAPI interface (`whatsapp_interface.py` or `cli_interface.py`) receives incoming messages.
+    *   **Routing Layer (`request_router.py`):** Receives messages from the active bridge API, normalizes user ID, determines user status (`new`, `onboarding`, `active`), and routes requests to the appropriate Agent or Cheat command handler.
+    *   **Agent Layer (`OnboardingAgent`, `OrchestratorAgent`):** Central reasoning hubs using a **Pure LLM Control Flow**. Process user input within context, leverage Structured Tool Use (Instructor/Pydantic) to delegate actions to Tools. Manage conversational state and response generation based on LLM decisions and tool results.
+    *   **Tool Layer (`tool_definitions.py`):** Defines Pydantic models for tool parameters and Python functions that act as validated interfaces to the Service Layer.
+    *   **Service Layer (`TaskManager`, `TaskQueryService`, `ConfigManager`, `RoutineService`, `NotificationService`, `SyncService`, `Cheats`):** Encapsulates business logic, data manipulation, and interactions with persistent stores and external APIs (GCal). Invoked by Tools or scheduled jobs. `SyncService` provides read-only context merging.
+    *   **Scheduler (`scheduler_service.py`):** An APScheduler instance runs background jobs (`RoutineService` checks, `NotificationService` checks, daily cleanup) at configured intervals.
+    *   **Pure LLM Control Flow:** Agents rely **entirely on the LLM** (guided by specific system prompts) to manage conversational state, ask clarifying questions, interpret user replies, decide which tool to call (if any), and formulate responses based on history and tool results. Python code primarily executes validated tool calls requested by the LLM.
+    *   **Two-Step LLM Interaction (with Tools):** Standard pattern used by Agents when a tool is invoked (LLM plans -> Tool executes -> LLM responds based on result).
+*   **Modularity & Reusability:** Components are clearly separated. Services contain reusable business logic. Tools provide reliable interfaces.
+*   **Reliability & Maintainability:** Prioritize reliable execution via structured Tool Use and Pydantic validation. Code includes type hinting and clear documentation. Conversational logic resides primarily within the LLM prompts. `whatsapp-web.js` dependency introduces external volatility.
+*   **LLM Interaction:** Utilizes OpenAI's Tool Use capabilities via Instructor/Pydantic. `propose_task_slots` tool uses a focused LLM sub-call.
+*   **Data Handling & State:**
+    *   Persistence: Metadata Store (CSV/DB), User Registry (JSON/DB), Encrypted Token Store.
+    *   User Status: Tracked via `status` in preferences (`new`, `onboarding`, `active`), managed by `user_registry.py` and `config_manager.py`. Dictates routing in `request_router.py`.
+    *   Runtime State: Central, thread-safe `AgentStateManager` manages in-memory state (preferences, history, task context snapshot, API clients, notification tracking). Loaded/created via `user_manager.py`.
+    *   Context Provision: Relevant context loaded via `AgentStateManager` and provided to the appropriate Agent. Routines use `SyncService` for context.
+    *   State Updates: Services update persistent stores and signal updates to in-memory state via `AgentStateManager`.
+    *   Synchronization: `SyncService` merges GCal/WT data for context snapshots; no persistent merge implemented yet.
+*   **Error Handling:** Tools/Services return status/messages. Pydantic validates tool parameters. Agents interpret tool failures via LLM. Bridge interface handles basic connection/ACK errors.
+
+**2. Architecture Overview**
+
+1.  **External Bridge (`wa_bridge.js`):**
+    *   Connects to WhatsApp using `whatsapp-web.js`.
+    *   On receiving a WA message: Sends `POST` to Python backend's `/incoming` endpoint (`whatsapp_interface.py`).
+    *   Periodically polls Python backend's `/outgoing` endpoint using `GET`.
+    *   On receiving messages from `/outgoing`: Sends them to users via WA. Sends `POST` to Python backend's `/ack` endpoint for each successfully sent message.
+2.  **Interface Layer (Python - `whatsapp_interface.py` or `cli_interface.py`):**
+    *   Selected interface runs via Uvicorn/FastAPI (controlled by `main.py`).
+    *   `/incoming`: Receives message from bridge/client -> Calls `request_router.handle_incoming_message` -> Returns immediate `{"ack": true}`.
+    *   `/outgoing`: Returns list of messages currently in the outgoing queue (managed by the active Bridge class instance set via `request_router.set_bridge`) **without** removing them.
+    *   `/ack`: Receives `message_id` -> Finds and removes the corresponding message from the outgoing queue.
+3.  **Routing Layer (`request_router.py`):**
+    *   Receives message details from the active interface API (`/incoming`).
+    *   Normalizes `user_id`, ensures user state exists (`user_manager.get_agent`).
+    *   Retrieves user status (`new`, `onboarding`, `active`).
+    *   Routes based on status: Welcome message (`new`), `OnboardingAgent` (`onboarding`), `OrchestratorAgent` (`active`), or `Cheats` service (`/` commands).
+4.  **Agent Layer (`onboarding_agent.py` or `orchestrator_agent.py`):**
+    *   Receives user message and context snapshot. Loads system prompt. Defines available Tools.
+    *   **LLM Call 1 (Planner):** Sends context, history, message, tools to LLM.
+    *   LLM decides: Respond directly or call tool(s).
+5.  **Execution Layer:**
+    *   **If LLM Responds Directly:** Agent uses text.
+    *   **If LLM Calls Tool(s):**
+        *   Agent receives tool call request(s). Validates. Calls corresponding Tool function (`tool_definitions.py`).
+        *   Tool interacts with **Service Layer**.
+        *   Services perform logic, interact with **Data Layer** and external APIs. Update persistent data & signal memory state updates via `AgentStateManager`.
+        *   Tool returns result dict (`{"success": bool, ...}`).
+6.  **Agent Layer (Response Generation):**
+    *   **If LLM Responded Directly:** Use that text.
+    *   **If Tool(s) Called:**
+        *   Agent prepares messages for **LLM Call 2 (Responder)**, including original messages, assistant's tool call(s), and `role: "tool"` message(s) with result(s).
+        *   Agent sends messages to LLM.
+        *   LLM generates final text response based on tool result(s) and instructions.
+7.  **Response Flow:** Agent returns response string -> Router calls `send_message` (from the active Bridge class instance) -> Bridge class adds message with ID to its outgoing queue -> User (via external bridge polling `/outgoing` and sending).
+8.  **Scheduled Tasks (`scheduler_service.py`):**
+    *   Runs independently via APScheduler.
+    *   Triggers jobs in `NotificationService` (check events) and `RoutineService` (check triggers, daily cleanup).
+    *   Triggered routines (`check_routine_triggers`) get context via `SyncService`, generate messages, and return them to the scheduler wrapper.
+    *   Scheduler wrapper calls `request_router.send_message` to queue generated routine messages for sending via the active Bridge.
+
+*Diagram:* (The high-level diagram concept remains similar, but the Interface Layer now explicitly involves the external `wa_bridge.js` communicating with `whatsapp_interface.py` via polling/ACK, which then feeds into the `request_router`.)
+
+**3. Module & Function Breakdown**
+
+*   **External Components:**
+    *   `wa_bridge.js`: Node.js script using `whatsapp-web.js` to interface with WhatsApp and communicate with the Python backend API.
+*   **Core Infrastructure:**
+    *   `main.py`: **Updated** - Selects bridge interface (`cli` or `whatsapp`) based on ENV/args, starts Uvicorn with the correct app path, initializes agents, starts scheduler.
+    *   `bridge/whatsapp_interface.py`: **NEW** - FastAPI app providing `/incoming`, `/outgoing`, `/ack` endpoints for `wa_bridge.js`. Uses `WhatsAppBridge` class for queuing. Includes `calendar_router` for OAuth.
+    *   `bridge/cli_interface.py`: **Updated** - Alternative FastAPI app for CLI mock testing. Uses `CLIBridge` class.
+    *   `bridge/request_router.py`: **Updated** - Receives messages from the active bridge API. Handles routing based on user status (`new`, `onboarding`, `active`), cheat codes. Uses `set_bridge` to configure the active message queuing class (`WhatsAppBridge` or `CLIBridge`).
+    *   `tools/logger.py`, `tools/encryption.py`, `tools/token_store.py`, `tools/metadata_store.py`, `tools/google_calendar_api.py`, `tools/calendar_tool.py`: Core utilities and specific API/data interactions.
+    *   `users/user_registry.py`, `users/user_manager.py`: User profile and in-memory state management.
+    *   `services/agent_state_manager.py`: Central management of the in-memory `_AGENT_STATE_STORE`.
+*   **Service Layer:**
+    *   `services/task_manager.py`: Core task/reminder/session logic.
+    *   `services/config_manager.py`: User configuration logic.
+    *   `services/task_query_service.py`: Data retrieval and formatting logic.
+    *   `services/cheats.py`: Handles cheat code commands.
+    *   `services/llm_interface.py`: Initializes Instructor-patched OpenAI client.
+    *   `services/sync_service.py`: **Active** - Provides merged context snapshots (WT meta + GCal events) for read-only use.
+    *   `services/scheduler_service.py`: **Active** - Manages APScheduler, schedules jobs.
+    *   `services/notification_service.py`: **Active** - Logic for checking and formatting event notifications. Triggered by scheduler.
+    *   `services/routine_service.py`: **Active** - Logic for checking routine triggers (morning/evening) and generating summaries. Includes daily cleanup. Triggered by scheduler.
+*   **Agent Layer:**
+    *   `agents/orchestrator_agent.py`: Central reasoning hub for **active** users (Pure LLM flow).
+    *   `agents/onboarding_agent.py`: Central reasoning hub for **onboarding** users (Pure LLM flow).
+    *   `agents/tool_definitions.py`: Pydantic models and Python functions for the toolset, interfacing with services.
+*   **(Obsolete Files):** `agents/intention_agent.py`, `agents/task_agent.py`, `agents/config_agent.py`, `agents/scheduler_agent.py`, `agents/scheduling_logic.py`, `agents/list_reply_logic.py`, `langchain_chains/*`.
+
+**4. Configuration Files**
+
+*   `config/prompts.yaml`: Contains system prompts for Orchestrator, Onboarding, and Session Scheduler sub-LLM. Critical for system behavior.
+*   `config/messages.yaml`: Standard user-facing messages.
+*   `.env`: Secrets (API keys, client IDs/secrets, encryption key), `BRIDGE_TYPE` (optional).
+
+**5. Key Considerations / Future Work**
+
+*   **Prompt Engineering:** Success heavily relies on prompt quality for the Pure LLM flow. Continuous refinement needed.
+*   **LLM Reliability:** Dependence on LLM for state/flow management might be less robust than explicit state machines for complex interactions. Requires thorough testing.
+*   **WhatsApp Bridge Stability:** `whatsapp-web.js` is unofficial and can break with WhatsApp updates. Requires monitoring and potential library updates or alternative solutions (official API).
+*   **Deployment Complexity:** Requires running both the Python backend (FastAPI/Uvicorn) and the Node.js bridge process. Containerization (e.g., Docker Compose) recommended for managing this.
+*   **Error Handling:** Ensure robust error handling between the Node.js bridge and Python backend (connection issues, timeouts, ACK failures).
+*   **Security:** Secure the communication between the bridge and backend if deployed separately. Ensure API keys and tokens are handled securely.
+*   **Scalability:** Polling mechanism in the bridge might not be the most scalable approach for very high message volumes (WebSockets could be an alternative if needed later).
+*   **Synchronization (`SyncService`):** Current implementation is read-only merge. Full two-way sync is deferred but important long-term.
+*   **Testing:** Requires end-to-end testing involving the actual WhatsApp interface, testing LLM prompt adherence, tool execution, scheduled jobs, and the bridge communication.
+
+# --- END OF FILE WhatsTasker_SRS_08.txt ---

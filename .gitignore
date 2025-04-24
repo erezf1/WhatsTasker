@@ -1,0 +1,53 @@
+# Virtual Environment
+venv/
+*/venv/
+.venv/
+env/
+*/env/
+ENV/
+*/ENV/
+env.bak/
+venv.bak/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE specific folders/files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Secrets and Sensitive Data !!! IMPORTANT !!!
+.env
+*.env.*
+!*.env.example
+data/tokens_*.json.enc
+# If your user registry contains sensitive info (it shouldn't, but just in case)
+# data/users/registry.json # Uncomment if needed, but better to keep non-sensitive registry tracked
+
+# Logs
+logs/
+*.log
+
+# Node.js bridge specifics (if wa_bridge.js is in the root)
+node_modules/
+package-lock.json # Often ignored, but can be useful to track exact dependencies
+# *.pid
+# *.seed
+# *.log.[0-9]*.[0-9]*
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# Other build/dist artifacts if any
+dist/
+build/
+*.egg-info/
+
+# WhatsApp Web JS session data (CRITICAL TO IGNORE)
+.wwebjs_auth/
+.wwebjs_cache/

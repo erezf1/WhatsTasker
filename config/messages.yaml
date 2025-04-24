@@ -1,0 +1,24 @@
+# config/messages.yaml
+
+# --- Add these ---
+welcome_confirmation_message: |
+  Hello! 👋 Ready to take control of your time and focus? Welcome to WhatsTasker!
+  Imagine having a personal Time Management Expert right here in WhatsApp, helping you:
+  🧠 **Capture Everything Instantly:** Just text me your tasks and reminders like you normally would – "remind me about the team sync at 10", "add task finish the report by Friday, takes about 3 hours". No more switching apps!
+  📅 **Stay Aligned with Your Calendar:** I connect directly to your Google Calendar, ensuring your tasks and scheduled work time fit seamlessly into your day.
+  ⏱️ **Beat Procrastination:** Need focused time for important tasks? I can find empty slots in your calendar and block out dedicated work sessions for you.
+  ☀️ **Start Strong, End Clear:** Get ahead with helpful morning check-ins and wrap up your day effectively with quick evening reviews to ensure nothing falls through the cracks (coming soon!).
+  Think of me as your partner in productivity, helping you plan better, focus deeply, and get more done with less stress.
+  Ready to unlock WhatsTasker? 
+
+setup_starting_message: "Great! Let's set things up. I'll ask a few questions to configure your preferences."
+setup_declined_message: "Okay, no problem. Just message me again whenever you're ready to set things up!"
+ask_confirmation_again_message: "Sorry, I didn't quite understand that. Are you ready to start the setup process? (yes/no)"
+user_registered_already_message: "Welcome back! How can I help you today?" # Optional: For returning users found by get_agent
+
+# --- Keep existing messages ---
+generic_error_message: "Sorry, an unexpected error occurred. Please try again."
+intent_parse_error_message: "Sorry, I had trouble understanding the structure of that request."
+intent_unknown_message: "Sorry, I'm not sure how to help with that. You can ask me to add tasks, list tasks, or change settings."
+intent_clarify_message: "Sorry, I didn't quite understand that. Could you please rephrase?"
+# ... add any other messages you have ...

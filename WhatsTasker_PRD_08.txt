@@ -1,0 +1,65 @@
+﻿WhatsTasker: Product Requirements (v0.8 - Orchestrator Focused)
+🧭 Overview
+WhatsTasker is a personal productivity assistant designed for individuals seeking to manage their tasks, improve focus, and reduce procrastination through a conversational interface. Accessed via WhatsApp, it functions as an intelligent Time Management Expert, integrating directly with the user's primary calendar (initially Google Calendar) and utilizing an internal metadata store for enhanced tracking. WhatsTasker aims to streamline daily planning, facilitate frictionless task capture, and support helpful routines.
+🌟 Core System Goal
+The system shall act as a proactive and intelligent Time Management Expert. It must understand user context (history, preferences, schedule, tasks), interpret requests accurately, facilitate effective task and schedule management, and anticipate user needs where feasible within the defined scope, moving beyond simple command execution.
+🔑 Core Functional Requirements
+1. Multi-User Support & Identification:
+   * Uniquely identify users via their WhatsApp phone number (user_id).
+   * Maintain consistent user_id linkage across all system components.
+2. Calendar-Based Task & Reminder Management:
+   * Direct Calendar Integration: Synchronize confirmed tasks and scheduled events with the user's designated primary calendar (initially Google Calendar).
+   * Metadata Augmentation: Maintain an internal metadata store linked to calendar events/internal IDs to track additional details crucial for system operation (e.g., item status [pending, in progress, completed, cancelled], type [task, reminder], estimated effort, project tags, timestamps).
+3. Natural Language Interaction (via WhatsApp):
+   * Conversational Interface: Enable users to interact using free-form, natural language commands and requests.
+   * Contextual Understanding: Maintain and utilize conversational context (recent history, user state) to understand follow-up questions, resolve ambiguities, and provide relevant, coherent responses.
+4. User Capabilities & Outcomes:
+   * Onboarding: Guide new users through an initial setup process to configure essential preferences (e.g., work parameters, calendar connection authorization) and activate their account.
+   * Task/Reminder Capture & Classification:
+      * Allow users to efficiently capture intentions (tasks, reminders) via natural language.
+      * Intelligently distinguish between simple Reminders (typically requiring only description and time) and effortful Tasks (implying duration/effort and eligibility for scheduling work sessions).
+      * Reliably extract key details: description, due date/time, type (task or reminder), and estimated effort (for tasks).
+   *    * Task Modification: Enable users to accurately modify details of existing tasks or reminders (e.g., description, due date/time, status, estimated effort) based on their requests.
+   * Task & Reminder Status Updates: Allow users to easily update the status of items (e.g., mark as completed, pending), including handling interactive replies to system-generated lists.
+   * Task & Reminder Viewing & Filtering: Enable users to view their items (tasks and reminders), with options to filter by relevant criteria such as date range, status (active, completed, etc.), or an associated project tag/label.
+   * Clarification Handling: Intelligently request clarification from the user when input is ambiguous, incomplete, or conflicts with existing information, guiding the user towards providing necessary details.
+   * Task Scheduling Assistance (for Type: task only):
+      * Proactively offer to find and schedule dedicated work time in the calendar for newly created Tasks (unless scheduling was part of the initial request).
+      * Upon user request, propose suitable, potentially distributed, time slots for Tasks requiring work sessions, considering task requirements, user preferences, and calendar availability.
+      * Allow users to easily confirm and book proposed work session slots into their calendar.
+5. Automated Routines & Summaries:
+   * Morning Check-in: Provide a concise overview of the user's upcoming day, including scheduled calendar events, due tasks, and reminders. Goal: Enhance daily awareness and readiness.
+   * Evening Review: Facilitate a quick end-of-day review:
+      * Present Tasks and Reminders scheduled for or due that day.
+      * Allow users to easily update the completion status of these items.
+      * For Tasks identified as incomplete, prompt the user (optionally asking for a reason) and proactively offer to reschedule the task or its remaining work, potentially suggesting new time slots. Goal: Prevent tasks from being dropped and adapt planning.
+   * 6. Fallback Operation:
+   * Support basic task and reminder management (capture, status updates, viewing lists) even without calendar integration. Smart scheduling proposals, calendar-based summaries, and rescheduling offers will be unavailable in this mode.
+💡 Future Capabilities (Beyond Initial Scope)
+* Advanced Scheduling Intelligence (Optimal times, breaks, conflict handling)
+* Proactive Time Management Advice & Goal Tracking
+* Weekly Reflection Module (Structured prompts, insight storage)
+* Recurring Tasks/Reminders Support
+* Advanced Daily Planning Assistance ("Just One Thing", backlog suggestions)
+* Timed Pre-Event Notifications (Requires external scheduler)
+* Shared/Team Task Collaboration Features
+* Expanded Calendar Integrations (Outlook, etc.)
+* User Subscription Tiers & Monetization
+⚠️ MVP Scope & Limitations (Initial Release)
+* Calendar: Integration only with Google Calendar; one active calendar per user.
+* Task Types: No built-in support for recurring tasks/reminders.
+* Collaboration: No shared tasks or team features.
+* Proactivity: Limited to offering scheduling for new tasks and rescheduling incomplete tasks in the evening review. No broader unsolicited advice.
+* Notifications: Timed pre-event notifications are out of scope.
+* Reflection: Weekly reflection module is out of scope.
+* Monetization: No user plans or payments.
+✅ Acceptance Criteria (High-Level)
+* Users can successfully onboard, configure preferences, and connect their Google Calendar.
+* The system correctly distinguishes between Tasks and Reminders based on user input.
+* Users can reliably create, view (with date/status/project filters), update, and mark tasks/reminders as complete via natural language.
+* The system proactively offers scheduling for newly created Tasks.
+* The system can propose schedule slots for Tasks based on calendar availability and preferences, and book confirmed slots.
+* The system provides functional Morning Check-in and Evening Review summaries.
+* The Evening Review correctly identifies incomplete Tasks and offers rescheduling options.
+* The system handles clarifications when user input is ambiguous.
+* Basic reminder functionality works without calendar integration.

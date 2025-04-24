@@ -1,0 +1,36 @@
+# --- START OF FILE requirements.txt ---
+# Web Framework & Server
+fastapi>=0.110.0,<0.112.0
+uvicorn[standard]>=0.29.0,<0.30.0
+
+# Langchain Core & OpenAI Integration
+langchain>=0.1.16,<0.2.0
+langchain-core>=0.1.40,<0.2.0
+langchain-openai>=0.1.3,<0.2.0
+
+# Google API Libraries
+google-api-python-client>=2.120.0,<3.0.0
+google-auth-oauthlib>=1.2.0,<2.0.0
+google-auth>=2.29.0,<3.0.0
+
+# Configuration & Environment
+python-dotenv>=1.0.1,<2.0.0
+PyYAML>=6.0.1,<7.0.0
+
+# Utilities
+requests>=2.31.0,<3.0.0
+pytz>=2024.1
+cryptography>=42.0.0,<43.0.0
+PyJWT>=2.8.0,<3.0.0
+
+# Pydantic (Core dependency for FastAPI & Langchain)
+pydantic>=2.7.0,<3.0.0
+
+# --- ADDED FOR SCHEDULING ---
+APScheduler>=3.10.0,<4.0.0
+# --------------------------
+
+# Optional: If using pandas checks (e.g., pd.isna) - uncomment if needed
+# pandas>=2.0.0,<3.0.0
+
+# --- END OF FILE requirements.txt ---

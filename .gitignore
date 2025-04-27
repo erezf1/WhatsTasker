@@ -51,3 +51,11 @@ build/
 # WhatsApp Web JS session data (CRITICAL TO IGNORE)
 .wwebjs_auth/
 .wwebjs_cache/
+
+# Data files
+data/events_metadata.csv
+data/*.db
+data/*.db-journal
+data/*.db-shm
+data/*.db-wal
+data/tokens_*.json.enc # Keep this one

@@ -8,6 +8,18 @@ import traceback
 from tools.logger import log_info, log_error, log_warning
 from users.user_registry import get_registry, register_user, get_user_preferences
 
+# --- Database Import ---
+try:
+    import tools.activity_db as activity_db
+    DB_IMPORTED = True
+    log_info("user_manager", "import", "Successfully imported activity_db.")
+except ImportError:
+    DB_IMPORTED = False
+    class activity_db:
+        @staticmethod
+        def list_tasks_for_user(*args, **kwargs): return []
+    log_error("user_manager", "import", "activity_db not found. Task preloading disabled.")
+
 # --- State Manager Import ---
 try:
     from services.agent_state_manager import (
@@ -19,7 +31,6 @@ try:
 except ImportError:
      log_error("user_manager", "import", "AgentStateManager not found.")
      AGENT_STATE_MANAGER_IMPORTED = False
-     # Fallback local dictionary (not recommended for production)
      _user_agents_in_memory: Dict[str, Dict[str, Any]] = {}
      def register_agent_instance(uid, state): _user_agents_in_memory[uid] = state
      def get_agent_state(uid): return _user_agents_in_memory.get(uid)
@@ -31,40 +42,41 @@ try:
     GCAL_API_IMPORTED = True
 except ImportError:
     GCAL_API_IMPORTED = False
-    GoogleCalendarAPI = None # Define as None if import fails
+    GoogleCalendarAPI = None
     log_warning("user_manager","import", "GoogleCalendarAPI not found.")
-try:
-    from tools.metadata_store import list_metadata
-    METADATA_STORE_IMPORTED = True
-    log_info("user_manager", "import", "Successfully imported metadata_store.")
-except ImportError:
-    METADATA_STORE_IMPORTED = False
-    def list_metadata(*args, **kwargs): return [] # Dummy function if import fails
-    log_error("user_manager", "import", "metadata_store not found.")
 
+# --- Token Store Import (NEEDED FOR CHECK) ---
+try:
+    from tools.token_store import get_user_token
+    TOKEN_STORE_IMPORTED = True
+except ImportError:
+     TOKEN_STORE_IMPORTED = False
+     log_error("user_manager", "import", "Failed to import token_store.get_user_token. GCalAPI check will fail.")
+     def get_user_token(*args, **kwargs): return None
+# ---------------------------------------------
 
 # --- In-Memory State Dictionary Reference ---
 _user_agents_in_memory: Dict[str, Dict[str, Any]] = {}
 if AGENT_STATE_MANAGER_IMPORTED:
-    # Initialize the state store via the manager
     initialize_state_store(_user_agents_in_memory)
 
 
 # --- Preload Context ---
-def _preload_initial_context(user_id: str) -> list:
-    """Loads initial context ONLY from the metadata store during startup."""
+def _preload_initial_context(user_id: str) -> list[dict]:
+    """Loads initial context (all tasks) for a user from the SQLite database."""
     fn_name = "_preload_initial_context"
-    log_info("user_manager", fn_name, f"Preloading initial context for {user_id} from metadata store.")
-    if not METADATA_STORE_IMPORTED:
-        log_error("user_manager", fn_name, "Metadata store not imported. Cannot preload context.")
+    log_info("user_manager", fn_name, f"Preloading initial context for {user_id} from activity_db.")
+
+    if not DB_IMPORTED:
+        log_error("user_manager", fn_name, "Database module not imported. Cannot preload context.")
         return []
+
     try:
-        # Fetch metadata without date filters initially
-        metadata_list = list_metadata(user_id=user_id)
-        log_info("user_manager", fn_name, f"Preloaded {len(metadata_list)} items from metadata store for {user_id}.")
-        return metadata_list
+        task_list = activity_db.list_tasks_for_user(user_id=user_id)
+        log_info("user_manager", fn_name, f"Preloaded {len(task_list)} tasks from DB for {user_id}.")
+        return task_list
     except Exception as e:
-        log_error("user_manager", fn_name, f"Error preloading context for {user_id} from metadata", e)
+        log_error("user_manager", fn_name, f"Error preloading context for {user_id} from DB", e, user_id=user_id)
         return []
 
 
@@ -85,52 +97,50 @@ def create_and_register_agent_state(user_id: str): # REMOVED TYPE HINT
         return None
 
     # --- Refined GCal Initialization ---
-    calendar_api_instance = None # Default to None
-    if GCAL_API_IMPORTED and GoogleCalendarAPI is not None and preferences.get("Calendar_Enabled"):
-        token_file = preferences.get("token_file")
-        if token_file and os.path.exists(token_file):
-            log_info("user_manager", fn_name, f"Attempting GCalAPI init for {norm_user_id}")
-            temp_cal_api = None # Initialize temporary variable
+    calendar_api_instance = None
+    # Check if GCal enabled in prefs AND necessary libraries/functions are loaded
+    if preferences.get("Calendar_Enabled") and GCAL_API_IMPORTED and GoogleCalendarAPI is not None and TOKEN_STORE_IMPORTED:
+        # --- MODIFIED CHECK: Try loading token data ---
+        token_data = get_user_token(norm_user_id)
+        if token_data is not None:
+            # --- END MODIFIED CHECK ---
+            log_info("user_manager", fn_name, f"Valid token data found for {norm_user_id}. Attempting GCalAPI init.")
+            temp_cal_api = None
             try:
-                # Step 1: Create the instance (this calls __init__ which loads creds and builds service)
                 temp_cal_api = GoogleCalendarAPI(norm_user_id)
-                # Step 2: Explicitly check if it's active *after* __init__ completes
                 if temp_cal_api.is_active():
-                    calendar_api_instance = temp_cal_api # Assign the created instance
+                    calendar_api_instance = temp_cal_api
                     log_info("user_manager", fn_name, f"GCalAPI initialized and active for {norm_user_id}")
                 else:
-                    # This case means __init__ completed but self.service was None or is_active() returned False
                     log_warning("user_manager", fn_name, f"GCalAPI initialized but NOT active for {norm_user_id}. Calendar features disabled.")
                     calendar_api_instance = None
             except Exception as cal_e:
-                 # *** ADDED TRACEBACK LOGGING ***
                  tb_str = traceback.format_exc()
                  log_error("user_manager", fn_name, f"Exception during GCalAPI initialization or is_active() check for {norm_user_id}. Traceback:\n{tb_str}", cal_e)
-                 # *******************************
-                 calendar_api_instance = None # Ensure None on any exception
+                 calendar_api_instance = None
         else:
-            if preferences.get("Calendar_Enabled"):
-                 log_warning("user_manager", fn_name, f"GCal enabled for {norm_user_id} but token file missing/invalid path: {token_file}")
-    elif not GCAL_API_IMPORTED:
-         log_warning("user_manager", fn_name, f"GoogleCalendarAPI library not imported, skipping calendar init for {norm_user_id}.")
+            # Token data not found (logged by get_user_token)
+            log_warning("user_manager", fn_name, f"GCal enabled for {norm_user_id} but no valid token data found via token_store.")
     elif not preferences.get("Calendar_Enabled"):
          log_info("user_manager", fn_name, f"Calendar not enabled for {norm_user_id}, skipping GCal init.")
+    # Log if libs were the issue
+    elif not GCAL_API_IMPORTED:
+         log_warning("user_manager", fn_name, f"GoogleCalendarAPI library not imported, skipping calendar init for {norm_user_id}.")
+    elif not TOKEN_STORE_IMPORTED:
+         log_warning("user_manager", fn_name, f"token_store not imported, skipping calendar init for {norm_user_id}.")
     # --- End Refined GCal Initialization ---
 
-    # Preload initial task context
     initial_context = _preload_initial_context(norm_user_id)
 
-    # Assemble the full agent state dictionary
     agent_state = {
         "user_id": norm_user_id,
         "preferences": preferences,
         "active_tasks_context": initial_context,
-        "calendar": calendar_api_instance, # Store the final instance (or None)
+        "calendar": calendar_api_instance,
         "conversation_history": [],
         "notified_event_ids_today": set()
     }
 
-    # Register state using AgentStateManager
     try:
         register_agent_instance(norm_user_id, agent_state)
         log_info("user_manager", fn_name, f"Successfully registered agent state for {norm_user_id}")
@@ -155,7 +165,6 @@ def init_all_agents():
 
     log_info("user_manager", fn_name, f"Found {len(registered_users)} users. Initializing...")
     for user_id in registered_users:
-        # Normalize ID just in case registry contains non-normalized ones
         norm_user_id = re.sub(r'\D', '', user_id)
         if not norm_user_id:
              log_warning("user_manager", fn_name, f"Skipping invalid user_id found in registry: '{user_id}'")
@@ -166,7 +175,6 @@ def init_all_agents():
             if created_state:
                 initialized_count += 1
             else:
-                # Error already logged by create_and_register_agent_state
                 failed_count += 1
         except Exception as e:
             log_error("user_manager", fn_name, f"Unexpected error initializing agent state for user {norm_user_id}", e)
@@ -186,14 +194,13 @@ def get_agent(user_id: str) -> Optional[Dict]:
 
     agent_state = None
     try:
-        # Use state manager function (or local fallback)
         agent_state = get_agent_state(norm_user_id)
         if not agent_state:
             log_warning("user_manager", fn_name, f"State for {norm_user_id} not in memory. Creating now.")
             agent_state = create_and_register_agent_state(norm_user_id)
     except Exception as e:
          log_error("user_manager", fn_name, f"Error retrieving/creating agent state for {norm_user_id}", e)
-         agent_state = None # Ensure None is returned on error
+         agent_state = None
 
     return agent_state
 

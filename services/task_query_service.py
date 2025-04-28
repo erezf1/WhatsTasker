@@ -1,23 +1,37 @@
-# --- START OF FILE services/task_query_service.py ---
-"""Service layer for querying and formatting task/reminder data."""
-from datetime import datetime, timedelta
+# --- START OF REFACTORED services/task_query_service.py ---
+"""Service layer for querying and formatting task/reminder data from the database."""
+from datetime import datetime, timedelta, timezone # Added timezone
 import json
-from typing import Dict, List, Any, Optional, Set, Tuple # Added Set/Tuple
+from typing import Dict, List, Any, Set, Tuple # Keep required types
 import pytz
-from tools.logger import log_info, log_error, log_warning
-from tools import metadata_store
+import traceback # Keep for detailed error logging
 
-# Agent State Manager Import
+from tools.logger import log_info, log_error, log_warning
+# Import the database utility module
 try:
-    from services.agent_state_manager import get_context, get_agent_state
+    import tools.activity_db as activity_db
+    DB_IMPORTED = True
+except ImportError:
+    log_error("task_query_service", "import", "activity_db not found. Task querying disabled.", None)
+    DB_IMPORTED = False
+    # Dummy DB functions
+    class activity_db:
+        @staticmethod
+        def list_tasks_for_user(*args, **kwargs): return []
+        @staticmethod
+        def get_task(*args, **kwargs): return None
+    # Consider halting application if DB is critical
+
+# Agent State Manager Import (still needed for preferences/calendar API instance)
+try:
+    from services.agent_state_manager import get_agent_state
     AGENT_STATE_MANAGER_IMPORTED = True
 except ImportError:
     log_error("task_query_service", "import", "AgentStateManager not found.")
     AGENT_STATE_MANAGER_IMPORTED = False
-    def get_context(*args, **kwargs): return None
-    def get_agent_state(*args, **kwargs): return None
+    def get_agent_state(*args, **kwargs): return None # Dummy function
 
-# Google Calendar API Import
+# Google Calendar API Import (needed for checking type and formatting sessions)
 try:
     from tools.google_calendar_api import GoogleCalendarAPI
     GCAL_API_IMPORTED = True
@@ -26,374 +40,342 @@ except ImportError:
      GoogleCalendarAPI = None
      GCAL_API_IMPORTED = False
 
-ACTIVE_STATUSES = {"pending", "in_progress"}
+# Define active statuses consistently
+ACTIVE_STATUSES = ["pending", "in_progress"] # Use list for DB query IN clause
 
 # --- Internal Helper Functions ---
 
+# Keep this function as it retrieves the API instance needed for _format_task_line
 def _get_calendar_api_from_state(user_id):
     """Helper to retrieve the active calendar API instance from agent state."""
-    fn_name = "_get_calendar_api_from_state" # Added fn_name
-    if not AGENT_STATE_MANAGER_IMPORTED or not GCAL_API_IMPORTED: return None
+    fn_name = "_get_calendar_api_from_state"
+    if not AGENT_STATE_MANAGER_IMPORTED or not GCAL_API_IMPORTED or GoogleCalendarAPI is None:
+        return None
     try:
-        agent_state = get_agent_state(user_id)
-        if agent_state:
+        agent_state = get_agent_state(user_id) # Returns dict or None
+        if agent_state is not None:
             calendar_api_maybe = agent_state.get("calendar")
             if isinstance(calendar_api_maybe, GoogleCalendarAPI) and calendar_api_maybe.is_active():
-                return calendar_api_maybe
+                return calendar_api_maybe # Return active instance
     except Exception as e:
-         log_error("task_query_service", fn_name, f"Error getting calendar API for {user_id}", e) # Use fn_name
-    return None
+         log_error("task_query_service", fn_name, f"Error getting calendar API for {user_id}", e, user_id=user_id)
+    return None # Return None if not found, not active, or error
 
-def _filter_tasks_by_status(task_list, status_filter='active'):
-    """Filters task list by status."""
-    fn_name = "_filter_tasks_by_status" # Added fn_name
-    filter_lower = status_filter.lower()
-    if filter_lower == 'all': return task_list
-    target_statuses = set()
-    if filter_lower == 'active': target_statuses = ACTIVE_STATUSES
-    elif filter_lower == 'completed': target_statuses = {"completed"}
-    elif filter_lower == 'pending': target_statuses = {"pending"}
-    elif filter_lower == 'in_progress': target_statuses = {"in_progress", "inprogress"} # Allow both variants
-    else:
-        log_warning("task_query_service", fn_name, f"Unknown status filter '{status_filter}'. Defaulting 'active'."); # Use fn_name
-        target_statuses = ACTIVE_STATUSES
-    return [task for task in task_list if str(task.get("status", "pending")).lower() in target_statuses]
-
-def _filter_tasks_by_date_range(task_list, date_range):
-    """Filters task list by 'date' field."""
-    fn_name = "_filter_tasks_by_date_range" # Added fn_name
-    if not date_range or len(date_range) != 2:
-        log_warning("task_query_service", fn_name, f"Invalid date_range provided: {date_range}. Skipping filter.")
-        return task_list
-    try:
-        start_date = datetime.strptime(date_range[0], "%Y-%m-%d").date()
-        end_date = datetime.strptime(date_range[1], "%Y-%m-%d").date()
-        filtered = []
-        for task in task_list:
-            task_date_str = task.get("date")
-            if task_date_str and isinstance(task_date_str, str):
-                try:
-                    task_date = datetime.strptime(task_date_str, "%Y-%m-%d").date()
-                    if start_date <= task_date <= end_date: filtered.append(task)
-                except (ValueError, TypeError): pass # Skip tasks with unparseable dates silently
-        return filtered
-    except Exception as e:
-        log_error("task_query_service", fn_name, f"Error filtering by date range {date_range}: {e}", e); # Use fn_name
-        return [] # Return empty list on error
-
-def _filter_tasks_by_project(task_list, project_filter):
-    """Filters task list by project tag (case-insensitive)."""
-    if not project_filter: return task_list
-    filter_lower = project_filter.lower()
-    return [task for task in task_list if task.get("project") is not None and str(task.get("project", "")).lower() == filter_lower]
-
-def _sort_tasks(task_list):
+# Keep sorting logic, operates on list of dictionaries
+def _sort_tasks(task_list: List[Dict]) -> List[Dict]:
     """Sorts task list robustly by date/time."""
-    fn_name = "_sort_tasks" # Added fn_name
+    # (Sorting logic remains the same as previous version - operates on dicts)
+    fn_name = "_sort_tasks"
     def sort_key(item):
-        # Use gcal_start_datetime if available and valid, otherwise fallback
         gcal_start = item.get("gcal_start_datetime")
         if gcal_start and isinstance(gcal_start, str):
              try:
-                 dt_aware = datetime.fromisoformat(gcal_start.replace('Z', '+00:00'))
-                 return dt_aware.replace(tzinfo=None) # Compare naive UTC equivalent
+                 if 'T' in gcal_start: # Datetime format
+                      dt_aware = datetime.fromisoformat(gcal_start.replace('Z', '+00:00'))
+                      return dt_aware.replace(tzinfo=None) # Compare naive UTC equivalent
+                 elif len(gcal_start) == 10: # Date format (all-day)
+                      dt_date = datetime.strptime(gcal_start, '%Y-%m-%d').date()
+                      # Sort all-day events as start of the day
+                      return datetime.combine(dt_date, datetime.min.time())
              except ValueError:
-                  log_warning("task_query_service", f"{fn_name}.sort_key", f"Could not parse gcal_start_datetime '{gcal_start}' for {item.get('event_id')}. Falling back.")
+                  pass # Fallback to metadata if parse fails
 
-        # Fallback logic using date/time
+        # Fallback logic using metadata date/time
         meta_date_str = item.get("date")
         meta_time_str = item.get("time")
         sort_dt = datetime.max # Default to max for sorting unknowns last
 
         if meta_date_str:
             try:
-                time_part = meta_time_str if meta_time_str else "00:00:00"
-                if len(time_part.split(':')) == 2: time_part += ':00'
-                if len(meta_date_str) == 10 and len(time_part) == 8:
-                     sort_dt = datetime.strptime(f"{meta_date_str} {time_part}", "%Y-%m-%d %H:%M:%S")
-                elif len(meta_date_str) == 10: # All day if only date
-                     sort_dt = datetime.strptime(meta_date_str, "%Y-%m-%d")
-                else:
-                     log_warning("task_query_service", f"{fn_name}.sort_key", f"Invalid date/time format for {item.get('event_id')}: D='{meta_date_str}' T='{meta_time_str}'.")
+                if meta_time_str: # Timed item
+                    time_part = meta_time_str
+                    if len(time_part.split(':')) == 2: time_part += ':00' # Add seconds if missing
+                    sort_dt = datetime.strptime(f"{meta_date_str} {time_part}", "%Y-%m-%d %H:%M:%S")
+                else: # All day item based on metadata date
+                    sort_dt = datetime.strptime(meta_date_str, "%Y-%m-%d")
             except (ValueError, TypeError):
-                 log_warning("task_query_service", f"{fn_name}.sort_key", f"Could not parse date/time for {item.get('event_id')}: D='{meta_date_str}' T='{meta_time_str}'.")
+                 # Log warning? Maybe too verbose for sorting fallback
+                 pass # Use default max time
         return sort_dt
 
     try:
-        # Sort primarily by datetime, secondarily by creation time, finally by title
+        # Sort primarily by datetime, secondarily by creation time (if available), finally by title
         return sorted(task_list, key=lambda item: (sort_key(item), item.get("created_at", ""), item.get("title", "").lower()))
     except Exception as e:
         log_error("task_query_service", fn_name, f"Error during task sorting: {e}", e)
         return task_list # Return unsorted list on error
 
-def _format_task_line(task_data, user_timezone_str="UTC", calendar_api=None): # Added calendar_api param
-    """
-    Formats a single task/event dictionary into a display string, converting
-    aware datetimes to the user's timezone. For tasks, it fetches and lists
-    details of scheduled work sessions from Google Calendar if available.
-
-    Args:
-        task_data (dict): Dictionary containing item data.
-        user_timezone_str (str): The user's Olson timezone string. Defaults to 'UTC'.
-        calendar_api (GoogleCalendarAPI | None): Active GCal API instance for the user.
-
-    Returns:
-        str: A formatted string representation of the item.
-    """
+# Keep formatting logic, operates on list of dictionaries
+# Ensure it correctly handles data types from DB (e.g., sessions_planned is INT)
+# And decodes session_event_ids if needed (activity_db functions handle this now)
+def _format_task_line(task_data: Dict, user_timezone_str: str = "UTC", calendar_api = None) -> str:
+    """Formats a single task/event dictionary into a display string."""
     fn_name = "_format_task_line"
     try:
         # Determine User Timezone Object
         user_tz = pytz.utc
         try:
             if user_timezone_str: user_tz = pytz.timezone(user_timezone_str)
-        except pytz.UnknownTimeZoneError:
-            log_warning("task_query_service", fn_name, f"Unknown timezone '{user_timezone_str}'. Using UTC for formatting item {task_data.get('event_id')}.")
-            user_timezone_str = "UTC"
+        except pytz.UnknownTimeZoneError: user_timezone_str = "UTC"
 
-        # --- Assemble Main Line Parts ---
+        # --- Assemble Main Line Parts (Largely same logic as before) ---
         parts = []
-        item_type = str(task_data.get("type", "Item")).capitalize()
-        if item_type.lower() == "external_event": item_type = "Event"
-        elif item_type.lower() == "task": item_type = "Task"
-        elif item_type.lower() == "reminder": item_type = "Reminder"
+        item_type_raw = task_data.get("type", "Item")
+        item_type = str(item_type_raw).capitalize()
+        if item_type_raw == "external_event": item_type = "Event" # Handle external events from sync
         parts.append(f"({item_type})")
-
-        desc = str(task_data.get("title", "")).strip() or str(task_data.get("description", "")).strip() or "(No Title)"
+        desc = str(task_data.get("title", "")).strip() or "(No Title)"
         parts.append(desc)
-
-        if item_type.lower() == "task":
+        if item_type_raw == "task":
             duration = task_data.get("estimated_duration")
-            is_empty_like = duration is None or (isinstance(duration, str) and duration.strip().lower() in ['', 'none', 'nan'])
-            if duration and not is_empty_like:
+            # Check for various empty-like values
+            if duration and not str(duration).strip().lower() in ['', 'none', 'nan', 'null']:
                 parts.append(f"[Est: {duration}]")
 
-        gcal_start_str = task_data.get("gcal_start_datetime")
-        meta_date = task_data.get("date")
-        meta_time = task_data.get("time")
+        # Date/Time Formatting (Prioritize GCal, fallback to metadata)
+        gcal_start_str = task_data.get("gcal_start_datetime"); meta_date = task_data.get("date"); meta_time = task_data.get("time")
         dt_str = ""
-
         if gcal_start_str:
-             try:
-                 dt_aware = datetime.fromisoformat(gcal_start_str.replace('Z', '+00:00'))
-                 dt_local = dt_aware.astimezone(user_tz)
-                 formatted_dt = dt_local.strftime('%Y-%m-%d @ %H:%M %Z')
-                 dt_str = f" on {formatted_dt}"
-             except (ValueError, TypeError) as parse_err:
-                 log_warning("task_query_service", fn_name, f"Could not parse/convert gcal_start_datetime '{gcal_start_str}' for {task_data.get('event_id')}. Error: {parse_err}. Falling back.")
-                 dt_str = f" (Time Error: {gcal_start_str})"
-        elif meta_date:
+             try: # Format GCal time
+                 if 'T' in gcal_start_str: # Datetime
+                      dt_aware = datetime.fromisoformat(gcal_start_str.replace('Z', '+00:00'))
+                      dt_local = dt_aware.astimezone(user_tz)
+                      # Use a clear format like: Tue, Apr 25 @ 10:00 EDT
+                      formatted_dt = dt_local.strftime('%a, %b %d @ %H:%M %Z')
+                      dt_str = f" on {formatted_dt}"
+                 elif len(gcal_start_str) == 10: # Date (All day)
+                      dt_local = datetime.strptime(gcal_start_str, '%Y-%m-%d').date()
+                      formatted_dt = dt_local.strftime('%a, %b %d (All day)')
+                      dt_str = f" on {formatted_dt}"
+             except Exception as fmt_err:
+                  log_warning("task_query_service", fn_name, f"Could not format gcal_start '{gcal_start_str}': {fmt_err}")
+                  dt_str = f" (Time Error: {gcal_start_str})" # Show raw on error
+        elif meta_date: # Fallback to metadata date/time
              dt_str = f" on {meta_date}"
              if meta_time: dt_str += f" at {meta_time}"
              else: dt_str += " (All day)"
-
         if dt_str: parts.append(dt_str)
 
-        project = task_data.get("project")
+        project = task_data.get("project"); status = task_data.get("status")
         if project: parts.append(f"{{{project}}}")
-
-        if item_type.lower() in ["task", "reminder"]:
-            status = str(task_data.get("status", "pending")).capitalize()
-            parts.append(f"[{status}]")
+        if item_type_raw in ["task", "reminder"] and status:
+             parts.append(f"[{str(status).capitalize()}]")
 
         main_line = " ".join(p for p in parts if p)
 
-        # --- ADDED: Fetch and Display Scheduled Session Details ---
+        # --- Display Scheduled Session Details ---
         session_details_lines = []
-        # Check type is Task, calendar_api is valid, and session_event_ids exists
-        if item_type.lower() == "task" and calendar_api and task_data.get("session_event_ids"):
-            sessions_json = task_data.get("session_event_ids")
-            if isinstance(sessions_json, str): # Ensure it's a string before trying to parse
-                session_ids = []
+        # session_event_ids should be a list from the DB access layer now
+        session_ids = task_data.get("session_event_ids")
+        if item_type_raw == "task" and calendar_api is not None and isinstance(session_ids, list) and session_ids:
+            session_details_lines.append("    └── Scheduled Sessions:")
+            session_num = 0
+            for session_id in session_ids:
+                if not isinstance(session_id, str) or not session_id.strip(): continue # Skip invalid IDs
                 try:
-                    session_ids = json.loads(sessions_json)
-                    if not isinstance(session_ids, list): session_ids = [] # Ensure it parsed to a list
-                except json.JSONDecodeError:
-                    log_warning("task_query_service", fn_name, f"Could not parse session_event_ids JSON for task {task_data.get('event_id')}: {sessions_json}")
-                    session_details_lines.append("    └── (Error reading session data)")
-                except Exception as e: # Catch unexpected parsing errors
-                    log_error("task_query_service", fn_name, f"Unexpected error parsing session JSON for task {task_data.get('event_id')}: {e}", e)
-                    session_details_lines.append("    └── (Error reading session data)")
-
-                if session_ids:
-                    session_details_lines.append("    └── Scheduled Sessions:") # Header for sessions
-                    session_num = 0
-                    for session_id in session_ids:
-                        # Ensure session_id is a non-empty string before proceeding
-                        if not isinstance(session_id, str) or not session_id.strip():
-                            log_warning("task_query_service", fn_name, f"Skipping invalid session ID: {session_id} for task {task_data.get('event_id')}")
-                            continue
-
-                        try:
-                            # Fetch session details from GCal
-                            session_event_data = calendar_api._get_single_event(session_id) # Use internal getter
-                            if session_event_data:
-                                session_num += 1
-                                parsed_session = calendar_api._parse_google_event(session_event_data) # Parse it
-                                session_start_str = parsed_session.get("gcal_start_datetime")
-                                session_end_str = parsed_session.get("gcal_end_datetime")
-                                session_time_info = "(Error parsing time)" # Default
-
-                                # Attempt to parse and format times
-                                if session_start_str and session_end_str:
-                                    try:
-                                        s_aware = datetime.fromisoformat(session_start_str.replace('Z', '+00:00'))
-                                        e_aware = datetime.fromisoformat(session_end_str.replace('Z', '+00:00'))
-                                        s_local = s_aware.astimezone(user_tz)
-                                        e_local = e_aware.astimezone(user_tz)
-                                        # Format: Date - Start HH:MM to End HH:MM (TZ)
-                                        session_time_info = s_local.strftime('%Y-%m-%d %H:%M') + e_local.strftime('-%H:%M %Z')
-                                    except (ValueError, TypeError):
-                                         log_warning("task_query_service", fn_name, f"Error parsing session time for {session_id}")
-                                         session_time_info = f"{session_start_str} to {session_end_str} (parse error)"
-
-                                # Add line for this session (further indented)
-                                session_details_lines.append(f"        {session_num}) {session_time_info} (ID: {session_id})")
-                            else:
-                                log_warning("task_query_service", fn_name, f"Could not fetch details for session ID {session_id}")
-                                # Optionally add a line indicating it wasn't found
-                                # session_details_lines.append(f"        - Session ID {session_id} not found in calendar.")
-                        except Exception as fetch_err:
-                            log_error("task_query_service", fn_name, f"Error fetching/processing session {session_id}", fetch_err)
-                            session_details_lines.append(f"        - Error fetching session ID {session_id}")
-
-                    # Only keep the header if actual sessions were found/processed
-                    if session_num == 0 and session_details_lines and "Scheduled Sessions:" in session_details_lines[0]:
-                         session_details_lines.pop(0) # Remove header if no sessions listed below it
-        # --- END OF ADDED SECTION ---
+                    session_event_data = calendar_api._get_single_event(session_id) # Returns dict or None
+                    if session_event_data:
+                        session_num += 1
+                        parsed_session = calendar_api._parse_google_event(session_event_data) # Returns dict
+                        s_start = parsed_session.get("gcal_start_datetime")
+                        s_end = parsed_session.get("gcal_end_datetime")
+                        s_info = "(Time Error)" # Default
+                        if s_start and s_end:
+                            try:
+                                s_aware = datetime.fromisoformat(s_start.replace('Z', '+00:00'))
+                                e_aware = datetime.fromisoformat(s_end.replace('Z', '+00:00'))
+                                s_local, e_local = s_aware.astimezone(user_tz), e_aware.astimezone(user_tz)
+                                # Format: YYYY-MM-DD HH:MM-HH:MM TZN
+                                s_info = s_local.strftime('%Y-%m-%d %H:%M') + e_local.strftime('-%H:%M %Z')
+                            except Exception as parse_err:
+                                log_warning("task_query_service", fn_name, f"Could not parse session times {s_start}-{s_end}: {parse_err}")
+                                s_info = f"{s_start} to {s_end} (parse error)"
+                        session_details_lines.append(f"        {session_num}) {s_info} (ID: {session_id})")
+                    # else: log_warning(f"Session ID {session_id} not found in GCal") # Optional: log if GCal event missing
+                except Exception as fetch_err:
+                    log_error("task_query_service", fn_name, f"Error fetching/processing session {session_id}", fetch_err, user_id=task_data.get("user_id"))
+                    session_details_lines.append(f"        - Error fetching session ID {session_id}")
+            # Remove header if no actual sessions were listed
+            if session_num == 0 and session_details_lines:
+                 session_details_lines.pop(0)
 
         # Combine main line and session details
         return main_line + ("\n" + "\n".join(session_details_lines) if session_details_lines else "")
 
     except Exception as e:
-        # Adding traceback here can help debug formatting errors
-        import traceback
-        log_error("task_query_service", fn_name, f"General error formatting item line {task_data.get('event_id')}. Error: {e}\n{traceback.format_exc()}", e)
+        # Log error with user context if available
+        user_ctx = task_data.get("user_id", "Unknown")
+        log_error("task_query_service", fn_name, f"General error formatting item line {task_data.get('event_id')}. Error: {e}\n{traceback.format_exc()}", e, user_id=user_ctx)
         return f"Error displaying item: {task_data.get('event_id', 'Unknown ID')}"
+
 
 # --- Public Service Functions ---
 
-def get_formatted_list(user_id, date_range=None, status_filter='active', project_filter=None, trigger_sync=False): # Removed type hints
+# Returns Tuple[str, Dict]
+def get_formatted_list(
+    user_id: str,
+    date_range: Tuple[str, str] | None = None,
+    status_filter: str = 'active', # Provide default
+    project_filter: str | None = None,
+    trigger_sync: bool = False # Keep trigger_sync param, though sync isn't fully implemented
+) -> Tuple[str, Dict]:
     """
-    Gets tasks, filters, sorts, formats into numbered list string & mapping.
-    Includes fetching and displaying details for scheduled task sessions.
+    Gets tasks from DB, filters (optional), sorts, formats into numbered list string & mapping.
+    Includes fetching and displaying details for scheduled task sessions if GCal is active.
     """
     fn_name = "get_formatted_list"
+    if not DB_IMPORTED:
+        log_error("task_query_service", fn_name, "Database module unavailable.", user_id=user_id)
+        return "Error: Could not access task data.", {}
+
     log_info("task_query_service", fn_name, f"Executing for user={user_id}, Status={status_filter}, Range={date_range}, Proj={project_filter}")
 
     if trigger_sync:
-        log_info("task_query_service", fn_name, "Sync triggered (NYI).")
+        log_info("task_query_service", fn_name, "Sync triggered (Not Implemented Yet).", user_id=user_id)
+        # Future: Call sync_service.perform_full_sync(user_id) here?
 
+    # Determine status list for DB query
+    query_status_list = None
+    filter_lower = status_filter.lower().replace(" ", "") if status_filter else 'active' # Default if None
+    if filter_lower == 'active': query_status_list = ACTIVE_STATUSES
+    elif filter_lower == 'completed': query_status_list = ["completed"]
+    elif filter_lower == 'pending': query_status_list = ["pending"]
+    elif filter_lower == 'in_progress': query_status_list = ["in_progress"]
+    elif filter_lower == 'all': query_status_list = None # No status filter for DB
+    else:
+        log_warning("task_query_service", fn_name, f"Unknown status filter '{status_filter}'. Defaulting 'active'.", user_id=user_id)
+        query_status_list = ACTIVE_STATUSES
+
+    log_info("task_query_service", fn_name, f"Querying DB for user={user_id}, Status={query_status_list}, Range={date_range}, Proj={project_filter}")
+
+    # Fetch data from DB, applying filters available in the DB function
     task_list = []
-    calendar_api = None
-    user_tz_str = "UTC" # Default timezone
-
     try:
-        # Get task context from agent state
-        task_list = get_context(user_id) or []
-
-        # Get Calendar API instance (needed for session details)
-        calendar_api = _get_calendar_api_from_state(user_id)
-        if not calendar_api:
-            log_info("task_query_service", fn_name, f"Calendar API not active for {user_id}, session details will not be fetched for list.")
-
-        # Get user timezone from preferences
-        agent_state = get_agent_state(user_id) # Fetch state once
-        prefs = agent_state.get("preferences", {}) if agent_state else {}
-        user_tz_str = prefs.get("TimeZone", "UTC") # Use default if not set
-
+        task_list = activity_db.list_tasks_for_user(
+            user_id=user_id,
+            status_filter=query_status_list, # Pass list of statuses or None
+            date_range=date_range,         # Pass tuple or None
+            project_filter=project_filter  # Pass string or None
+        )
+        log_info("task_query_service", fn_name, f"Fetched {len(task_list)} tasks from DB for {user_id} with filters.")
     except Exception as e:
-        log_error("task_query_service", fn_name, f"Error getting context/prefs for {user_id}", e)
-        # Continue with potentially empty task_list and no calendar_api
+        log_error("task_query_service", fn_name, f"Error fetching tasks from DB for {user_id}", e, user_id=user_id)
+        return "Error retrieving tasks.", {}
 
-    # Apply filters (no changes needed here)
-    filtered_s = _filter_tasks_by_status(task_list, status_filter)
-    filtered_d = filtered_s
-    if date_range:
-        filtered_d = _filter_tasks_by_date_range(filtered_s, date_range)
-    final_tasks = filtered_d
-    if project_filter:
-        final_tasks = _filter_tasks_by_project(filtered_d, project_filter)
+    # No need for python filtering now as DB function handles it
 
-    if not final_tasks:
-        log_info("task_query_service", fn_name, f"No tasks match criteria for {user_id}.")
-        return "", {}
+    if not task_list:
+        log_info("task_query_service", fn_name, f"No tasks found matching criteria for {user_id} after DB query.")
+        return "", {} # Return empty string and dict if no tasks found
 
-    # Sort tasks (no changes needed here)
-    sorted_tasks = _sort_tasks(final_tasks)
+    # Get Calendar API and User Timezone for formatting
+    calendar_api = _get_calendar_api_from_state(user_id)
+    user_tz_str = "UTC"
+    if AGENT_STATE_MANAGER_IMPORTED:
+        agent_state = get_agent_state(user_id)
+        prefs = agent_state.get("preferences", {}) if agent_state else {}
+        user_tz_str = prefs.get("TimeZone", "UTC")
+
+    # Sort tasks
+    sorted_tasks = _sort_tasks(task_list)
 
     # Format lines and build mapping
     lines, mapping = [], {}
     item_num = 0
     for task in sorted_tasks:
         item_id = task.get("event_id")
-        if not item_id:
-            log_warning("task_query_service", fn_name, f"Skipping item missing event_id: {task.get('title')}")
-            continue
+        if not item_id: continue # Skip items missing id
 
         item_num += 1
-        # Pass API instance and timezone to formatting function
         formatted_line = _format_task_line(task, user_tz_str, calendar_api)
         lines.append(f"{item_num}. {formatted_line}")
-        mapping[str(item_num)] = item_id # Use string key for mapping
+        mapping[str(item_num)] = item_id # Use string key
 
-    if item_num == 0:
-        # This case should be rare now unless _format_task_line errors out for all items
-        log_warning("task_query_service", fn_name, f"Formatting resulted in zero list items for {user_id}.")
-        return "Error formatting list.", {}
+    if item_num == 0: # Should only happen if formatting fails for all items
+        log_warning("task_query_service", fn_name, f"Formatting resulted in zero list items for {user_id}.", user_id=user_id)
+        return "Error formatting the task list.", {}
 
     list_body = "\n".join(lines)
-    log_info("task_query_service", fn_name, f"Generated list body ({len(mapping)} items, including session details) for {user_id}")
+    log_info("task_query_service", fn_name, f"Generated list body ({len(mapping)} items) for {user_id}")
     return list_body, mapping
 
-def get_tasks_for_summary(user_id, date_range, status_filter='active', trigger_sync=False):
-    """Gets tasks, filters, sorts and returns list of dictionaries."""
-    # *** CORRECTED LOGGING ***
+
+# Returns List[Dict]
+def get_tasks_for_summary(
+    user_id: str,
+    date_range: Tuple[str, str], # Date range is typically required for summaries
+    status_filter: str = 'active',
+    trigger_sync: bool = False
+) -> List[Dict]:
+    """Gets tasks from DB for summaries, filters, sorts, returns list of dictionaries."""
     fn_name = "get_tasks_for_summary"
+    if not DB_IMPORTED:
+        log_error("task_query_service", fn_name, "Database module unavailable.", user_id=user_id)
+        return []
+
     log_info("task_query_service", fn_name, f"Executing for user={user_id}, Filter={status_filter}, Range={date_range}")
-    # *************************
 
     if trigger_sync:
-        log_info("task_query_service", fn_name, "Sync triggered (NYI).")
+        log_info("task_query_service", fn_name, "Sync triggered (Not Implemented Yet).", user_id=user_id)
+
+    # Determine status list for DB query
+    query_status_list = None
+    filter_lower = status_filter.lower().replace(" ", "") if status_filter else 'active'
+    if filter_lower == 'active': query_status_list = ACTIVE_STATUSES
+    elif filter_lower == 'completed': query_status_list = ["completed"]
+    elif filter_lower == 'pending': query_status_list = ["pending"]
+    elif filter_lower == 'in_progress': query_status_list = ["in_progress"]
+    # 'all' means query_status_list remains None
 
     try:
-        task_list = get_context(user_id) or []
-    except Exception as e:
-        log_error("task_query_service", fn_name, f"Error getting context for {user_id}", e)
-        task_list = []
+        # Fetch directly using the specific filters required for summaries
+        task_list = activity_db.list_tasks_for_user(
+            user_id=user_id,
+            status_filter=query_status_list, # Pass list of statuses or None
+            date_range=date_range
+            # No project filter typically needed for summaries
+        )
+        # Sort results after fetching
+        sorted_tasks = _sort_tasks(task_list)
+        log_info("task_query_service", fn_name, f"Returning {len(sorted_tasks)} tasks for summary {user_id}")
+        return sorted_tasks
+    except Exception as db_err:
+        log_error("task_query_service", fn_name, f"Database error fetching tasks for summary: {user_id}", db_err, user_id=user_id)
+        return []
 
-    filtered_s = _filter_tasks_by_status(task_list, status_filter)
-    # Ensure date_range is a tuple or list of two strings
-    final_tasks = filtered_s
-    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
-        final_tasks = _filter_tasks_by_date_range(filtered_s, date_range)
-    elif date_range is not None:
-         log_warning("task_query_service", fn_name, f"Invalid date_range format for summary: {date_range}. Skipping date filter.")
 
-
-    sorted_tasks = _sort_tasks(final_tasks)
-    log_info("task_query_service", fn_name, f"Returning {len(sorted_tasks)} tasks for summary {user_id}")
-    return sorted_tasks
-
-def get_context_snapshot(user_id, history_weeks=1, future_weeks=2):
-    """Fetches relevant active WT tasks and GCal events for Orchestrator context."""
+# Returns Tuple[List[Dict], List[Dict]]
+def get_context_snapshot(user_id: str, history_weeks: int = 1, future_weeks: int = 2) -> Tuple[List[Dict], List[Dict]]:
+    """Fetches relevant active WT tasks (DB) and GCal events (API) for Orchestrator context."""
     fn_name = "get_context_snapshot"
+    if not DB_IMPORTED:
+        log_error("task_query_service", fn_name, "Database module unavailable.", user_id=user_id)
+        return [], [] # Return empty lists
+
     log_info("task_query_service", fn_name, f"Get Context Snapshot: User={user_id}")
     task_context, calendar_context = [], []
-    try:
-        # Note: This currently only gets WT tasks from context, not external GCal events
-        # To include external events, this would need to call the new sync_service function
-        # For now, keeping it simple as per current structure before sync service exists.
 
-        today = datetime.now().date()
+    try:
+        # 1. Calculate date range
+        today = datetime.now(timezone.utc).date() # Use UTC date for consistency
         start_date = today - timedelta(weeks=history_weeks)
         end_date = today + timedelta(weeks=future_weeks)
         start_str, end_str = start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
         date_range_tuple = (start_str, end_str)
 
-        # Get WT tasks from the current in-memory context
-        task_context = get_tasks_for_summary(user_id, date_range=date_range_tuple, status_filter='active')
+        # 2. Get WT tasks from DB (only active ones within the window)
+        try:
+            task_context = activity_db.list_tasks_for_user(
+                user_id=user_id,
+                status_filter=ACTIVE_STATUSES, # Fetch only active tasks
+                date_range=date_range_tuple     # Apply date range
+            )
+            log_info("task_query_service", fn_name, f"Fetched {len(task_context)} active WT tasks from DB for snapshot.")
+        except Exception as db_err:
+             log_error("task_query_service", fn_name, f"Failed to fetch tasks from DB for snapshot: {db_err}", db_err, user_id=user_id)
+             task_context = [] # Continue without tasks if DB fails
 
-        # Get GCal events directly from API
+        # 3. Get GCal events directly from API
         calendar_api = _get_calendar_api_from_state(user_id)
         if calendar_api:
             try:
@@ -401,16 +383,17 @@ def get_context_snapshot(user_id, history_weeks=1, future_weeks=2):
                 calendar_context = calendar_api.list_events(start_str, end_str)
                 log_info("task_query_service", fn_name, f"Fetched {len(calendar_context)} GCal events for snapshot.")
             except Exception as cal_e:
-                log_error("task_query_service", fn_name, f"Failed fetch calendar events for snapshot: {cal_e}", cal_e) # Log exception too
-                # Continue without calendar context
+                log_error("task_query_service", fn_name, f"Failed fetch calendar events for snapshot: {cal_e}", cal_e, user_id=user_id)
+                calendar_context = [] # Continue without calendar events
         else:
             log_info("task_query_service", fn_name, f"Calendar API not active for {user_id}, skipping GCal fetch for snapshot.")
 
-        log_info("task_query_service", fn_name, f"Snapshot created: {len(task_context)} tasks, {len(calendar_context)} events.")
+        log_info("task_query_service", fn_name, f"Snapshot created for {user_id}: {len(task_context)} tasks, {len(calendar_context)} external events.")
 
     except Exception as e:
-        # Log the error *here* within the function's context
-        log_error("task_query_service", fn_name, f"Error creating context snapshot for {user_id}", e)
-        # Return empty lists, the calling function will see the error log
+        log_error("task_query_service", fn_name, f"Error creating context snapshot for {user_id}", e, user_id=user_id)
+        return [], [] # Return empty lists on error
+
     return task_context, calendar_context
-# --- END OF FILE services/task_query_service.py ---
+
+# --- END OF REFACTORED services/task_query_service.py ---

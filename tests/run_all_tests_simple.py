@@ -55,7 +55,7 @@ def _cleanup_user_data(user_id: str):
             # Delete using the service function for consistency if possible,
             # but direct metadata_store call is okay for cleanup script
             for event_id in user_meta_ids:
-                if metadata_store.delete_event_metadata(event_id): # Call tool directly
+                if activity_db.delete_task(event_id): # Call tool directly
                      deleted_count += 1
                 else:
                      log_warning("run_all_tests_simple", "_cleanup_user_data", f"Metadata store reported failure deleting {event_id}")
@@ -201,7 +201,7 @@ def run_task_crud_tests() -> bool:
                  context = agent_state_manager.get_context(TEST_USER_ID) # Verify context update
                  if not _assert(context is None or not any(t.get('event_id') == task_2_id for t in context), "Reminder 2 not removed from context"): overall_success = False
                  # --- Verify metadata deletion using get ---
-                 meta_check = metadata_store.get_event_metadata(task_2_id) # Use correct function
+                 meta_check = activity_db.get_task(task_2_id) # Use correct function
                  if not _assert(not meta_check, "Reminder 2 metadata check found data after delete"): overall_success = False
                  else: log_info("run_all_tests_simple", "run_task_crud_tests", "Reminder 2 metadata deletion verified.")
 

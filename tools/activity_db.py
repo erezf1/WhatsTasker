@@ -1,10 +1,11 @@
-# --- START OF tools/activity_db.py ---
+# --- START OF FULL tools/activity_db.py ---
 
 import sqlite3
 import os
 import json
 import threading
-from datetime import datetime, timezone # Use timezone-aware datetime
+from datetime import datetime, timezone
+from typing import Dict, List, Any, Tuple # <--- ADD Dict, List, Any, Tuple HERE
 from tools.logger import log_info, log_error, log_warning
 
 # --- Configuration ---
@@ -229,7 +230,7 @@ def delete_task(event_id: str) -> bool:
 
 def list_tasks_for_user(
     user_id: str,
-    status_filter: list[str] | None = None, # Allow filtering by multiple statuses
+    status_filter: list[str] | None = None, # Allows filtering by multiple statuses
     date_range: tuple[str, str] | None = None,
     project_filter: str | None = None
 ) -> list[dict]:
@@ -242,24 +243,34 @@ def list_tasks_for_user(
     if status_filter:
         # Ensure status_filter is a list or tuple
         if isinstance(status_filter, str):
-            status_filter = [status_filter]
+            status_filter = [status_filter] # Convert single string to list
         if isinstance(status_filter, (list, tuple)) and status_filter:
-            placeholders = ','.join('?' * len(status_filter))
-            conditions.append(f"status IN ({placeholders})")
-            params.extend(status_filter)
+            # Sanitize statuses just in case
+            clean_statuses = [s.lower().strip() for s in status_filter if isinstance(s, str)]
+            if clean_statuses:
+                 placeholders = ','.join('?' * len(clean_statuses))
+                 conditions.append(f"status IN ({placeholders})")
+                 params.extend(clean_statuses)
+            else:
+                 log_warning("activity_db", fn_name, f"Received empty or invalid status_filter list for user {user_id}.")
+                 # Decide behavior: fetch all? fetch none? Let's fetch none to be safe.
+                 return []
+
+    # If NO status filter is provided, we fetch ALL statuses by default currently.
+    # <<<--- This is where the change would happen if we altered the default
 
     if date_range and len(date_range) == 2:
         conditions.append("date BETWEEN ? AND ?")
         params.extend(date_range)
 
     if project_filter:
-        conditions.append("LOWER(project) = LOWER(?)") # Case-insensitive project filter
+        conditions.append("LOWER(project) = LOWER(?)")
         params.append(project_filter)
 
     if conditions:
         sql += " AND " + " AND ".join(conditions)
 
-    sql += " ORDER BY date, time" # Add default sorting
+    sql += " ORDER BY date, time"
 
     results = []
     try:
@@ -269,11 +280,10 @@ def list_tasks_for_user(
             cursor.execute(sql, params)
             rows = cursor.fetchall()
             for row in rows:
-                # Decode JSON field
                 try:
                     row['session_event_ids'] = json.loads(row.get('session_event_ids', '[]') or '[]')
                 except (json.JSONDecodeError, TypeError):
-                    log_warning("activity_db", fn_name, f"Failed to decode session_event_ids JSON for task {row.get('event_id')}. Using empty list.")
+                    log_warning("activity_db", fn_name, f"Failed decode session_event_ids JSON for task {row.get('event_id')}. Using empty list.")
                     row['session_event_ids'] = []
                 results.append(row)
         return results
@@ -281,16 +291,17 @@ def list_tasks_for_user(
         log_error("activity_db", fn_name, f"Database error listing tasks for user {user_id}: {e}", e)
         return []
 
+
 # --- Logging Table Functions ---
 
-def log_system_event(level: str, module: str, function: str, message: str, traceback_str: str | None = None, user_id_context: str | None = None):
+def log_system_event(level: str, module: str, function: str, message: str, traceback_str: str | None = None, user_id_context: str | None = None, timestamp: str | None = None): # Added timestamp param
     """Logs errors and warnings to the system_logs table."""
     fn_name = "log_system_event"
     sql = """
     INSERT INTO system_logs (timestamp, level, module, function, message, traceback, user_id_context)
     VALUES (?, ?, ?, ?, ?, ?, ?)
     """
-    ts = datetime.now(timezone.utc).isoformat(timespec='seconds')+'Z'
+    ts = timestamp or datetime.now(timezone.utc).isoformat(timespec='seconds')+'Z' # Use provided or generate new
     params = (ts, level, module, function, message, traceback_str, user_id_context)
     try:
         with DB_LOCK:
@@ -349,6 +360,58 @@ def log_llm_activity_db(user_id: str, agent_type: str, activity_type: str, tool_
                  conn.commit()
     except sqlite3.Error as e:
         print(f"CRITICAL DB LOG ERROR: {e} while logging LLM activity: {params}")
+
+# --- Add this function ---
+def update_task_fields(event_id: str, updates: Dict[str, Any]) -> bool:
+    """Updates specific fields for a task given its event_id."""
+    fn_name = "update_task_fields"
+    if not event_id or not updates:
+        log_warning("activity_db", fn_name, "Missing event_id or updates dictionary.")
+        return False
+
+    # Ensure we only try to update valid columns
+    allowed_fields = {f for f in TASK_FIELDS if f != 'event_id'} # Cannot update primary key
+    update_cols = []
+    update_params = []
+    for key, value in updates.items():
+        if key in allowed_fields:
+            update_cols.append(f"{key} = ?")
+            # Handle potential JSON encoding for session_event_ids if needed
+            if key == "session_event_ids" and isinstance(value, list):
+                 update_params.append(json.dumps(value))
+            else:
+                 update_params.append(value)
+        else:
+            log_warning("activity_db", fn_name, f"Ignoring invalid field '{key}' in update for {event_id}.")
+
+    if not update_cols:
+        log_warning("activity_db", fn_name, f"No valid fields to update for {event_id}.")
+        return False # Nothing to update
+
+    update_params.append(event_id) # Add event_id for the WHERE clause
+    sql = f"UPDATE users_tasks SET {', '.join(update_cols)} WHERE event_id = ?"
+
+    try:
+        with DB_LOCK:
+            with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
+                cursor = conn.cursor()
+                cursor.execute(sql, update_params)
+                conn.commit()
+                if cursor.rowcount > 0:
+                    log_info("activity_db", fn_name, f"Successfully updated fields {list(updates.keys())} for task {event_id}")
+                    return True
+                else:
+                    # This could happen if the event_id doesn't exist
+                    log_warning("activity_db", fn_name, f"Task {event_id} not found for update or no changes needed.")
+                    return False # Return False if no row was updated
+    except sqlite3.Error as e:
+        log_error("activity_db", fn_name, f"Database error updating task {event_id}: {e}", e)
+        return False
+    except Exception as e:
+        log_error("activity_db", fn_name, f"Unexpected error updating task {event_id}: {e}", e)
+        return False
+
+# --- End of added function ---
 
 
 # --- Initialize DB on module load ---

@@ -1,6 +1,8 @@
 # --- START OF FULL tools/google_calendar_api.py ---
 
 import os
+import re  # <--- ADD THIS IMPORT
+
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, TYPE_CHECKING # Removed Optional
 

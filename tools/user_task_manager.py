@@ -5,7 +5,7 @@
 from datetime import datetime, timedelta # Make sure timedelta is imported if used
 # Correct potential import path if moved
 from tools.google_calendar_api import GoogleCalendarAPI # Keep original path if not moved
-from tools import metadata_store
+from tools import activity_db.list_tasks_for_user
 from tools.logger import log_info, log_error, log_warning
 # --- REMOVED get_agent import ---
 # from users.user_manager import get_agent
@@ -71,7 +71,7 @@ class UserTaskManager:
 
         try:
             log_info("UserTaskManager", "create_event", f"Saving metadata for event {google_event_id} (user {self.user_id})")
-            metadata_store.save_event_metadata(metadata_to_save_cleaned)
+            activity_db.add_or_update_task(metadata_to_save_cleaned)
             log_info("UserTaskManager", "create_event", f"Successfully saved metadata for event {google_event_id}")
 
             # --- Update Provided Memory Context ---
@@ -97,11 +97,11 @@ class UserTaskManager:
         log_info("UserTaskManager", "update_event", f"Updating event {event_id} for user {self.user_id}")
         updated_metadata = None
         try:
-            original_metadata = metadata_store.get_event_metadata(event_id)
+            original_metadata = activity_db.get_task(event_id)
             if not original_metadata: raise ValueError(f"Metadata for {event_id} not found.")
             updated_metadata = {**original_metadata, **updates} # Apply updates
             # Ensure all required fields are still present after update if necessary
-            metadata_store.save_event_metadata(updated_metadata)
+            activity_db.add_or_update_task(updated_metadata)
             log_info("UserTaskManager", "update_event", f"Successfully updated metadata for event {event_id}")
 
             # --- Update Provided Memory Context ---
@@ -173,7 +173,7 @@ class UserTaskManager:
         metadata_deleted = False
         if gcal_deleted_or_skipped:
             try:
-                metadata_deleted = metadata_store.delete_event_metadata(event_id) # Returns True if deleted or not found
+                metadata_deleted = activity_db.delete_task(event_id) # Returns True if deleted or not found
                 if metadata_deleted:
                     log_info("UserTaskManager", "delete_event", f"Successfully deleted/confirmed missing metadata for event {event_id}")
                     # --- Remove from Provided Memory Context ---
@@ -205,12 +205,12 @@ class UserTaskManager:
         log_info("UserTaskManager", "mark_event_completed", f"Marking event {event_id} as completed (metadata only)")
         try:
             completion_time = datetime.utcnow().isoformat() # Use ISO format
-            metadata = metadata_store.get_event_metadata(event_id)
+            metadata = activity_db.get_task(event_id)
             if not metadata: raise ValueError(f"Metadata for event {event_id} not found.")
 
             updates = {"status": "completed", "completed_at": completion_time}
             metadata.update(updates)
-            metadata_store.save_event_metadata(metadata) # Save updated metadata
+            activity_db.add_or_update_task(metadata) # Save updated metadata
 
             # --- Remove from Provided Memory Context ---
             if active_tasks_context is not None:
@@ -251,7 +251,7 @@ class UserTaskManager:
             if not event_id: continue
 
             try:
-                meta = metadata_store.get_event_metadata(event_id)
+                meta = activity_db.get_task(event_id)
                 if meta:
                     combined_data = {**event, **meta} # Metadata fields overwrite GCal fields if keys overlap
                     enriched_events.append(combined_data)

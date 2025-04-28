@@ -1,599 +1,623 @@
-# --- START OF FILE services/task_manager.py ---
+# --- START OF REFACTORED services/task_manager.py ---
 """
 Service layer for managing tasks: creating, updating, cancelling, and scheduling sessions.
-Interacts with Google Calendar API and the Metadata Store.
+Interacts with Google Calendar API and the SQLite database via activity_db.
 """
 import json
 import traceback
 import uuid
-from datetime import datetime, timedelta, timezone # Added timezone
+from datetime import datetime, timedelta, timezone
 import re
+from typing import Dict, List, Any # Keep typing for internal use
 
 # Tool/Service Imports
-try: from tools.logger import log_info, log_error, log_warning
+try:
+    from tools.logger import log_info, log_error, log_warning
 except ImportError:
+    # Basic fallback logger
     import logging; logging.basicConfig(level=logging.INFO)
     log_info=logging.info; log_error=logging.error; log_warning=logging.warning
     log_error("task_manager", "import", "Logger failed import.")
 
-try: from tools.google_calendar_api import GoogleCalendarAPI
+# Database Utility Import (Primary Data Source Now)
+try:
+    import tools.activity_db as activity_db
+    DB_IMPORTED = True
 except ImportError:
-    log_error("task_manager", "import", "GoogleCalendarAPI not found.")
+    log_error("task_manager", "import", "activity_db not found. Task management disabled.", None)
+    DB_IMPORTED = False
+    # Define dummy DB functions if import fails to prevent crashes later
+    class activity_db:
+        @staticmethod
+        def add_or_update_task(*args, **kwargs): return False
+        @staticmethod
+        def get_task(*args, **kwargs): return None
+        @staticmethod
+        def delete_task(*args, **kwargs): return False
+        @staticmethod
+        def list_tasks_for_user(*args, **kwargs): return []
+    # TODO: Consider if the application should halt if the DB module can't be imported
+
+# GCal API Import
+try:
+    from tools.google_calendar_api import GoogleCalendarAPI
+    GCAL_API_IMPORTED = True
+except ImportError:
+    log_warning("task_manager", "import", "GoogleCalendarAPI not found, GCal features disabled.")
     GoogleCalendarAPI = None
+    GCAL_API_IMPORTED = False
 
-try: from tools import metadata_store; METADATA_STORE_IMPORTED = True
+# Agent State Manager Import (for updating in-memory context)
+try:
+    from services.agent_state_manager import get_agent_state, add_task_to_context, update_task_in_context, remove_task_from_context
+    AGENT_STATE_MANAGER_IMPORTED = True
 except ImportError:
-    log_error("task_manager", "import", "metadata_store not found."); METADATA_STORE_IMPORTED = False
-    # Define a minimal MockMetadataStore if needed for basic testing without the real one
-    class MockMetadataStore:
-        _data = {}; FIELDNAMES = ["event_id", "user_id", "type", "status", "title", "description", "date", "time", "estimated_duration", "session_event_ids", "sessions_planned", "created_at", "completed_at", "project", "original_date", "duration", "progress", "progress_percent", "internal_reminder_minutes", "internal_reminder_sent", "sessions_completed", "series_id", "gcal_start_datetime", "gcal_end_datetime"]
-        def init_metadata_store(self): pass
-        def save_event_metadata(self, data): self._data[data['event_id']] = {k: data.get(k) for k in self.FIELDNAMES}
-        def get_event_metadata(self, event_id): return self._data.get(event_id)
-        def delete_event_metadata(self, event_id): return self._data.pop(event_id, None) is not None
-        def list_metadata(self, user_id, **kwargs): return [v for v in self._data.values() if v.get("user_id") == user_id]
-        def load_all_metadata(self): return list(self._data.values())
-    metadata_store = MockMetadataStore(); metadata_store.init_metadata_store()
-
-
-try: from services.agent_state_manager import get_agent_state, add_task_to_context, update_task_in_context, remove_task_from_context; AGENT_STATE_MANAGER_IMPORTED = True
-except ImportError:
-    log_error("task_manager", "import", "AgentStateManager not found."); AGENT_STATE_MANAGER_IMPORTED = False
-    # Define dummy functions if import fails
+    log_error("task_manager", "import", "AgentStateManager not found. In-memory context updates skipped.")
+    AGENT_STATE_MANAGER_IMPORTED = False
+    # Dummy functions
     def get_agent_state(*a, **k): return None
     def add_task_to_context(*a, **k): pass
     def update_task_in_context(*a, **k): pass
     def remove_task_from_context(*a, **k): pass
 
 # Constants
-DEFAULT_REMINDER_DURATION = "15m" # Duration for GCal event if reminder has time
+DEFAULT_REMINDER_DURATION = "15m"
 
-# --- Helper Functions ---
+# --- Helper Functions (Keep these as they are useful internally) ---
+# Returns GoogleCalendarAPI instance or None
 def _get_calendar_api(user_id):
     """Safely retrieves the active calendar API instance from agent state."""
     fn_name = "_get_calendar_api"
-    if not AGENT_STATE_MANAGER_IMPORTED or GoogleCalendarAPI is None:
-        log_warning("task_manager", fn_name, f"Cannot get calendar API for {user_id}: Dependencies missing.")
+    if not AGENT_STATE_MANAGER_IMPORTED or not GCAL_API_IMPORTED or GoogleCalendarAPI is None:
+        # log_warning("task_manager", fn_name, f"Cannot get calendar API for {user_id}: Dependencies missing.")
         return None
     agent_state = get_agent_state(user_id)
-    if agent_state:
+    if agent_state is not None:
         calendar_api = agent_state.get("calendar")
         if isinstance(calendar_api, GoogleCalendarAPI) and calendar_api.is_active():
             return calendar_api
-        else:
-            # Log only if calendar object exists but is inactive
-            if isinstance(calendar_api, GoogleCalendarAPI) and not calendar_api.is_active():
-                 log_info("task_manager", fn_name, f"Calendar API found but inactive for user {user_id}.")
+        # Optionally log if inactive:
+        # elif isinstance(calendar_api, GoogleCalendarAPI) and not calendar_api.is_active():
+        #      log_info("task_manager", fn_name, f"Calendar API found but inactive for user {user_id}.")
+    # else: log_warning("task_manager", fn_name, f"Agent state not found for user {user_id}.")
     return None
 
+# Returns int (minutes) or None
 def _parse_duration_to_minutes(duration_str):
     """Parses duration strings like '2h', '90m', '1.5h' into minutes."""
     fn_name = "_parse_duration_to_minutes"
-    if not duration_str or not isinstance(duration_str, str):
-        return None
-
-    duration_str = duration_str.lower().replace(' ','')
-    total_minutes = 0.0 # Use float for intermediate calculation
-
+    if not duration_str or not isinstance(duration_str, str): return None
+    duration_str = duration_str.lower().replace(' ',''); total_minutes = 0.0
     try:
-        # Match patterns like '1.5h30m', '2h', '90m', '1.5h', '0.5h'
         hour_match = re.search(r'(\d+(\.\d+)?)\s*h', duration_str)
         minute_match = re.search(r'(\d+)\s*m', duration_str)
-
-        if hour_match:
-            total_minutes += float(hour_match.group(1)) * 60
-            # Check if minutes follow directly after hours (e.g., in '1h30m')
-            # to avoid double counting minutes if 'm' is also present separately
-            remaining_str = duration_str[hour_match.end():]
-            minute_after_hour_match = re.match(r'(\d+)\s*m', remaining_str)
-            if minute_after_hour_match:
-                 total_minutes += int(minute_after_hour_match.group(1))
-                 # Prevent separate minute match from adding again
-                 minute_match = None
-        elif minute_match: # Only look for minutes if hours weren't found first
-            total_minutes += int(minute_match.group(1))
-
-        # Handle cases where only a number was provided (assume minutes)
+        if hour_match: total_minutes += float(hour_match.group(1)) * 60
+        if minute_match: total_minutes += int(minute_match.group(1))
         if total_minutes == 0 and hour_match is None and minute_match is None:
-             if duration_str.replace('.','',1).isdigit():
-                  log_warning("task_manager", fn_name, f"Assuming minutes for duration input: '{duration_str}'")
-                  total_minutes = float(duration_str)
-             else:
-                  # Could not parse as hours, minutes, or plain number
-                  raise ValueError("Unrecognized duration format")
-
+             if duration_str.replace('.','',1).isdigit(): total_minutes = float(duration_str)
+             else: raise ValueError("Unrecognized duration format")
         return int(round(total_minutes)) if total_minutes > 0 else None
-
-    except (ValueError, TypeError) as e:
+    except (ValueError, TypeError, AttributeError) as e:
         log_warning("task_manager", fn_name, f"Could not parse duration string '{duration_str}': {e}")
         return None
 
 # ==============================================================
-# Core Service Functions
+# Core Service Functions (Refactored for SQLite via activity_db)
 # ==============================================================
 
-def create_task(user_id, task_params):
-    """Creates a task or reminder, saves metadata, optionally adds to GCal."""
+# Returns dict (saved item) or None
+def create_task(user_id: str, task_params: Dict[str, Any]) -> Dict | None:
+    """
+    Creates a task or reminder, saves metadata to DB, optionally adds to GCal.
+    Returns the dictionary representing the saved task/reminder, or None on failure.
+    """
     fn_name = "create_task"
+    if not DB_IMPORTED:
+        log_error("task_manager", fn_name, "Database module not imported. Cannot create task.")
+        return None
+
     item_type = task_params.get("type")
     if not item_type:
-        log_error("task_manager", fn_name, "Missing 'type' in task_params.")
+        log_error("task_manager", fn_name, "Missing 'type' in task_params.", user_id=user_id)
         return None
     log_info("task_manager", fn_name, f"Creating item for {user_id}, type: {item_type}")
-    if not METADATA_STORE_IMPORTED:
-        log_error("task_manager", fn_name, "Metadata store unavailable.")
-        return None
 
     calendar_api = _get_calendar_api(user_id)
-    google_event_id = None
+    google_event_id = None # Track GCal ID for potential rollback
 
     try:
-        # Initialize metadata with known fields
-        metadata = {k: task_params.get(k) for k in metadata_store.FIELDNAMES if k in task_params}
-        metadata["user_id"] = user_id
-        metadata["status"] = "pending"
-        # *** Store created_at in UTC ISO format ***
-        metadata["created_at"] = datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
-        metadata["title"] = task_params.get("description", "Untitled Item")
-        metadata["type"] = item_type
-        # *** Initialize internal_reminder_sent as empty string ***
-        metadata["internal_reminder_sent"] = "" # Default to not sent
+        # --- Prepare Core Metadata ---
+        task_data_to_save = {}
+        task_data_to_save["user_id"] = user_id
+        task_data_to_save["type"] = item_type
+        task_data_to_save["status"] = "pending" # Default status
+        task_data_to_save["created_at"] = datetime.now(timezone.utc).isoformat(timespec='seconds')+'Z'
+        task_data_to_save["title"] = task_params.get("description", "Untitled Item") # Use description as title
+        # Copy other relevant fields from input params if they exist in TASK_FIELDS
+        for field in activity_db.TASK_FIELDS:
+             if field in task_params and field not in task_data_to_save:
+                 task_data_to_save[field] = task_params[field]
 
-        # Task specific defaults
-        if item_type == "task":
-            metadata["session_event_ids"] = json.dumps([])
-            metadata["sessions_planned"] = 0
-            metadata["sessions_completed"] = 0
-            metadata["progress_percent"] = 0
-
-        # --- Modified GCal Reminder Creation Logic ---
+        # --- Handle GCal Integration (Reminders with time) ---
         item_time = task_params.get("time")
         has_time = item_time is not None and item_time != ""
         should_create_gcal = item_type == "reminder" and has_time and calendar_api is not None
 
-        log_info("task_manager", fn_name, f"Checking GCal creation: type='{item_type}', has_time={has_time}, calendar_api_present={calendar_api is not None}. Should create: {should_create_gcal}")
-
         if should_create_gcal:
-            log_info("task_manager", fn_name, f"Attempting to create GCal Reminder event for user {user_id}, item: '{metadata['title'][:30]}...'")
-            gcal_event_payload = {
-                "title": metadata.get("title"),
-                "description": f"Reminder: {metadata.get('description', '')}",
+            log_info("task_manager", fn_name, f"Attempting GCal creation for reminder {user_id}...")
+            gcal_event_payload = { # Simplified payload for GCalAPI
+                "title": task_data_to_save.get("title"),
+                "description": f"Reminder: {task_data_to_save.get('description', '')}",
                 "date": task_params.get("date"),
                 "time": item_time,
                 "duration": DEFAULT_REMINDER_DURATION
             }
             try:
-                # Explicitly log before the API call
-                log_info("task_manager", fn_name, f"Calling calendar_api.create_event for user {user_id} with payload: {gcal_event_payload}")
-                google_event_id = calendar_api.create_event(gcal_event_payload) # This might return None or raise Exception
-
-                # *** ADDED Logging: Check result immediately ***
-                if google_event_id:
-                    log_info("task_manager", fn_name, f"GCal Reminder event CREATED successfully, ID: {google_event_id}")
-                    metadata["event_id"] = google_event_id
-                    # Fetch details to get exact times
-                    gcal_event_details = calendar_api._get_single_event(google_event_id)
-                    if gcal_event_details:
-                        parsed_gcal = calendar_api._parse_google_event(gcal_event_details)
-                        metadata["gcal_start_datetime"] = parsed_gcal.get("gcal_start_datetime")
-                        metadata["gcal_end_datetime"] = parsed_gcal.get("gcal_end_datetime")
-                        log_info("task_manager", fn_name, f"Fetched GCal details for new event {google_event_id}")
-                    else:
-                         log_warning("task_manager", fn_name, f"Created GCal event {google_event_id} but failed to fetch its details afterward.")
+                # create_event returns event ID string or None
+                created_event_id = calendar_api.create_event(gcal_event_payload)
+                if created_event_id is not None:
+                    log_info("task_manager", fn_name, f"GCal Reminder created, ID: {created_event_id}")
+                    task_data_to_save["event_id"] = created_event_id # Use GCal ID as primary key
+                    google_event_id = created_event_id # Track for rollback
+                    # Fetch GCal details to store exact times
+                    gcal_details = calendar_api._get_single_event(created_event_id)
+                    if gcal_details:
+                        parsed = calendar_api._parse_google_event(gcal_details)
+                        task_data_to_save["gcal_start_datetime"] = parsed.get("gcal_start_datetime")
+                        task_data_to_save["gcal_end_datetime"] = parsed.get("gcal_end_datetime")
+                    else: log_warning("task_manager", fn_name, f"Failed to fetch details for GCal event {created_event_id}")
                 else:
-                    # calendar_api.create_event returned None
-                    log_warning("task_manager", fn_name, f"GCal Reminder event creation FAILED (returned None) for user {user_id}. Assigning local ID.")
-                    metadata["event_id"] = f"local_{uuid.uuid4()}"
-
-            except Exception as gcal_create_err:
-                # Log any exception during the create_event call
-                log_error("task_manager", fn_name, f"Error calling calendar_api.create_event for user {user_id}", gcal_create_err)
-                metadata["event_id"] = f"local_{uuid.uuid4()}" # Assign local ID if GCal failed
-                google_event_id = None # Ensure google_event_id is None after failure
+                    log_warning("task_manager", fn_name, f"GCal event creation failed (returned None) for {user_id}. Using local ID.")
+                    task_data_to_save["event_id"] = f"local_{uuid.uuid4()}"
+            except Exception as gcal_err:
+                log_error("task_manager", fn_name, f"Error creating GCal event for {user_id}", gcal_err, user_id=user_id)
+                task_data_to_save["event_id"] = f"local_{uuid.uuid4()}" # Fallback to local ID
         else:
-            # Log reason for not attempting GCal creation
-            reason = ""
-            if item_type != "reminder": reason = "Item is not a reminder."
-            elif not has_time: reason = "Reminder has no specific time."
-            elif calendar_api is None: reason = "Calendar API is not active/available."
-            log_info("task_manager", fn_name, f"Assigning local ID for {item_type}. Reason: {reason}")
-            metadata["event_id"] = f"local_{uuid.uuid4()}"
-        # --- End Modified GCal Reminder Creation Logic ---
+            # Assign local ID for tasks or reminders without time/API
+            task_data_to_save["event_id"] = f"local_{uuid.uuid4()}"
+            if item_type == "reminder" and has_time and calendar_api is None:
+                 log_info("task_manager", fn_name, f"Assigning local ID for reminder {user_id}. Reason: GCal API inactive.")
 
-        # Final validation before saving
-        if not metadata.get("event_id"):
-            log_error("task_manager", fn_name, "Critical error: Metadata missing 'event_id' before save attempt.")
+        # --- Save to Database ---
+        if not task_data_to_save.get("event_id"): # Should not happen, but safety check
+             log_error("task_manager", fn_name, "Failed to assign event_id before DB save.", user_id=user_id)
+             return None
+
+        # Fill missing defaults before saving (optional, add_or_update_task handles some)
+        task_data_to_save.setdefault('sessions_planned', 0)
+        task_data_to_save.setdefault('sessions_completed', 0)
+        task_data_to_save.setdefault('progress_percent', 0)
+        task_data_to_save.setdefault('session_event_ids', '[]')
+
+        save_success = activity_db.add_or_update_task(task_data_to_save)
+
+        if save_success:
+            log_info("task_manager", fn_name, f"Task {task_data_to_save['event_id']} saved to DB for {user_id}")
+            # Fetch the potentially updated data from DB to return it
+            saved_data = activity_db.get_task(task_data_to_save['event_id'])
+            if saved_data and AGENT_STATE_MANAGER_IMPORTED:
+                add_task_to_context(user_id, saved_data) # Update memory context
+            return saved_data if saved_data else task_data_to_save # Return DB data if possible
+        else:
+            log_error("task_manager", fn_name, f"Failed to save task {task_data_to_save.get('event_id')} to DB for {user_id}.", user_id=user_id)
+            # Attempt GCal rollback if DB save failed *after* GCal success
+            if google_event_id is not None and calendar_api is not None:
+                log_warning("task_manager", fn_name, f"DB save failed. Rolling back GCal event {google_event_id}")
+                try: calendar_api.delete_event(google_event_id)
+                except Exception: log_error("task_manager", fn_name, f"GCal rollback failed for {google_event_id}", user_id=user_id)
             return None
 
-        # Prepare final dict and save
-        final_meta = {fn: metadata.get(fn) for fn in metadata_store.FIELDNAMES}
-        metadata_store.save_event_metadata(final_meta)
-        log_info("task_manager", fn_name, f"Metadata saved for event_id: {final_meta['event_id']}")
-
-        # Update in-memory context
-        if AGENT_STATE_MANAGER_IMPORTED:
-             add_task_to_context(user_id, final_meta)
-
-        return final_meta
-
     except Exception as e:
-        tb = traceback.format_exc()
-        log_error("task_manager", fn_name, f"Overall error creating item for {user_id}. Trace:\n{tb}", e)
-        # Rollback GCal event if it was successfully created in this failed attempt
-        if google_event_id and calendar_api:
-            log_warning("task_manager", fn_name, f"Attempting final GCal rollback for event {google_event_id} due to overall error.")
-            try: calendar_api.delete_event(google_event_id)
-            except Exception as final_rollback_e: log_error("task_manager", fn_name, f"Error during final GCal rollback for event {google_event_id}", final_rollback_e)
+        # Catch any unexpected errors during preparation
+        log_error("task_manager", fn_name, f"Unexpected error during task creation for {user_id}", e, user_id=user_id)
+        # Rollback GCal if it was created before the unexpected error
+        if google_event_id is not None and calendar_api is not None:
+             log_warning("task_manager", fn_name, f"Unexpected error. Rolling back GCal event {google_event_id}")
+             try: calendar_api.delete_event(google_event_id)
+             except Exception: log_error("task_manager", fn_name, f"GCal rollback failed for {google_event_id}", user_id=user_id)
         return None
 
-def update_task(user_id, item_id, updates):
-    """Updates details of an existing task/reminder."""
+# Returns dict (updated item) or None
+def update_task(user_id: str, item_id: str, updates: Dict[str, Any]) -> Dict | None:
+    """Updates details of an existing task/reminder in the DB and GCal."""
     fn_name = "update_task"
+    if not DB_IMPORTED:
+        log_error("task_manager", fn_name, "Database module not imported. Cannot update task.")
+        return None
+
     log_info("task_manager", fn_name, f"Updating item {item_id} for {user_id}, keys: {list(updates.keys())}")
-    if not METADATA_STORE_IMPORTED:
-        log_error("task_manager", fn_name, "Metadata store unavailable.")
+
+    # 1. Get existing task data from DB
+    existing_task = activity_db.get_task(item_id) # Returns dict or None
+    if existing_task is None:
+        log_error("task_manager", fn_name, f"Task {item_id} not found in DB.", user_id=user_id)
+        return None
+    if existing_task.get("user_id") != user_id:
+        log_error("task_manager", fn_name, f"User mismatch for task {item_id}.", user_id=user_id)
         return None
 
     calendar_api = _get_calendar_api(user_id)
-    gcal_updated = False
+    item_type = existing_task.get("type")
+    gcal_updated = False # Track GCal update success
 
-    try:
-        existing = metadata_store.get_event_metadata(item_id)
-        if not existing:
-            log_error("task_manager", fn_name, f"Metadata not found for item {item_id}.")
-            return None
-        if existing.get("user_id") != user_id:
-            log_error("task_manager", fn_name, f"User mismatch for item {item_id}.")
-            return None
+    # 2. Handle GCal Update (Reminders only)
+    if item_type == "reminder" and not item_id.startswith("local_") and calendar_api is not None:
+        gcal_payload = {}
+        needs_gcal_update = False
+        if "description" in updates:
+            gcal_payload["title"] = updates["description"]
+            gcal_payload["description"] = f"Reminder: {updates['description']}"
+            needs_gcal_update = True
+        if "date" in updates or "time" in updates:
+            gcal_payload["date"] = updates.get("date", existing_task.get("date"))
+            gcal_payload["time"] = updates.get("time") if "time" in updates else existing_task.get("time")
+            if gcal_payload["date"] is not None: needs_gcal_update = True
 
-        item_type = existing.get("type")
-        needs_gcal_update, gcal_payload = False, {}
+        if needs_gcal_update:
+            log_info("task_manager", fn_name, f"Attempting GCal update for reminder {item_id}")
+            try:
+                update_success = calendar_api.update_event(item_id, gcal_payload)
+                if update_success:
+                    gcal_updated = True
+                    log_info("task_manager", fn_name, f"GCal reminder {item_id} updated successfully.")
+                else: log_warning("task_manager", fn_name, f"GCal reminder {item_id} update failed (API returned False).")
+            except Exception as gcal_err:
+                 log_error("task_manager", fn_name, f"Error updating GCal reminder {item_id}", gcal_err, user_id=user_id)
+        else: log_info("task_manager", fn_name, f"No relevant fields for GCal reminder {item_id} update.")
 
-        # Check if GCal update is needed (only for non-local reminders with active calendar)
-        if item_type == "reminder" and not item_id.startswith("local_") and calendar_api:
-            # Map metadata update keys to potential GCal payload keys
-            if "description" in updates: gcal_payload["title"] = updates["description"]; gcal_payload["description"] = f"Reminder: {updates['description']}"; needs_gcal_update = True
-            if "date" in updates or "time" in updates:
-                 # Note: GCal update needs full date/time usually, handle carefully
-                 gcal_payload["date"] = updates.get("date", existing.get("date"))
-                 gcal_payload["time"] = updates.get("time", existing.get("time")) # Handle potential None value
-                 if "time" in updates and updates["time"] is None: # Explicitly clearing time
-                      gcal_payload["time"] = None
-                 needs_gcal_update = True
-            # Add other relevant mappings if needed
+    # 3. Prepare DB Updates
+    db_update_data = existing_task.copy() # Start with existing data
+    # Apply valid updates from the input 'updates' dictionary
+    allowed_meta_keys = {"description", "date", "time", "estimated_duration", "project"}
+    applied_db_updates = False
+    for key, value in updates.items():
+        if key in allowed_meta_keys:
+            db_update_data[key] = value
+            if key == 'description': db_update_data['title'] = value # Keep title synced
+            applied_db_updates = True
 
-            if needs_gcal_update:
-                 log_info("task_manager", fn_name, f"Attempting GCal Reminder update for {item_id}")
-                 gcal_updated = calendar_api.update_event(item_id, gcal_payload)
-                 if not gcal_updated: log_warning("task_manager", fn_name, f"GCal Reminder update failed for {item_id}.")
-                 else: log_info("task_manager", fn_name, f"GCal Reminder update OK for {item_id}")
-            else: log_info("task_manager", fn_name, f"No relevant GCal fields to update for reminder {item_id}.")
-        # else: log info about skipping GCal update for tasks/local items/inactive calendar?
+    # 4. Refresh GCal Timestamps if GCal was updated
+    if gcal_updated and calendar_api is not None:
+        gcal_details = calendar_api._get_single_event(item_id)
+        if gcal_details:
+            parsed = calendar_api._parse_google_event(gcal_details)
+            db_update_data["gcal_start_datetime"] = parsed.get("gcal_start_datetime")
+            db_update_data["gcal_end_datetime"] = parsed.get("gcal_end_datetime")
+            applied_db_updates = True # Mark as updated even if only GCal times changed
+            log_info("task_manager", fn_name, f"Refreshed GCal times in task data for {item_id}")
+        else:
+            log_warning("task_manager", fn_name, f"GCal update ok, but failed to re-fetch details for {item_id}")
 
-        # Update metadata store
-        allowed_meta_keys = {"description", "date", "time", "estimated_duration", "project"}
-        valid_meta_updates = {k: v for k, v in updates.items() if k in allowed_meta_keys}
+    # 5. Save to DB if changes were applied or GCal timestamps were refreshed
+    if applied_db_updates:
+        save_success = activity_db.add_or_update_task(db_update_data)
+        if save_success:
+            log_info("task_manager", fn_name, f"Task {item_id} updated successfully in DB.")
+            # Fetch final state from DB
+            updated_task_from_db = activity_db.get_task(item_id)
+            if updated_task_from_db and AGENT_STATE_MANAGER_IMPORTED:
+                 update_task_in_context(user_id, item_id, updated_task_from_db) # Update memory
+            return updated_task_from_db if updated_task_from_db else db_update_data
+        else:
+            log_error("task_manager", fn_name, f"Failed to save task {item_id} updates to DB.", user_id=user_id)
+            return None # DB save failed
+    else:
+        log_info("task_manager", fn_name, f"No applicable DB updates or GCal timestamp changes for task {item_id}.")
+        return existing_task # Return original data if no changes were made
 
-        if not valid_meta_updates:
-             log_warning("task_manager", fn_name, f"No valid metadata fields in updates for {item_id}. No metadata change.")
-             # Return existing if no changes, but maybe GCal updated? Check gcal_updated?
-             # For simplicity, let's return existing if no *metadata* changes.
-             return existing
-
-        updated_metadata = existing.copy()
-        updated_metadata.update(valid_meta_updates)
-        if "description" in valid_meta_updates: updated_metadata["title"] = valid_meta_updates["description"] # Keep title synced with description
-        if "time" in valid_meta_updates and valid_meta_updates["time"] is None: updated_metadata["time"] = None # Ensure None is stored if cleared
-
-        # Fetch updated GCal details if update occurred
-        if gcal_updated and calendar_api:
-             gcal_event_details = calendar_api._get_single_event(item_id)
-             if gcal_event_details:
-                  parsed_gcal = calendar_api._parse_google_event(gcal_event_details)
-                  updated_metadata["gcal_start_datetime"] = parsed_gcal.get("gcal_start_datetime")
-                  updated_metadata["gcal_end_datetime"] = parsed_gcal.get("gcal_end_datetime")
-
-        meta_to_save = {fn: updated_metadata.get(fn) for fn in metadata_store.FIELDNAMES}
-        metadata_store.save_event_metadata(meta_to_save)
-        log_info("task_manager", fn_name, f"Metadata updated successfully for {item_id}")
-
-        # Update in-memory context
-        if AGENT_STATE_MANAGER_IMPORTED:
-             update_task_in_context(user_id, item_id, meta_to_save)
-
-        return meta_to_save
-
-    except Exception as e:
-        tb = traceback.format_exc()
-        log_error("task_manager", fn_name, f"Error updating item {item_id} for {user_id}. Trace:\n{tb}", e)
-        return None
-
-def update_task_status(user_id, item_id, new_status):
-    """Updates only the status and related tracking fields."""
+# Returns dict (updated item) or None
+def update_task_status(user_id: str, item_id: str, new_status: str) -> Dict | None:
+    """Updates only the status and related tracking fields in the DB."""
     fn_name = "update_task_status"
+    if not DB_IMPORTED:
+        log_error("task_manager", fn_name, "Database module not imported.")
+        return None
+
     log_info("task_manager", fn_name, f"Setting status='{new_status}' for item {item_id}, user {user_id}")
-    if new_status == "cancelled":
-        log_error("task_manager", fn_name, "Use cancel_item() function for 'cancelled' status.")
+    # Validate and clean status
+    new_status_clean = new_status.lower().replace(" ", "")
+    allowed_statuses = {"pending", "in_progress", "completed"}
+    if new_status_clean == "cancelled":
+        log_error("task_manager", fn_name, "Use cancel_item() function for 'cancelled' status.", user_id=user_id)
         return None
-    try:
-        existing = metadata_store.get_event_metadata(item_id)
-        if not existing:
-            log_error("task_manager", fn_name, f"Metadata not found for item {item_id}.")
-            return None
-        if existing.get("user_id") != user_id:
-            log_error("task_manager", fn_name, f"User mismatch for item {item_id}.")
-            return None
+    if new_status_clean not in allowed_statuses:
+         log_error("task_manager", fn_name, f"Invalid status '{new_status}' provided.", user_id=user_id)
+         return None
 
-        updates_dict = {"status": new_status}
-        if new_status.lower() == "completed":
-            # *** Store completed_at in UTC ISO format ***
-            updates_dict["completed_at"] = datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
-            updates_dict["progress_percent"] = 100
-            if existing.get("type") == "task":
-                updates_dict["sessions_completed"] = existing.get("sessions_planned", 0) # Mark all planned as done
-        elif new_status.lower() in ["pending", "in_progress", "in progress"]:
-             updates_dict["completed_at"] = "" # Use empty string for None/cleared value in CSV
-             if new_status.lower() == "pending":
-                  updates_dict["progress_percent"] = 0 # Reset progress
-
-        # Apply updates to a copy
-        updated_metadata = existing.copy()
-        updated_metadata.update(updates_dict)
-
-        # Prepare final dict with only defined FIELDNAMES
-        meta_to_save = {fn: updated_metadata.get(fn) for fn in metadata_store.FIELDNAMES}
-        metadata_store.save_event_metadata(meta_to_save)
-        log_info("task_manager", fn_name, f"Metadata status updated successfully for {item_id}")
-
-        # Update in-memory context
-        if AGENT_STATE_MANAGER_IMPORTED:
-             update_task_in_context(user_id, item_id, meta_to_save)
-
-        return meta_to_save
-    except Exception as e:
-        log_error("task_manager", fn_name, f"Error saving status update for {item_id}", e)
+    # 1. Get existing task data
+    existing_task = activity_db.get_task(item_id)
+    if existing_task is None:
+        log_error("task_manager", fn_name, f"Task {item_id} not found in DB.", user_id=user_id)
+        return None
+    if existing_task.get("user_id") != user_id:
+        log_error("task_manager", fn_name, f"User mismatch for task {item_id}.", user_id=user_id)
         return None
 
-def cancel_item(user_id, item_id):
-    """Sets item status to 'cancelled' and deletes associated GCal events."""
+    # 2. Prepare update dictionary
+    updates_dict = {"status": new_status_clean}
+    now_iso_utc = datetime.now(timezone.utc).isoformat(timespec='seconds')+'Z'
+
+    if new_status_clean == "completed":
+        updates_dict["completed_at"] = now_iso_utc
+        updates_dict["progress_percent"] = 100
+        if existing_task.get("type") == "task":
+            updates_dict["sessions_completed"] = existing_task.get("sessions_planned", 0)
+    elif new_status_clean == "pending":
+         updates_dict["completed_at"] = None # Use None for DB
+         updates_dict["progress_percent"] = 0
+         updates_dict["sessions_completed"] = 0
+    elif new_status_clean == "in_progress":
+         updates_dict["completed_at"] = None # Use None for DB
+
+    # 3. Apply updates to a copy and save
+    task_data_to_save = existing_task.copy()
+    task_data_to_save.update(updates_dict)
+
+    save_success = activity_db.add_or_update_task(task_data_to_save)
+
+    if save_success:
+        log_info("task_manager", fn_name, f"Task {item_id} status updated to {new_status_clean} in DB.")
+        updated_task_from_db = activity_db.get_task(item_id) # Re-fetch to get final state
+        if updated_task_from_db and AGENT_STATE_MANAGER_IMPORTED:
+             update_task_in_context(user_id, item_id, updated_task_from_db)
+        return updated_task_from_db if updated_task_from_db else task_data_to_save
+    else:
+        log_error("task_manager", fn_name, f"Failed to save status update for task {item_id} to DB.", user_id=user_id)
+        return None
+
+# Returns bool
+def cancel_item(user_id: str, item_id: str) -> bool:
+    """Sets item status to 'cancelled' in DB and deletes associated GCal events."""
     fn_name = "cancel_item"
-    log_info("task_manager", fn_name, f"Processing cancellation for item {item_id}, user {user_id}")
-    if not METADATA_STORE_IMPORTED:
-        log_error("task_manager", fn_name, "Metadata store unavailable.")
+    if not DB_IMPORTED:
+        log_error("task_manager", fn_name, "Database module not imported.")
         return False
 
+    log_info("task_manager", fn_name, f"Processing cancellation for item {item_id}, user {user_id}")
+
+    # 1. Get task data from DB
+    task_data = activity_db.get_task(item_id)
+    if task_data is None:
+        log_warning("task_manager", fn_name, f"Task {item_id} not found in DB during cancel. Assuming handled.")
+        return True # Not found -> already gone? Success.
+    if task_data.get("user_id") != user_id:
+        log_error("task_manager", fn_name, f"User mismatch for item {item_id}.", user_id=user_id)
+        return False
+    if task_data.get("status") == "cancelled":
+        log_info("task_manager", fn_name, f"Item {item_id} is already cancelled.")
+        return True
+
+    # 2. GCal Cleanup
     calendar_api = _get_calendar_api(user_id)
-    gcal_cleanup_ok = True # Assume okay unless error occurs
+    item_type = task_data.get("type")
+    gcal_cleanup_errors = []
 
-    try:
-        metadata = metadata_store.get_event_metadata(item_id)
-        if not metadata:
-            log_warning("task_manager", fn_name, f"Metadata not found for {item_id} during cancel. Assuming already handled.")
-            return True
-        if metadata.get("user_id") != user_id:
-            log_error("task_manager", fn_name, f"User mismatch for item {item_id}.")
-            return False
-        if metadata.get("status") == "cancelled":
-            log_info("task_manager", fn_name, f"Item {item_id} is already cancelled.")
-            return True
+    if calendar_api is not None and not item_id.startswith("local_"):
+        log_info("task_manager", fn_name, f"Performing GCal cleanup for {item_type} {item_id}")
+        # Delete main event if it's a Reminder on GCal
+        if item_type == "reminder":
+            try:
+                deleted = calendar_api.delete_event(item_id)
+                if not deleted: log_warning("task_manager", fn_name, f"GCal delete failed/not found for reminder {item_id}")
+            except Exception as del_err:
+                 log_error("task_manager", fn_name, f"Error deleting GCal reminder {item_id}", del_err, user_id=user_id)
+                 gcal_cleanup_errors.append(f"Main event {item_id}")
+        # Delete session events if it's a Task
+        elif item_type == "task":
+            session_ids = task_data.get("session_event_ids", []) # Already decoded list from get_task
+            if isinstance(session_ids, list) and session_ids:
+                log_info("task_manager", fn_name, f"Deleting {len(session_ids)} GCal sessions for task {item_id}")
+                for session_id in session_ids:
+                    if not isinstance(session_id, str) or not session_id: continue
+                    try:
+                        deleted = calendar_api.delete_event(session_id)
+                        if not deleted: log_warning("task_manager", fn_name, f"GCal delete failed/not found for session {session_id}")
+                    except Exception as sess_del_err:
+                         log_error("task_manager", fn_name, f"Error deleting GCal session {session_id}", sess_del_err, user_id=user_id)
+                         gcal_cleanup_errors.append(f"Session {session_id}")
+            else: log_info("task_manager", fn_name, f"No GCal session IDs to delete for task {item_id}")
+    # else: log reason for skipping GCal cleanup
 
-        item_type = metadata.get("type")
+    # 3. Update DB Status
+    update_payload = task_data.copy()
+    update_payload["status"] = "cancelled"
+    # Reset task-specific fields on cancel
+    if item_type == "task":
+        update_payload["sessions_planned"] = 0
+        update_payload["sessions_completed"] = 0
+        update_payload["progress_percent"] = 0
+        update_payload["session_event_ids"] = [] # Store empty list, will be JSON '[]'
 
-        # --- GCal Cleanup ---
-        # ... (GCal cleanup logic remains the same) ...
-        if calendar_api and not item_id.startswith("local_"):
-            # ... (reminder and task session deletion) ...
-            pass # Keep existing GCal cleanup logic here
-        elif not calendar_api:
-             log_info("task_manager", fn_name, f"Calendar API inactive for user {user_id}. Skipping GCal cleanup for {item_id}.")
-        else: # Item is local_
-             log_info("task_manager", fn_name, f"Item {item_id} is local. No GCal cleanup needed.")
-        # --- End GCal Cleanup ---
+    save_success = activity_db.add_or_update_task(update_payload)
 
-        # --- Update Metadata Status DIRECTLY ---
-        log_info("task_manager", fn_name, f"Updating metadata status to cancelled for {item_id}")
-        metadata["status"] = "cancelled"
-        # Optionally clear session data from metadata?
-        # metadata["session_event_ids"] = json.dumps([])
-        # metadata["sessions_planned"] = 0
-        try:
-            # Prepare final dict with only defined FIELDNAMES
-            meta_to_save = {fn: metadata.get(fn) for fn in metadata_store.FIELDNAMES}
-            metadata_store.save_event_metadata(meta_to_save)
-            log_info("task_manager", fn_name, f"Successfully marked item {item_id} as cancelled in metadata.")
-            # Update in-memory context
-            if AGENT_STATE_MANAGER_IMPORTED:
-                 # Use update, not remove, to reflect the 'cancelled' status
-                 update_task_in_context(user_id, item_id, meta_to_save)
-            return True
-        except Exception as meta_save_err:
-             log_error("task_manager", fn_name, f"Failed to save metadata status update to cancelled for {item_id}", meta_save_err)
-             # Should we try to rollback GCal changes here? Difficult.
-             return False
-        # --- End Direct Metadata Update ---
-
-    except Exception as e:
-        tb = traceback.format_exc()
-        log_error("task_manager", fn_name, f"Error cancelling item {item_id} for user {user_id}. Trace:\n{tb}", e)
+    if save_success:
+        log_info("task_manager", fn_name, f"Successfully marked item {item_id} as cancelled in DB.")
+        cancelled_task_data = activity_db.get_task(item_id) # Get final state
+        if cancelled_task_data and AGENT_STATE_MANAGER_IMPORTED:
+             update_task_in_context(user_id, item_id, cancelled_task_data) # Update memory context
+        if gcal_cleanup_errors:
+             log_warning("task_manager", fn_name, f"Cancel successful for {item_id}, but GCal cleanup errors: {gcal_cleanup_errors}", user_id=user_id)
+        return True
+    else:
+        log_error("task_manager", fn_name, f"Failed to save cancelled status for {item_id} to DB.", user_id=user_id)
+        # State is inconsistent: GCal might be cleaned, DB not updated.
         return False
 
 # --- Scheduling Functions ---
 
-def schedule_work_sessions(user_id, task_id, slots_to_book):
-    """Creates GCal events for proposed work sessions and updates the main task metadata."""
+# Returns dict with 'success', 'message', 'booked_count', 'session_ids'
+def schedule_work_sessions(user_id: str, task_id: str, slots_to_book: List[Dict]) -> Dict:
+    """Creates GCal events for proposed work sessions and updates the parent task in DB."""
     fn_name = "schedule_work_sessions"
+    default_fail_result = {"success": False, "booked_count": 0, "message": "An unexpected error occurred.", "session_ids": []}
+    if not DB_IMPORTED:
+        return {**default_fail_result, "message": "Database module not available."}
+
     log_info("task_manager", fn_name, f"Booking {len(slots_to_book)} sessions for task {task_id}")
-    if not METADATA_STORE_IMPORTED:
-         return {"success": False, "message": "Metadata store unavailable.", "session_ids": []}
 
     calendar_api = _get_calendar_api(user_id)
-    if not calendar_api:
-        return {"success": False, "message": "Calendar is not connected or active. Cannot schedule sessions.", "session_ids": []}
+    if calendar_api is None:
+        return {**default_fail_result, "message": "Calendar is not connected or active."}
 
-    # --- Get Task Details & Preferences ---
-    task_metadata = metadata_store.get_event_metadata(task_id)
-    if not task_metadata or task_metadata.get("user_id") != user_id:
-        log_error("task_manager", fn_name, f"Main task {task_id} not found or user mismatch.")
-        return {"success": False, "message": "Could not find the original task details.", "session_ids": []}
+    # 1. Get Parent Task Details from DB
+    task_metadata = activity_db.get_task(task_id)
+    if task_metadata is None:
+        log_error("task_manager", fn_name, f"Parent task {task_id} not found in DB.", user_id=user_id)
+        return {**default_fail_result, "message": "Original task details not found."}
+    if task_metadata.get("user_id") != user_id:
+        log_error("task_manager", fn_name, f"User mismatch for task {task_id}.", user_id=user_id)
+        return {**default_fail_result, "message": "Task ownership mismatch."}
     if task_metadata.get("type") != "task":
-         log_error("task_manager", fn_name, f"Item {task_id} is not a task. Cannot schedule sessions.")
-         return {"success": False, "message": "Scheduling is only supported for items of type 'task'.", "session_ids": []}
+         log_error("task_manager", fn_name, f"Item {task_id} is not a task.", user_id=user_id)
+         return {**default_fail_result, "message": "Scheduling only supported for tasks."}
 
     task_title = task_metadata.get("title", "Task Work")
-    agent_state = get_agent_state(user_id) # Reuse state if already fetched?
-    prefs = agent_state.get("preferences", {}) if agent_state else {}
-    session_length_str = prefs.get("Preferred_Session_Length", "60m")
-    session_length_minutes = _parse_duration_to_minutes(session_length_str) or 60
 
-    # --- Create GCal Events ---
+    # 2. Create GCal Events
     created_session_ids = []
     errors = []
     for i, session_slot in enumerate(slots_to_book):
         session_date = session_slot.get("date")
         session_time = session_slot.get("time")
-        if not session_date or not session_time:
-             log_warning("task_manager", fn_name, f"Skipping session {i+1} for task {task_id}: missing date or time.")
-             errors.append(f"Session {i+1} missing data")
-             continue
-
+        session_end_time = session_slot.get("end_time")
+        if not all([session_date, session_time, session_end_time]):
+             msg = f"Session {i+1} missing date/time/end_time"
+             log_warning("task_manager", fn_name, msg + f" for task {task_id}")
+             errors.append(msg); continue
         try:
+            start_dt = datetime.strptime(f"{session_date} {session_time}", "%Y-%m-%d %H:%M")
+            end_dt = datetime.strptime(f"{session_date} {session_end_time}", "%Y-%m-%d %H:%M")
+            duration_minutes = int((end_dt - start_dt).total_seconds() / 60)
+            if duration_minutes <= 0: raise ValueError("Duration must be positive")
+
             session_event_data = {
                 "title": f"Work: {task_title} [{i+1}/{len(slots_to_book)}]",
                 "description": f"Focused work session for task: {task_title}\nParent Task ID: {task_id}",
                 "date": session_date, "time": session_time,
-                "duration": f"{session_length_minutes}m"
+                "duration": f"{duration_minutes}m"
             }
+            # create_event returns ID string or None
             session_event_id = calendar_api.create_event(session_event_data)
-            if session_event_id:
+            if session_event_id is not None:
                 created_session_ids.append(session_event_id)
             else:
-                log_error("task_manager", fn_name, f"Failed to create GCal event for session {i+1} of task {task_id}.")
-                errors.append(f"Session {i+1} GCal creation failed")
+                msg = f"Session {i+1} GCal creation failed (API returned None)"
+                log_error("task_manager", fn_name, msg + f" for task {task_id}.", user_id=user_id)
+                errors.append(msg)
         except Exception as e:
-            log_error("task_manager", fn_name, f"Error creating GCal event for session {i+1} of task {task_id}", e)
-            errors.append(f"Session {i+1} creation error: {type(e).__name__}")
+            msg = f"Session {i+1} creation error: {type(e).__name__}"
+            log_error("task_manager", fn_name, f"Error creating GCal session {i+1} for task {task_id}", e, user_id=user_id)
+            errors.append(msg)
 
     if not created_session_ids:
-        log_error("task_manager", fn_name, f"Failed to create any GCal session events for task {task_id}.")
-        error_summary = "; ".join(errors)
-        return {"success": False, "message": f"Sorry, I couldn't add the proposed sessions to your calendar. Errors: {error_summary}", "session_ids": []}
+        err_summary = "; ".join(errors) if errors else "Unknown reason"
+        log_error("task_manager", fn_name, f"Failed to create any GCal sessions for task {task_id}. Errors: {err_summary}", user_id=user_id)
+        return {**default_fail_result, "message": f"Sorry, couldn't add sessions to calendar. Errors: {err_summary}"}
 
-    log_info("task_manager", fn_name, f"Successfully created {len(created_session_ids)} GCal session events for task {task_id}: {created_session_ids}")
+    log_info("task_manager", fn_name, f"Created {len(created_session_ids)} GCal sessions for task {task_id}: {created_session_ids}")
 
-    # --- Update Main Task Metadata ---
-    try:
-        existing_ids_json = task_metadata.get("session_event_ids", "[]")
-        existing_session_ids = json.loads(existing_ids_json) if isinstance(existing_ids_json, str) and existing_ids_json.strip() else []
-        if not isinstance(existing_session_ids, list): existing_session_ids = []
-    except json.JSONDecodeError:
-        log_error("task_manager", fn_name, f"Failed to parse existing session IDs for task {task_id}. Overwriting.")
-        existing_session_ids = []
-
-    # Combine old and new, removing duplicates
+    # 3. Update Parent Task in DB
+    # Combine existing and new session IDs
+    existing_session_ids = task_metadata.get("session_event_ids", []) # Already decoded list
+    if not isinstance(existing_session_ids, list): existing_session_ids = []
     all_session_ids = list(set(existing_session_ids + created_session_ids))
 
-    metadata_update_payload = {
-        "sessions_planned": len(all_session_ids),
-        "session_event_ids": json.dumps(all_session_ids),
-        "status": "in_progress" # Update status when sessions are booked
-    }
+    update_payload = task_metadata.copy()
+    update_payload["sessions_planned"] = len(all_session_ids)
+    update_payload["session_event_ids"] = all_session_ids # Store list, add_or_update handles JSON
+    update_payload["status"] = "in_progress" # Mark task as in progress
 
-    # Apply updates to a copy
-    updated_metadata = task_metadata.copy()
-    updated_metadata.update(metadata_update_payload)
-    # Prepare final dict with only defined FIELDNAMES
-    meta_to_save = {fn: updated_metadata.get(fn) for fn in metadata_store.FIELDNAMES}
+    save_success = activity_db.add_or_update_task(update_payload)
 
-    try:
-        metadata_store.save_event_metadata(meta_to_save)
-        log_info("task_manager", fn_name, f"Updated parent task {task_id} metadata with session info.")
-        if AGENT_STATE_MANAGER_IMPORTED: update_task_in_context(user_id, task_id, meta_to_save)
-    except Exception as meta_e:
-         log_error("task_manager", fn_name, f"Created GCal sessions, but failed update metadata for task {task_id}.", meta_e)
-         log_warning("task_manager", fn_name, f"Attempting rollback of {len(created_session_ids)} GCal sessions for {task_id}.")
-         if calendar_api:
-             for sid in created_session_ids:
-                 try: calendar_api.delete_event(sid)
-                 except Exception as del_e: log_error("task_manager", fn_name, f"Rollback delete failed for session {sid}", del_e)
-         else: log_warning("task_manager", fn_name, "Cannot perform GCal rollback as calendar_api is not available.")
-         return {"success": False, "message": "Scheduled sessions in calendar, but failed to link them to the task. Rolling back calendar changes.", "session_ids": []}
+    if save_success:
+        log_info("task_manager", fn_name, f"Parent task {task_id} updated in DB with session info.")
+        updated_task_data = activity_db.get_task(task_id) # Get final state
+        if updated_task_data and AGENT_STATE_MANAGER_IMPORTED:
+            update_task_in_context(user_id, task_id, updated_task_data) # Update memory
 
-    # --- Return Success ---
-    num_sessions = len(created_session_ids)
-    plural_s = "s" if num_sessions > 1 else ""
-    success_message = f"Okay, I've scheduled {num_sessions} work session{plural_s} for '{task_title}' in your calendar."
-    if errors: success_message += f" (Note: Issues encountered with {len(errors)} potential sessions)."
+        num_booked = len(created_session_ids)
+        plural_s = "s" if num_booked > 1 else ""
+        msg = f"Okay, I've scheduled {num_booked} work session{plural_s} for '{task_title}' in your calendar."
+        if errors: msg += f" (Issues with {len(errors)} other slots)."
+        return {"success": True, "booked_count": num_booked, "message": msg, "session_ids": created_session_ids}
+    else:
+        log_error("task_manager", fn_name, f"Created GCal sessions for {task_id}, but failed DB update.", user_id=user_id)
+        # Rollback GCal changes
+        log_warning("task_manager", fn_name, f"Attempting GCal rollback for {len(created_session_ids)} sessions (Task ID: {task_id}).")
+        if calendar_api is not None:
+            for sid in created_session_ids:
+                try: calendar_api.delete_event(sid)
+                except Exception: log_error("task_manager", fn_name, f"GCal rollback delete failed for session {sid}", user_id=user_id)
+        return {**default_fail_result, "message": "Scheduled sessions, but failed to link to task. Calendar changes rolled back."}
 
-    return {"success": True, "message": success_message, "session_ids": created_session_ids}
-
-
-def cancel_sessions(user_id, task_id, session_ids_to_cancel):
-    """Cancels specific GCal work sessions and updates task metadata."""
+# Returns dict with 'success', 'cancelled_count', 'message'
+def cancel_sessions(user_id: str, task_id: str, session_ids_to_cancel: List[str]) -> Dict:
+    """Cancels specific GCal work sessions and updates task metadata in DB."""
     fn_name = "cancel_sessions"
+    default_fail_result = {"success": False, "cancelled_count": 0, "message": "An unexpected error occurred."}
+    if not DB_IMPORTED:
+        return {**default_fail_result, "message": "Database module not available."}
+
     log_info("task_manager", fn_name, f"Cancelling {len(session_ids_to_cancel)} sessions for task {task_id}")
-    if not METADATA_STORE_IMPORTED:
-        return {"success": False, "cancelled_count": 0, "message": "Metadata store unavailable."}
 
     calendar_api = _get_calendar_api(user_id)
-    if not calendar_api:
-        return {"success": False, "cancelled_count": 0, "message": "Calendar is not connected or active."}
+    if calendar_api is None:
+        return {**default_fail_result, "message": "Calendar is not connected or active."}
 
-    # --- Get Task Metadata ---
-    task_metadata = metadata_store.get_event_metadata(task_id)
-    if not task_metadata or task_metadata.get("user_id") != user_id:
-        log_error("task_manager", fn_name, f"Original task {task_id} not found or user mismatch.")
-        return {"success": False, "cancelled_count": 0, "message": "Original task details not found."}
+    # 1. Get Parent Task from DB
+    task_metadata = activity_db.get_task(task_id)
+    if task_metadata is None:
+        log_error("task_manager", fn_name, f"Parent task {task_id} not found.", user_id=user_id)
+        return {**default_fail_result, "message": "Original task details not found."}
+    if task_metadata.get("user_id") != user_id: # Check ownership
+         log_error("task_manager", fn_name, f"User mismatch for task {task_id}.", user_id=user_id)
+         return {**default_fail_result, "message": "Task ownership mismatch."}
     if task_metadata.get("type") != "task":
-         return {"success": False, "cancelled_count": 0, "message": "Can only cancel sessions for tasks."}
+         return {**default_fail_result, "message": "Can only cancel sessions for tasks."}
 
-    # --- Delete GCal Events ---
+    # 2. Delete GCal Events
     cancelled_count = 0
     errors = []
-    valid_ids_to_cancel_gcal = [sid for sid in session_ids_to_cancel if not str(sid).startswith("local_")]
+    valid_gcal_ids_to_cancel = [sid for sid in session_ids_to_cancel if isinstance(sid, str) and not sid.startswith("local_")]
 
-    for session_id in valid_ids_to_cancel_gcal:
+    for session_id in valid_gcal_ids_to_cancel:
         try:
-            deleted = calendar_api.delete_event(session_id)
-            if deleted:
-                cancelled_count += 1
-            # else: delete_event now returns True even if 404/410, so this branch likely won't hit often
+            deleted = calendar_api.delete_event(session_id) # Returns bool
+            if deleted: cancelled_count += 1
+            # else: delete_event logs warning if not found/failed
         except Exception as e:
-            log_error("task_manager", fn_name, f"Error deleting GCal session {session_id} for task {task_id}", e)
+            log_error("task_manager", fn_name, f"Error deleting GCal session {session_id} for task {task_id}", e, user_id=user_id)
             errors.append(session_id)
+    log_info("task_manager", fn_name, f"GCal delete attempts for task {task_id}: Success/Gone: {cancelled_count}, Errors: {len(errors)}")
 
-    log_info("task_manager", fn_name, f"GCal delete attempts completed for task {task_id}. Success/Gone: {cancelled_count}, Errors: {len(errors)}")
+    # 3. Update Parent Task in DB
+    existing_session_ids = task_metadata.get("session_event_ids", []) # Already list from get_task
+    if not isinstance(existing_session_ids, list): existing_session_ids = []
 
-    # --- Update Metadata ---
-    try:
-        existing_ids_json = task_metadata.get("session_event_ids", "[]")
-        existing_session_ids = json.loads(existing_ids_json) if isinstance(existing_ids_json, str) and existing_ids_json.strip() else []
-        if not isinstance(existing_session_ids, list): existing_session_ids = []
-    except json.JSONDecodeError:
-        log_error("task_manager", fn_name, f"Corrupted session IDs JSON for task {task_id}. Resetting.")
-        existing_session_ids = []
-
-    cancelled_set = set(session_ids_to_cancel) # Use the original list including potential local IDs
+    cancelled_set = set(session_ids_to_cancel) # Use original list (might include local IDs intended for removal)
     remaining_ids = [sid for sid in existing_session_ids if sid not in cancelled_set]
 
-    metadata_updates = {
-        "sessions_planned": len(remaining_ids),
-        "session_event_ids": json.dumps(remaining_ids)
-        # Consider if status should change back from 'in_progress' if all sessions cancelled?
-        # "status": "pending" if not remaining_ids else "in_progress"
-    }
-    updated_metadata = task_metadata.copy()
-    updated_metadata.update(metadata_updates)
-    meta_to_save = {fn: updated_metadata.get(fn) for fn in metadata_store.FIELDNAMES}
+    update_payload = task_metadata.copy()
+    update_payload["sessions_planned"] = len(remaining_ids)
+    update_payload["session_event_ids"] = remaining_ids # Store list for DB function
+    # Only change status to pending if NO sessions remain, otherwise keep current status
+    if not remaining_ids:
+        update_payload["status"] = "pending"
 
-    try:
-        metadata_store.save_event_metadata(meta_to_save)
-        log_info("task_manager", fn_name, f"Updated parent task {task_id} metadata after cancelling sessions.")
-        if AGENT_STATE_MANAGER_IMPORTED: update_task_in_context(user_id, task_id, meta_to_save)
-        message = f"Successfully cancelled {cancelled_count} session(s)." # Report GCal deletions
-        if errors: message += f" Encountered errors cancelling {len(errors)}."
-        return {"success": True, "cancelled_count": cancelled_count, "message": message}
-    except Exception as meta_e:
-        log_error("task_manager", fn_name, f"Deleted GCal sessions, but failed update metadata for task {task_id}.", meta_e)
-        # This is tricky - GCal events are gone, but metadata isn't updated.
-        return {"success": False, "cancelled_count": cancelled_count, "message": "Cancelled sessions in calendar, but failed to update the task link."}
-# --- END OF FILE services/task_manager.py ---
+    save_success = activity_db.add_or_update_task(update_payload)
+
+    if save_success:
+        log_info("task_manager", fn_name, f"Parent task {task_id} updated in DB after session cancellation.")
+        updated_task_data = activity_db.get_task(task_id) # Get final state
+        if updated_task_data and AGENT_STATE_MANAGER_IMPORTED:
+            update_task_in_context(user_id, task_id, updated_task_data) # Update memory
+
+        msg = f"Successfully cancelled {cancelled_count} session(s) from your calendar."
+        if errors: msg += f" Encountered errors cancelling {len(errors)}."
+        return {"success": True, "cancelled_count": cancelled_count, "message": msg}
+    else:
+        log_error("task_manager", fn_name, f"Deleted GCal sessions for {task_id}, but failed DB update.", user_id=user_id)
+        # Inconsistent state: GCal events gone, DB still references them. Hard to roll back GCal deletes.
+        return {**default_fail_result, "cancelled_count": cancelled_count, "message": "Cancelled sessions in calendar, but failed to update the task link."}
+
+# --- END OF REFACTORED services/task_manager.py ---

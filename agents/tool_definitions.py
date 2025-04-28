@@ -12,7 +12,6 @@ import services.task_manager as task_manager
 import services.config_manager as config_manager
 import services.task_query_service as task_query_service
 from services.agent_state_manager import get_agent_state, add_task_to_context, update_task_in_context # Assuming AGENT_STATE_MANAGER_IMPORTED is handled internally or true
-from tools import metadata_store
 # Import the class itself for type checking if needed, handle import error
 try:
     from tools.google_calendar_api import GoogleCalendarAPI
@@ -21,6 +20,22 @@ except ImportError:
      GoogleCalendarAPI = None
      GCAL_API_IMPORTED = False
 
+try:
+    import tools.activity_db as activity_db_real # Use a different alias
+    DB_IMPORTED = True
+    # Define activity_db to point to the real one
+    activity_db = activity_db_real
+except ImportError:
+    DB_IMPORTED = False
+    log_error("tool_definitions", "update_item_details_tool_import", "Failed to import real activity_db. Fallback active.", None)
+    # Define a dummy class with the necessary static method
+    class activity_db_dummy:
+        @staticmethod
+        def get_task(*a, **k):
+             log_warning("tool_definitions", "activity_db_dummy.get_task", "Using dummy get_task - DB not imported.")
+             return None
+    # Define activity_db to point to the dummy
+    activity_db = activity_db_dummy
 
 # LLM Interface (for scheduler sub-call)
 from services.llm_interface import get_instructor_client
@@ -178,8 +193,9 @@ class ProposeTaskSlotsParams(BaseModel):
     duration: str = Field(...)
     timeframe: str = Field(...)
     description: str | None = Field(None)
-    split_preference: str | None = Field(None)
-    num_options_to_propose: int | None = Field(3) # Allow None, default applied in code if needed
+    # REMOVE split_preference: str | None = Field(None)
+    scheduling_hints: str | None = Field(None, description="User's specific scheduling preferences or constraints provided in natural language, e.g., 'in the afternoon', 'not on Monday', 'needs one continuous block', 'split into sessions'.") # <-- ADD this
+    num_options_to_propose: int | None = Field(3)
     @field_validator('num_options_to_propose')
     @classmethod
     def check_num_options(cls, v: int | None):
@@ -282,14 +298,29 @@ class GetFormattedTaskListParams(BaseModel):
     project_filter: str | None = Field(None)
     @field_validator('date_range')
     @classmethod
-    def validate_date_range(cls, v: list[str] | None):
+    @classmethod
+    def validate_and_normalize_date_range(cls, v: list[str] | None):
         if v is None: return v
-        if not isinstance(v, list) or len(v) != 2: raise ValueError("date_range must be a list of two date strings.")
-        try:
-            start_date = datetime.strptime(v[0], '%Y-%m-%d').date(); end_date = datetime.strptime(v[1], '%Y-%m-%d').date()
-            if start_date > end_date: raise ValueError("Start date cannot be after end date.")
-            return v
-        except (ValueError, TypeError): raise ValueError("Dates must be valid YYYY-MM-DD strings.")
+        if not isinstance(v, list): raise ValueError("date_range must be a list of date strings.")
+        if len(v) == 1:
+            # If only one date provided, assume it's start and end
+            try:
+                the_date = datetime.strptime(v[0], '%Y-%m-%d').date()
+                log_warning("tool_definitions", "validate_date_range", f"Received single date {v[0]}, assuming start/end.")
+                return [v[0], v[0]] # Return list with duplicated date
+            except (ValueError, TypeError):
+                raise ValueError("Single date provided is not a valid YYYY-MM-DD string.")
+        elif len(v) == 2:
+            # Validate two dates
+            try:
+                start_date = datetime.strptime(v[0], '%Y-%m-%d').date()
+                end_date = datetime.strptime(v[1], '%Y-%m-%d').date()
+                if start_date > end_date: raise ValueError("Start date cannot be after end date.")
+                return v # Return original valid pair
+            except (ValueError, TypeError):
+                raise ValueError("Dates must be valid YYYY-MM-DD strings.")
+        else: # Invalid number of elements
+            raise ValueError("date_range must be a list of one or two date strings.")
     @field_validator('status_filter')
     @classmethod
     def check_status_filter(cls, v: str | None):
@@ -354,14 +385,14 @@ def create_task_tool(user_id, params: CreateTaskParams):
 # Returns dict
 def propose_task_slots_tool(user_id, params: ProposeTaskSlotsParams):
     """
-    Finds available work session slots based on duration/timeframe BEFORE task creation.
+    Finds available work session slots based on duration/timeframe and hints.
     Uses an LLM sub-call for intelligent slot finding, considering calendar events.
     Returns proposed slots and the search context used.
     """
     fn_name = "propose_task_slots_tool"
     fail_result = {"success": False, "proposed_slots": None, "message": "Sorry, I encountered an issue trying to propose schedule slots.", "search_context": None}
     try:
-        log_info("tool_definitions", fn_name, f"Executing user={user_id}. Search: duration='{params.duration}', timeframe='{params.timeframe}'...")
+        log_info("tool_definitions", fn_name, f"Executing user={user_id}. Search: duration='{params.duration}', timeframe='{params.timeframe}', hints='{params.scheduling_hints}'")
         search_context_to_return = params.model_dump() # Store validated input as basis for context
 
         llm_client = get_instructor_client()
@@ -376,7 +407,7 @@ def propose_task_slots_tool(user_id, params: ProposeTaskSlotsParams):
 
         agent_state = get_agent_state(user_id);
         prefs = agent_state.get("preferences", {}) if agent_state else {}
-        calendar_api = _get_calendar_api_from_state(user_id) # Returns instance or None
+        calendar_api = _get_calendar_api_from_state(user_id)
         preferred_session_str = prefs.get("Preferred_Session_Length", "60m")
 
         task_estimated_duration_str = params.duration;
@@ -385,67 +416,105 @@ def propose_task_slots_tool(user_id, params: ProposeTaskSlotsParams):
              log_error("tool_definitions", fn_name, f"Invalid duration '{task_estimated_duration_str}'")
              return {**fail_result, "message": f"Invalid duration format: '{task_estimated_duration_str}'. Use 'Xh' or 'Ym'."}
 
-        # Determine slot duration and count
+        # Determine target slot duration and count based on total duration,
+        # user preferred length, and hints about splitting/continuity.
         session_minutes = task_manager._parse_duration_to_minutes(preferred_session_str) or 60
-        num_slots_to_find = 1;
-        slot_duration_str = task_estimated_duration_str # Default: find one continuous block
-        split_pref = params.split_preference.lower() if params.split_preference else None
+        num_slots_to_find = 1
+        slot_duration_str = task_estimated_duration_str # Default to one continuous block
+        hints_lower = (params.scheduling_hints or "").lower()
 
-        # Split if requested OR if task > preferred session and preference not set to continuous
-        if split_pref == 'separate' or (split_pref is None and total_minutes > session_minutes):
-            if session_minutes > 0:
-                num_slots_to_find = (total_minutes + session_minutes - 1) // session_minutes # Ceiling division
-            else: num_slots_to_find = 1 # Avoid division by zero if session_minutes is bad
-            if num_slots_to_find <= 0 : num_slots_to_find = 1 # Ensure at least one slot
-            slot_duration_str = preferred_session_str
-            log_info("tool_definitions", fn_name, f"Requesting {num_slots_to_find} split sessions of duration: {slot_duration_str}")
-        elif split_pref == 'continuous':
-            log_info("tool_definitions", fn_name, f"Requesting 1 continuous block of duration: {slot_duration_str}")
-        else: # Default case (task <= preferred session, or error in logic)
-            log_info("tool_definitions", fn_name, f"Requesting 1 block of duration: {slot_duration_str}")
+        # Decide on splitting based on hints or duration comparison
+        # Prioritize hint if given, otherwise compare total duration to preferred session length
+        needs_split = False
+        if "continuous" in hints_lower or "one block" in hints_lower or "one slot" in hints_lower:
+             needs_split = False
+             log_info("tool_definitions", fn_name, "Hint indicates continuous block required.")
+        elif "split" in hints_lower or "separate" in hints_lower or "multiple sessions" in hints_lower:
+             needs_split = True
+             log_info("tool_definitions", fn_name, "Hint indicates split sessions required.")
+        elif session_minutes > 0 and total_minutes > session_minutes:
+             # Default to split if no hint and total > preferred
+             needs_split = True
+             log_info("tool_definitions", fn_name, "Defaulting to split sessions (total > preferred, no specific hint).")
 
-        # Determine search date range based on timeframe
-        # --- This logic seems complex but reasonable for interpreting common phrases ---
-        # --- Keeping it as is for now ---
+        if needs_split and session_minutes > 0:
+             num_slots_to_find = (total_minutes + session_minutes - 1) // session_minutes
+             if num_slots_to_find <= 0 : num_slots_to_find = 1
+             slot_duration_str = preferred_session_str # Use preferred length for each split slot
+             log_info("tool_definitions", fn_name, f"Calculated need for {num_slots_to_find} split sessions of duration: {slot_duration_str}")
+        else:
+            # Stays as 1 slot with total duration
+            log_info("tool_definitions", fn_name, f"Calculated need for 1 continuous block of duration: {slot_duration_str}")
+
+        # Timeframe parsing logic (keep as is)
         today = datetime.now().date(); start_date = today + timedelta(days=1); due_date_for_search = None
         tf = params.timeframe.lower()
-        if "tomorrow" in tf: start_date = today + timedelta(days=1); due_date_for_search = start_date
-        elif "next week" in tf: start_of_next_week = today + timedelta(days=(7 - today.weekday())); start_date = start_of_next_week; due_date_for_search = start_of_next_week + timedelta(days=6)
+        # --- Add parsing for ISO interval ---
+        iso_interval_match = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]\d{2}:\d{2}|Z))/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]\d{2}:\d{2}|Z))", params.timeframe)
+        if iso_interval_match:
+             try:
+                  start_iso, end_iso = iso_interval_match.groups()
+                  # Convert to date for search range (ignoring time part for the range boundary)
+                  start_dt_aware = datetime.fromisoformat(start_iso.replace('Z', '+00:00'))
+                  # For end date, we want the day it ends on
+                  end_dt_aware = datetime.fromisoformat(end_iso.replace('Z', '+00:00'))
+                  start_date = start_dt_aware.date()
+                  # Make sure start is not before tomorrow
+                  start_date = max(start_date, today + timedelta(days=1))
+                  due_date_for_search = end_dt_aware.date() # Use end date as effective due date
+                  log_info("tool_definitions", fn_name, f"Parsed ISO Interval: Start={start_date}, EffectiveDue={due_date_for_search}")
+             except ValueError as iso_parse_err:
+                  log_warning("tool_definitions", fn_name, f"Failed to parse ISO interval timeframe '{params.timeframe}': {iso_parse_err}")
+                  # Fallback to default window if parse fails
+        # --- Continue with existing timeframe parsing ---
+        elif "tomorrow" in tf: start_date = today + timedelta(days=1); due_date_for_search = start_date
+        elif "next week" in tf:
+             start_of_next_week = today + timedelta(days=(7 - today.weekday()))
+             start_date = start_of_next_week
+             due_date_for_search = start_of_next_week + timedelta(days=6)
+             log_info("tool_definitions", fn_name, f"Parsed 'next week': Start={start_date}, EffectiveDue={due_date_for_search}")
         elif "on " in tf:
             try: date_part = tf.split("on ")[1].strip(); parsed_date = datetime.strptime(date_part, "%Y-%m-%d").date(); start_date = max(parsed_date, today + timedelta(days=1)); due_date_for_search = start_date
             except Exception: log_warning("tool_definitions", fn_name, f"Parsing timeframe date failed: '{params.timeframe}'")
         elif "by " in tf:
-            try: date_part = tf.split("by ")[1].strip(); parsed_date = datetime.strptime(date_part, "%Y-%m-%d").date(); due_date_for_search = parsed_date; start_date = max(today + timedelta(days=1), parsed_date - timedelta(days=14)) # Search up to 2 weeks before 'by' date
+            try: date_part = tf.split("by ")[1].strip(); parsed_date = datetime.strptime(date_part, "%Y-%m-%d").date(); due_date_for_search = parsed_date; start_date = max(today + timedelta(days=1), parsed_date - timedelta(days=14))
             except Exception: log_warning("tool_definitions", fn_name, f"Parsing timeframe 'by' date failed: '{params.timeframe}'")
+        # --- Add parsing for "later today/tonight" etc. ---
+        elif "later today" in tf or "tonight" in tf or "this afternoon" in tf:
+             start_date = today # Search starts today
+             due_date_for_search = today # Due date is today
+             log_info("tool_definitions", fn_name, f"Parsed relative timeframe '{tf}': Start={start_date}, EffectiveDue={due_date_for_search}")
+             # Note: Hints should guide the sub-LLM to pick *later* slots
+        # --- Default case ---
         else: log_warning("tool_definitions", fn_name, f"Unclear timeframe '{params.timeframe}', using default window.")
 
-        # Calculate end date, ensuring buffer before due date
         default_horizon_days = 56; end_date_limit = start_date + timedelta(days=default_horizon_days - 1)
-        # Set end_date to 1 day before due date if due date exists and is after start_date
         end_date = end_date_limit
-        if due_date_for_search and due_date_for_search > start_date:
-             end_date = min(end_date_limit, due_date_for_search - timedelta(days=1))
-        end_date = max(end_date, start_date); # Ensure end is not before start
+        if due_date_for_search and due_date_for_search >= start_date: # Use >= to allow same day start/end
+             # Allow buffer unless start/end are same day
+             buffer_days = 0 if start_date == due_date_for_search else 1
+             end_date = min(end_date_limit, due_date_for_search - timedelta(days=buffer_days))
+        end_date = max(end_date, start_date); # Ensure end >= start
         start_date_str, end_date_str = start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
         log_info("tool_definitions", fn_name, f"Derived Search Range: {start_date_str} to {end_date_str}")
+        # Update search context with parsed dates and original timeframe for sub-LLM
         search_context_to_return["effective_due_date"] = due_date_for_search.strftime("%Y-%m-%d") if due_date_for_search else None
-        search_context_to_return["search_start_date"] = start_date_str # Add for clarity
-        search_context_to_return["search_end_date"] = end_date_str   # Add for clarity
+        search_context_to_return["search_start_date"] = start_date_str
+        search_context_to_return["search_end_date"] = end_date_str
+        search_context_to_return["original_timeframe"] = params.timeframe # Keep original for sub-LLM context
 
-        # Fetch existing calendar events
+        # Fetch existing calendar events (keep as is)
         existing_events = [];
-        if calendar_api is not None: # Check if API instance exists
+        if calendar_api is not None:
             log_info("tool_definitions", fn_name, f"Fetching GCal events from {start_date_str} to {end_date_str}")
             if start_date <= end_date:
                 try:
-                    events_raw = calendar_api.list_events(start_date_str, end_date_str) # Returns list of dicts or []
-                    # Ensure necessary keys exist before adding
+                    events_raw = calendar_api.list_events(start_date_str, end_date_str)
                     existing_events = [
                          {"start_datetime": ev.get("gcal_start_datetime"), "end_datetime": ev.get("gcal_end_datetime"), "summary": ev.get("title")}
                          for ev in events_raw if ev.get("gcal_start_datetime") and ev.get("gcal_end_datetime")
                     ]
                     log_info("tool_definitions", fn_name, f"Fetched {len(existing_events)} valid GCal events.")
-                    # log_info("tool_definitions", f"{fn_name}_DEBUG", f"Existing Events Sent: {json.dumps(existing_events, indent=2)}")
                 except Exception as e:
                      log_error("tool_definitions", fn_name, f"Fetch GCal events failed: {e}", e)
             else:
@@ -455,44 +524,50 @@ def propose_task_slots_tool(user_id, params: ProposeTaskSlotsParams):
 
         # Prepare data for LLM scheduler sub-call
         try:
-            num_options = params.num_options_to_propose if params.num_options_to_propose is not None else 3
+            # Ask sub-LLM for the number of slots we actually need
+            slots_to_request_from_llm = num_slots_to_find
             prompt_data = {
                 "task_description": params.description or "(No description)",
                 "task_due_date": search_context_to_return["effective_due_date"] or "(No specific due date)",
-                "task_estimated_duration": task_estimated_duration_str, # Total duration
+                "task_estimated_duration": task_estimated_duration_str,
                 "user_working_days": prefs.get("Work_Days", ["Mon", "Tue", "Wed", "Thu", "Fri"]),
                 "user_work_start_time": prefs.get("Work_Start_Time", "09:00"),
                 "user_work_end_time": prefs.get("Work_End_Time", "17:00"),
-                "user_session_length": slot_duration_str, # Duration of EACH slot to find
+                "user_session_length": slot_duration_str, # Duration PER slot
                 "existing_events_json": json.dumps(existing_events),
                 "current_date": today.strftime("%Y-%m-%d"),
-                "num_slots_requested": num_options # Ask LLM for N options
+                "num_slots_requested": slots_to_request_from_llm, # Use calculated number
+                "search_start_date": start_date_str,
+                "search_end_date": end_date_str,
+                "scheduling_hints": params.scheduling_hints or "None" # Pass hints
             }
-            # log_info("tool_definitions", f"{fn_name}_DEBUG", f"Data Sent to Scheduler LLM: {json.dumps(prompt_data, indent=2)}")
-            log_info("tool_definitions", fn_name, f"Scheduler prompt data prepared (event count: {len(existing_events)}).")
+            log_info("tool_definitions", fn_name, f"Scheduler prompt data prepared (requesting {slots_to_request_from_llm} slots, event count: {len(existing_events)}).")
         except Exception as e:
              log_error("tool_definitions", fn_name, f"Failed prepare prompt data for scheduler: {e}", e)
              return {**fail_result, "message": "Failed prepare data for scheduler."}
 
-        # Call LLM and parse response
+        # Call LLM and parse response (keep as is)
         raw_llm_output = None; parsed_data = None
         try:
             fmt_human = human_prompt.format(**prompt_data)
             messages = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": fmt_human}]
             log_info("tool_definitions", fn_name, ">>> Invoking Session Scheduler LLM...")
-            # Expect JSON object directly from GPT-4o
             sched_resp = llm_client.chat.completions.create(model="gpt-4o", messages=messages, temperature=0.2, response_format={"type": "json_object"})
             raw_llm_output = sched_resp.choices[0].message.content
-            # log_info("tool_definitions", fn_name, f"<<< Scheduler LLM Raw Resp: {raw_llm_output[:300]}...")
-            # log_info("tool_definitions", f"{fn_name}_DEBUG", f"Full Raw LLM Resp: {raw_llm_output}")
-            parsed_data = _parse_scheduler_llm_response(raw_llm_output) # Use helper to parse and validate
-            if parsed_data is None: # Check parse result
+            parsed_data = _parse_scheduler_llm_response(raw_llm_output)
+            if parsed_data is None:
                 log_error("tool_definitions", fn_name, "Scheduler response parse failed or returned invalid structure.")
                 return {**fail_result, "message": "Received invalid proposals format from scheduler."}
 
             log_info("tool_definitions", f"{fn_name}_DEBUG", f"Parsed Scheduler LLM Resp: {json.dumps(parsed_data, indent=2)}")
+            # --- Check if enough slots were returned ---
+            num_returned = len(parsed_data.get("proposed_sessions", []))
+            if num_returned < num_slots_to_find:
+                 log_warning("tool_definitions", fn_name, f"Sub-LLM returned only {num_returned} slots, but {num_slots_to_find} were needed.")
+                 # Append to message? Modify success? For now, just return what was found.
+                 parsed_data["response_message"] += f" (Note: Only found {num_returned} of the {num_slots_to_find} required slots)."
+            # -------------------------------------------
             log_info("tool_definitions", fn_name, f"Scheduler LLM processing successful.")
-            # Return success with parsed slots and the context used
             return {"success": True, "proposed_slots": parsed_data.get("proposed_sessions"), "message": parsed_data.get("response_message", "..."), "search_context": search_context_to_return}
         except Exception as e:
             tb_str = traceback.format_exc()
@@ -505,7 +580,7 @@ def propose_task_slots_tool(user_id, params: ProposeTaskSlotsParams):
     except Exception as e:
          log_error("tool_definitions", fn_name, f"Unexpected error in propose_task_slots: {e}", e)
          return fail_result
-
+         
 # Returns dict
 def finalize_task_and_book_sessions_tool(user_id, params: FinalizeTaskAndBookSessionsParams):
     """Creates a task metadata record AND books the approved work sessions in GCal."""
@@ -576,24 +651,34 @@ def finalize_task_and_book_sessions_tool(user_id, params: FinalizeTaskAndBookSes
 
 # Returns dict
 def update_item_details_tool(user_id, params: UpdateItemDetailsParams):
+    """Updates core details ONLY (desc, date, time, estimate, project). Not status."""
+    # This docstring was slightly incorrect before, fixed it.
     fn_name = "update_item_details_tool";
+
     try:
         log_info("tool_definitions", fn_name, f"Executing user={user_id}, item={params.item_id}, updates={list(params.updates.keys())}")
-        updated_item = task_manager.update_task(user_id, params.item_id, params.updates) # Pass validated updates
+        # Call task_manager which now uses DB (via the imported activity_db alias)
+        updated_item = task_manager.update_task(user_id, params.item_id, params.updates)
+
         if updated_item:
              return {"success": True, "message": f"Item '{params.item_id[:8]}...' updated successfully."}
         else:
              log_warning("tool_definitions", fn_name, f"Update failed for item {params.item_id} (not found or no change?).")
-             # Check if item exists to provide better message
-             if metadata_store.get_event_metadata(params.item_id):
+             # Check DB to see if item exists to give better error msg
+             # Uses the activity_db alias (which points to real or dummy)
+             item_exists = activity_db.get_task(params.item_id) is not None
+
+             if item_exists:
                   return {"success": False, "message": f"Failed to apply updates to item {params.item_id[:8]}... (perhaps no change or internal error)."}
              else:
                   return {"success": False, "message": f"Item {params.item_id[:8]}... not found."}
     except pydantic.ValidationError as e:
-         log_error("tool_definitions", fn_name, f"Validation Error: {e}");
+         # Log validation error with user context if possible (user_id available here)
+         log_error("tool_definitions", fn_name, f"Validation Error: {e}", e, user_id=user_id)
          return {"success": False, "message": f"Invalid parameters: {e}"}
     except Exception as e:
-         log_error("tool_definitions", fn_name, f"Unexpected error: {e}", e)
+         # Log unexpected error with user context
+         log_error("tool_definitions", fn_name, f"Unexpected error: {e}", e, user_id=user_id)
          return {"success": False, "message": f"Error during update: {e}."}
 
 # Returns dict

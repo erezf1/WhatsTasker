@@ -10,7 +10,8 @@ project_files = [
     "WhatsTasker_PRD_08.txt",       # v0.8 Product Requirements
     "WhatsTasker_SRS_08.txt",       # v0.8 Software Requirements/Architecture
     "requirements.txt",             # Includes APScheduler now
-
+    "wa_bridge.js"                  # js cript to work with the WAweb
+    "monitor_whatstasker.sh",       #activation script
     # ================== CONFIGURATION ==================
     "config/prompts.yaml",          # Includes Orchestrator, Onboarding, Scheduler prompts
     "config/messages.yaml",         # Includes welcome message and others
@@ -23,6 +24,7 @@ project_files = [
     # ================== BRIDGE ==================
     "bridge/request_router.py",     # Handles routing based on status
     "bridge/cli_interface.py",      # FastAPI endpoints for CLI bridge
+    "bridge/whatsapp_interface.py",      # FastAPI endpoints for CLI bridge
 
     # ================== AGENT LAYER (v0.8) ==================
     "agents/orchestrator_agent.py", # Main agent logic (pure LLM flow)
@@ -49,7 +51,7 @@ project_files = [
     "tools/token_store.py",         # Encrypted token storage
     "tools/encryption.py",          # Encryption utilities
     "tools/logger.py",              # Logging setup
-
+    "tools/activity_db.py",         #new db file
     # ================== USERS (State & Preferences) ==================
     "users/user_manager.py",        # Initializes agent states (with notification set)
     "users/user_registry.py",       # Persistent user preferences store (JSON - updated defaults)

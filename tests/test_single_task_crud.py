@@ -89,7 +89,7 @@ def run_create_delete_test() -> bool:
             context = agent_state_manager.get_context(TEST_USER_ID)
             if not _assert(context and any(t.get('event_id') == created_event_id for t in context), "Created task not found in context"): overall_success = False
             # Verify persistent metadata
-            meta_check = metadata_store.get_event_metadata(created_event_id)
+            meta_check = activity_db.get_task(created_event_id)
             if not _assert(meta_check and meta_check.get('event_id') == created_event_id, "Created task metadata not found"): overall_success = False
 
         # 3. Delete Task/Reminder
@@ -104,7 +104,7 @@ def run_create_delete_test() -> bool:
             context_after_delete = agent_state_manager.get_context(TEST_USER_ID)
             if not _assert(context_after_delete is None or not any(t.get('event_id') == created_event_id for t in context_after_delete), "Deleted task still found in context"): overall_success = False
             # Verify persistent metadata deleted
-            meta_check_after_delete = metadata_store.get_event_metadata(created_event_id)
+            meta_check_after_delete = activity_db.get_task(created_event_id)
             if not _assert(not meta_check_after_delete, "Deleted task metadata still found"): overall_success = False
 
 

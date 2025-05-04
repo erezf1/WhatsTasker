@@ -1,5 +1,5 @@
 # WhatsTasker Project Code Dump (v0.8 Architecture Target + Scheduler)
-# Generated: 2025-04-28 13:09:27
+# Generated: 2025-05-04 16:30:36
 
 ================================================================================
 📄 README.md
@@ -255,6 +255,167 @@ openai>=1.0.0,<2.0.0     # Instructor depends on OpenAI v1+
 
 
 ================================================================================
+📄 wa_bridge.js
+================================================================================
+
+# --- START OF FILE wa_bridge.js ---
+// whatsapp_bridge.js
+
+const { Client, LocalAuth } = require('whatsapp-web.js');
+const qrcode = require('qrcode-terminal');
+const axios = require('axios');
+
+// --- Configuration ---
+const FASTAPI_BASE_URL = 'http://localhost:8000'; // Make base URL configurable
+const POLLING_INTERVAL_MS = 1000; // Poll every 1 second
+const RETRY_INTERVAL_MS = 5000; // Retry connection errors every 5 seconds
+// --- End Configuration ---
+
+let isClientReady = false; // Flag to track client readiness
+
+// Initialize the WhatsApp client
+const client = new Client({
+    authStrategy: new LocalAuth(),
+    puppeteer: {
+        headless: true, // Recommended for server
+        args: ['--no-sandbox', '--disable-setuid-sandbox'] // Often needed in server/container environments
+     }
+});
+
+// --- Event Handlers ---
+client.on('qr', (qr) => {
+    console.log('Scan the QR code below:');
+    qrcode.generate(qr, { small: true });
+});
+
+client.on('ready', () => {
+    console.log('WhatsApp client is ready!');
+    isClientReady = true;
+    // --- Start polling ONLY AFTER client is ready ---
+    // Check immediately in case messages queued while starting
+    pollForOutgoingMessages();
+    // -------------------------------------------------
+});
+
+client.on('auth_failure', msg => {
+    console.error('AUTHENTICATION FAILURE:', msg);
+    isClientReady = false; // Mark as not ready
+    // Consider exiting or attempting re-auth
+});
+
+client.on('disconnected', (reason) => {
+    console.log('Client was logged out:', reason);
+    isClientReady = false; // Mark as not ready
+    // Exit or attempt re-initialization
+    process.exit(1); // Exit on disconnect
+});
+
+// Listen for incoming messages
+client.on('message', async (message) => {
+    // Ignore messages if client isn't ready (might happen during init)
+    if (!isClientReady) {
+        console.log(`Ignoring message from ${message.from} (client not ready)`);
+        return;
+    }
+    try {
+        console.log(`Received message from ${message.from}: "${message.body.substring(0, 50)}..."`);
+        // Send the incoming message to FastAPI and await only an acknowledgment.
+        await axios.post(`${FASTAPI_BASE_URL}/incoming`, {
+            user_id: message.from, // e.g., number@c.us
+            message: message.body
+        });
+        // console.log(`Ack received for message from ${message.from}`); // Can be verbose
+    } catch (error) {
+        console.error(`Error sending incoming message from ${message.from} to FastAPI:`, error.message || error);
+    }
+});
+// --- End Event Handlers ---
+
+
+// --- Polling Function ---
+async function pollForOutgoingMessages() {
+    // Only proceed if client is ready
+    if (!isClientReady) {
+        console.log('Polling paused: WhatsApp client not ready.');
+        // Schedule next check later, gives client time to reconnect/ready
+        setTimeout(pollForOutgoingMessages, RETRY_INTERVAL_MS);
+        return;
+    }
+
+    let nextPollDelay = POLLING_INTERVAL_MS; // Default delay
+
+    try {
+        // GET messages waiting to be sent.
+        const response = await axios.get(`${FASTAPI_BASE_URL}/outgoing`);
+        const messages = response.data.messages; // Expected array
+
+        if (messages && messages.length > 0) {
+             console.log(`Polling: Found ${messages.length} message(s) to send.`);
+            for (const msg of messages) {
+                if (!msg.user_id || msg.message === undefined || !msg.message_id) {
+                    console.warn('Polling: Skipping invalid message structure from backend:', msg);
+                    continue;
+                }
+                try {
+                    // Send the outgoing message to the correct user.
+                    // msg.user_id should now be correctly formatted (e.g., number@c.us) by Python backend
+                    console.log(`Sending to ${msg.user_id} (ID: ${msg.message_id}): "${msg.message.substring(0, 50)}..."`);
+                    await client.sendMessage(msg.user_id, msg.message);
+
+                    // Notify FastAPI that the message was sent.
+                    await axios.post(`${FASTAPI_BASE_URL}/ack`, {
+                        user_id: msg.user_id, // Include user_id in ACK for logging on backend
+                        message_id: msg.message_id
+                    });
+                    console.log(`ACK sent for message ID: ${msg.message_id}`);
+                } catch (sendError) {
+                    // Handle errors during send/ack for a specific message
+                    console.error(`Error sending message ID ${msg.message_id} to ${msg.user_id}:`, sendError.message || sendError);
+                    // Decide if you want to retry this specific message later or just skip it
+                    // For now, we log the error and the loop continues to the next message / next poll cycle.
+                    // If the error is 'invalid wid', the user_id format is still wrong from the backend.
+                    // If it's another error, it might be a temporary WA issue.
+                }
+            }
+        }
+        // else { console.log('Polling: No messages found.'); } // Can be verbose
+
+    } catch (error) {
+        // Handle errors during the polling GET request itself
+        if (error.code === 'ECONNREFUSED' || error.code === 'ECONNRESET') {
+            console.error(`Polling Error: Connection to FastAPI (${FASTAPI_BASE_URL}) refused/reset. Is the backend running?`);
+            nextPollDelay = RETRY_INTERVAL_MS; // Wait longer before retrying connection
+        } else if (axios.isAxiosError(error)) {
+             console.error(`Polling Error: Axios error polling FastAPI - ${error.message} (Status: ${error.response?.status})`);
+             if (error.response?.status >= 500) {
+                  nextPollDelay = RETRY_INTERVAL_MS; // Wait longer on server errors
+             }
+        }
+         else {
+            console.error('Polling Error: Unexpected error during polling:', error);
+            nextPollDelay = RETRY_INTERVAL_MS; // Wait longer on unexpected errors
+        }
+    } finally {
+        // Schedule the next poll using the determined delay
+        setTimeout(pollForOutgoingMessages, nextPollDelay);
+    }
+}
+// --- End Polling Function ---
+
+// --- Initialization ---
+console.log('Initializing WhatsApp client...');
+client.initialize().catch(err => {
+    console.error('Client initialization failed:', err);
+    process.exit(1); // Exit if initialization fails critically
+});
+
+console.log('WhatsApp Bridge script started. Waiting for client ready event to start polling...');
+// NOTE: Polling now starts inside the 'ready' event handler.
+// --- End Initialization ---
+# --- END OF FILE wa_bridge.js ---
+
+
+================================================================================
 📄 monitor_whatstasker.sh
 ================================================================================
 
@@ -410,109 +571,123 @@ done
 # =====================================================
 # Prompt(s) for OrchestratorAgent (v0.8 Flow Option 1: Find Time First)
 # =====================================================
+# =====================================================
+# Prompt(s) for OrchestratorAgent (v0.8 Flow Option 1: Find Time First)
+# =====================================================
 orchestrator_agent_system_prompt: |
-  You are an expert Time Management Assistant. You are part of the WhatsTasker service — an AI-based WhatsApp assistant designed to help users manage their reminders and tasks efficiently. 
-  The WhatsTasker service includes creating and managing tasks and reminders, sending notifications, and providing follow-ups to keep users on top of their commitments.
+  You are an expert Time Management Assistant for WhatsTasker. Your goal is to help users manage tasks (ToDo Tasks and Working Tasks) and reminders efficiently via WhatsApp. You also manage user preferences. Be concise and clear.
 
-  Your goals are:
-    - Manage user tasks and reminders (create, edit, reschedule, mark as complete, show tasks and reminders).
-    - Manage user preferences (show or update preferences).
+  **CORE TASK:** Understand the user's request based on their LATEST message AND the conversation HISTORY. Decide the single next step: ask a clarifying question, call ONE tool, or respond directly.
 
-  **Be concise and clear in your interactions.**
+  **CONTEXT IS KEY:** Always review the recent `Conversation History`, including previous user messages, your own responses, and TOOL RESULTS (especially `propose_task_slots` results containing `proposed_slots` and `search_context`) before deciding your next action. Avoid re-asking for information already provided or taking actions inconsistent with the current conversational state.
 
-  **Core Principles:**
-    - Understand the user's primary goal for this message: create a task or reminder, manage existing tasks or reminders, show tasks and reminders, or show/update preferences.
-    - Use conversation history to maintain context.
-    - Ask short, clear questions only when essential information is missing.
-    - Call only one tool per turn based on intent and flow state.
-    - Analyze tool results (success, message, data) to formulate responses: confirm success, relay failures, present data (like slots), or ask the next logical question.
+  **TASK TYPES:**
+  *   **ToDo Task:** An item the user needs to remember to do, but doesn't require scheduled calendar time via this system. Created using `create_task`.
+  *   **Working Task:** An item requiring effort that the user wants assistance scheduling dedicated time for in their calendar. Uses the Task Scheduling Flow (`propose_task_slots` and `finalize_task_and_book_sessions`).
+  *   **Reminder:** A simple alert for a specific date/time. Created using `create_reminder`.
 
-  **Flow: Creating a Reminder**
-    1. Intent: User uses "remind me", "reminder", etc.
-    2. Info Needed: description, date. Time is optional.
-    3. Action:
-      - If date missing: Ask "When do you want the reminder (date and time)? (Time is optional)." Get reply.
-      - If date present but time missing: Ask "Do you want to set a specific time for the reminder? (Optional)." Get reply.
-      - If both date and time present: Proceed.
-    4. Tool Call: Call create_reminder with description, date, and time (if provided).
-    5. Response: Confirm "OK, reminder '[description]' set for [Date] [at Time]."
+  **GENERAL FLOWS:**
 
-  **Flow: Creating a Task**
-    1. Intent: User mentions "task", "add task", "need to do", or describes an action.
-    2. Extract:
-      - Get description.
-      - Check if the user provided a target timeframe and a duration.
-    3. Clarify Intent:
-      - If no due date or duration: ask "Do you want me to allocate time for this task on your calendar? If so, what is the due date for this task?"
-    4. Branch:
-      - If user does not want to allocate time:
-        - Call create_task with description only.
-        - Confirm "OK, task '[description]' added to your list." → END.
-      - If user agrees to scheduling:
-        - Proceed to **Task Scheduling Flow**.
+  *   **Reminders:** Get description & date/time -> Call `create_reminder`. Ask for missing info once.
+  *   **Task Creation:** Determine if user wants a ToDo Task or a Working Task -> Follow **Task Creation Flow**.
+  *   **Manage Existing:** Identify item (ToDo, Working Task, or Reminder using history/list mapping) -> Call `update_item_details`, `update_item_status`, or `cancel_task_sessions`.
+  *   **List Items:** User asks to see items -> Call `get_formatted_task_list`.
+  *   **Preferences:** User asks to see/change settings -> Follow **Preference Management Flow**.
+  *   **Calendar Connect:** User asks to connect -> Call `initiate_calendar_connection`.
 
-  **Flow: Scheduling a Task**
-    5. Prepare:
-      - Ensure description is known (context/history).
-      - Get duration and timeframe/date.
-    6. LLM Decision - Splittable:
-      - Determine if task is splittable (e.g., "Write report" = splittable, "Doctor appointment" = not).
-      - Set split_hint: "separate" or "continuous".
-    7. Tool Call: Call propose_task_slots with description, duration, timeframe, and split_preference.
-    8. Present Slots:
-      - Show options: "Found slots for '[description]' ([duration]): 1. [Slot1] 2. [Slot2]... Is it OK?"
-    9. Confirmation Loop:
-      - User Approves: extract approved slot(s).
-      - User Corrects: re-call propose_task_slots with updated info.
-      - User Rejects: ask if add as unscheduled task (yes → create_task, no → cancel).
-    10. Finalize Tool Call: Call finalize_task_and_book_sessions with approved_slots and search_context.
-    11. Response: Confirm "Task '[description]' created for [due date] and scheduled."
+  **Flow: Task Creation (ToDo vs. Working Task)**
+    1. Intent: User wants to add a task (e.g., "add task", "need to do", "work on X").
+    2. Extract Initial Details: From the user's message, extract:
+       - `description` (Required)
+       - `estimated_duration` (Optional, e.g., "2 hours", "90m")
+       - `timeframe` or `due_date` (Optional, e.g., "next week", "by Friday")
+    3. **Determine Task Type & Gather Info:**
+       - **Case A: Duration AND Timeframe/Due Date Provided?**
+         - If YES: Assume it's a **Working Task**. Proceed *directly* to **Working Task Scheduling Flow** (Step 5). Do NOT ask if they want to schedule.
+       - **Case B: Only Duration Provided?**
+         - If YES: Assume it's likely a **Working Task**. Ask *only* for the timeframe/due date (e.g., "Okay, task '[description]' for [duration]. When should this be done by (or timeframe)?"). Once provided, proceed to **Working Task Scheduling Flow** (Step 5).
+       - **Case C: Only Timeframe/Due Date Provided?**
+         - If YES: Assume it's likely a **Working Task**. Ask *only* for the duration (e.g., "Okay, task '[description]' for [timeframe]. How long do you estimate it will take?"). Once provided, proceed to **Working Task Scheduling Flow** (Step 5).
+       - **Case D: NEITHER Duration NOR Timeframe/Due Date Provided?**
+         - If YES: Ask the clarifying question: "Okay, I can add '[description]' to your list. Do you also want my help finding and scheduling time in your calendar to work on it (as a Working Task)? Or just add it as a ToDo Task?"
+         - Based on reply:
+           - If YES (wants scheduling help): Treat as a **Working Task**. Ask for BOTH estimated duration and timeframe/due date. Once provided, proceed to **Working Task Scheduling Flow** (Step 5).
+           - If NO (just add to list): Treat as a **ToDo Task**. Call the `create_task` tool with *only* the `description`. Confirm "OK, ToDo Task '[description]' added to your list." -> END.
+
+  **Flow: Working Task Scheduling Flow (Starts at Step 5)**
+    5. Prepare for Slot Proposal:
+       - Ensure `description`, `duration`, and `timeframe`/`due_date` are known for the Working Task.
+    6. Extract Scheduling Constraints:
+       - Analyze the user's request and conversation history for specific constraints or preferences (`scheduling_hints`). Examples: "in the afternoon", "not on Monday", "needs to be one continuous block", "split into sessions if possible". Determine conceptual need for splitting.
+    7. Tool Call: Call `propose_task_slots` with description, duration, timeframe, and hints. Remember the `search_context` returned.
+    8. Present Slots: Show numbered `proposed_slots`. Ask user to confirm.
+    9. Handle Confirmation/Rejection (IMPORTANT STATE CHANGE):
+      *   **User Confirms:**
+          *   Identify chosen slot number. Retrieve slot details (`date`, `time`, `end_time`) and `search_context` from HISTORY.
+          *   **Your ONLY next action is to call `finalize_task_and_book_sessions`.** Pass correct `search_context` and `approved_slots` list (formatted correctly).
+      *   **User Rejects/Corrects:**
+          *   Extract new timeframe/hints. Identify original task ID if rescheduling (look in previous `search_context` or tool results).
+          *   Re-call `propose_task_slots` with updated info. If rescheduling, ensure original ID is passed in `search_context` as `rescheduled_item_id`.
+          *   Loop back to Step 8.
+      *   **User Rejects Entirely:** Ask if they want to save as a ToDo task instead. Handle YES/NO appropriately.
+    10. Finalize Tool Call (`finalize_task_and_book_sessions`): Pass full `search_context` (potentially with `rescheduled_item_id`) and correctly formatted `approved_slots`.
+    11. Response: Confirm "Working Task '[description]' created/updated and scheduled."
 
   **Flow: Updating Items**
     1. Detect user wants to modify an item.
-    2. Determine if it's:
-      - Updating definition (description, date, time, duration, project).
-      - Changing status (pending, completed, cancelled).
-    3. If updating definition:
-      - Call update_item_details with item_id and updates.
-    4. If updating status:
-      - Call update_item_status with item_id and new_status.
+    2. Determine if it's: Updating definition (description, date, time, duration, project) or Changing status (pending, completed, cancelled).
+    3. If updating definition: Call `update_item_details` with `item_id` and `updates` dictionary.
+    4. If updating status: Call `update_item_status` with `item_id` and `new_status`.
 
-  **Critical Rules:**
-    - Always call the correct tool based on current intent.
-    - `finalize_task_and_book_sessions` must include search_context and approved_slots.
-    - Distinguish between `update_item_details` and `update_item_status`.
-    - Minimize unnecessary questions.
+  # --- >>>>> NEW FLOW: PREFERENCE MANAGEMENT <<<<< ---
+  **Flow: Preference Management**
+    1. Intent: User asks to view or change settings/preferences (e.g., "show my settings", "change work start time", "set timezone to X").
+    2. **Identify Goal:** Is the user asking to VIEW or UPDATE preferences?
+    3. **If VIEW:**
+       - Respond directly by summarizing the relevant preferences from the `User Preferences` context provided. Format clearly (e.g., "Your current work hours are [Start] to [End] on [Days]. Your timezone is [TZ]."). Do NOT call a tool.
+    4. **If UPDATE:**
+       - Extract the specific preference(s) to change and the desired new value(s) from the user message.
+       - **Validate Format:** Ensure the new value is in the correct format (e.g., HH:MM for time, Olson name for TimeZone, duration string like '60m' for session length). If format is unclear or invalid, ask for clarification, reminding the user of the required format.
+       - **Tool Call:** Once value is validated, call `update_user_preferences` with an `updates` dictionary containing the {key: value} pairs. Example: `{"updates": {"Work_Start_Time": "09:30"}}`.
+       - **Response:** Based on tool result: Confirm success ("OK, I've updated your [Preference Name].") or relay failure ("Sorry, I couldn't update that preference.").
+  # --- >>>>> END NEW FLOW <<<<< ---
 
-  **Context Provided:**
-    - Current time and date (timezone-adjusted).
-    - User preferences (JSON object).
-    - Recent conversation history.
-    - Active tasks/reminders (DB snapshot).
-    - Calendar events snapshot (from GCal).
+  **CRITICAL RULES:**
+  *   **Use History:** Base decisions on the LATEST user message + HISTORY + TOOL RESULTS.
+  *   **Minimal Questions:** Only ask for essential missing info.
+  *   **One Tool:** Max ONE tool per turn.
+  *   **Post-Proposal State:** After `propose_task_slots`, user confirmation leads ONLY to `finalize_task_and_book_sessions`.
+  *   **`search_context`:** Pass the full dictionary from `propose_task_slots` result to `finalize_task_and_book_sessions`.
+  *   **`approved_slots` Format:** Ensure `[{"date": "YYYY-MM-DD", "time": "HH:MM", "end_time": "HH:MM"}]` format.
+  *   **Rescheduling:** Preserve original `item_id` in `search_context` (as `rescheduled_item_id`) when re-proposing slots for an existing task, so `finalize_task_and_book_sessions` updates correctly.
 
+  **CONTEXT PROVIDED:** Current Time/Date, User Preferences (JSON object), Conversation History (User, Assistant, Tool Results), Active Items (DB), Calendar Events (GCal).
+
+  # --- >>>>> REVISED AVAILABLE TOOLS SECTION <<<<< ---
   **Available Tools & Parameters:**
-    - create_reminder: {description, date, time?, project?}
-    - create_task: {description, date?, estimated_duration?, project?}
-    - propose_task_slots: {description?, duration, timeframe, split_preference?}
-    - finalize_task_and_book_sessions: {search_context, approved_slots: [{date, time, end_time}], project?}
-    - update_item_details: {item_id, updates: {description?, date?, time?, estimated_duration?, project?}}
-    - update_item_status: {item_id, new_status: "pending|in_progress|completed|cancelled"}
-    - update_user_preferences: {updates: {...}}
-    - initiate_calendar_connection: {}
-    - cancel_task_sessions: {task_id, session_ids_to_cancel: [string]}
-    - interpret_list_reply: {user_reply, list_mapping: {string: string}}
-    - get_formatted_task_list: {date_range?: [string, string], status_filter?: string, project_filter?: string}
-
-  **Your Task Summary:**
-    - Analyze user message and context.
-    - Classify intent.
-    - Follow correct flow.
-    - Ask clear, necessary questions.
-    - Call the right tool with correct parameters.
-    - Analyze the tool's response.
-    - Formulate and deliver a clear next step or final confirmation.
-
+    *   `create_reminder`: {description: str, date: str (YYYY-MM-DD), time?: str (HH:MM), project?: str}
+        - Creates a simple reminder, potentially in GCal if time is specified.
+    *   `create_task`: {description: str, date?: str (YYYY-MM-DD), estimated_duration?: str (e.g., "2h", "90m"), project?: str}
+        - Creates a ToDo Task (metadata only, no GCal booking). Date/duration are optional metadata.
+    *   `propose_task_slots`: {description?: str, duration: str (e.g., "2h", "90m"), timeframe: str (e.g., "next week", "on YYYY-MM-DD"), scheduling_hints?: str}
+        - Finds potential calendar slots for a Working Task based on duration, timeframe, and hints. Returns proposed slots and search context. Return format: `{success, proposed_slots: List[Dict], message, search_context: Dict}`
+    *   `finalize_task_and_book_sessions`: {search_context: Dict, approved_slots: List[Dict], project?: str}
+        - Creates/updates task metadata based on `search_context` (checks for `rescheduled_item_id`) and books approved sessions into GCal. `approved_slots` format: `[{"date": "YYYY-MM-DD", "time": "HH:MM", "end_time": "HH:MM"}]`.
+    *   `update_item_details`: {item_id: str, updates: Dict}
+        - Updates non-status details (description, date, time, estimated_duration, project) of an existing item. `updates` dict keys must be valid fields.
+    *   `update_item_status`: {item_id: str, new_status: str}
+        - Updates the status of an item ("pending", "in_progress", "completed", "cancelled"). Use "cancelled" for deletion.
+    *   `update_user_preferences`: {updates: Dict}
+        - Updates user settings. `updates` dict keys must be valid preference names (e.g., "Work_Start_Time", "TimeZone"). Values must be correctly formatted.
+    *   `initiate_calendar_connection`: {}
+        - Starts the Google Calendar authentication flow. Returns auth URL if needed.
+    *   `cancel_task_sessions`: {task_id: str, session_ids_to_cancel: List[str]}
+        - Removes specific scheduled GCal sessions linked to a task and updates task metadata.
+    *   `interpret_list_reply`: {user_reply: str, list_mapping: Dict[str, str]}
+        - Interprets user replies (e.g., "1", "done 2") referring to a previously displayed numbered list. Returns identified item IDs.
+    *   `get_formatted_task_list`: {date_range?: List[str], status_filter?: str, project_filter?: str}
+        - Retrieves and formats a list of tasks/reminders based on filters. Status filter defaults to 'active'. Date range is [start_date, end_date]. Returns formatted string and item mapping.
+  # --- >>>>> END REVISED AVAILABLE TOOLS SECTION <<<<< ---
 
 # =====================================================
 # Prompt(s) for Session Scheduling LLM (Used BY propose_task_slots TOOL)
@@ -521,38 +696,46 @@ session_scheduler_system_prompt: |
   You are an expert Scheduler assistant used by the propose_task_slots tool for WhatsTasker.
   Your goal is to propose a schedule of work sessions for a specific task, distributing them reasonably over the available time, based on user preferences, task details, and existing calendar events.
 
-  **Core Task:** Given the task details, user preferences, existing calendar events, the number of slots requested (`num_slots_requested`), and the desired duration for *each* slot (`user_session_length` - which might be the user's preference OR the task's total duration if only 1 slot is requested), generate a list of proposed work session slots.
+  **Core Task:** Given the task details, user preferences, existing calendar events, the number of slots requested (`num_slots_requested`), the desired duration for *each* slot (`user_session_length`), and **scheduling hints**, generate a list of proposed work session slots **strictly within the calculated search window**.
 
   **Input Variables Provided:**
   - Task Description: {task_description}
-  - Task Due Date: {task_due_date} (YYYY-MM-DD) - Use for context and buffer.
-  - Task Estimated Duration: {task_estimated_duration} (e.g., "3h", "90m") - Total work estimate.
-  - User Working Days: {user_working_days} (List of strings)
-  - User Work Start Time: {user_work_start_time} (HH:MM)
-  - User Work End Time: {user_work_end_time} (HH:MM)
-  - User Session Length: {user_session_length} (String, e.g., "60m", "3h") - **This is the DURATION of EACH slot you need to find.** It might be the user's preferred length OR the total task duration if num_slots_requested=1.
-  - Existing Calendar Events (JSON list): {existing_events_json} (Format: [{"start_datetime": "...", "end_datetime": "...", "summary": "..."}, ...])
-  - Current Date: {current_date} (YYYY-MM-DD)
-  - Number of Slots to Propose: {num_slots_requested} (Integer) - Find exactly this many slots.
+  - Task Due Date: {task_due_date}
+  - Task Estimated Duration: {task_estimated_duration}
+  - User Working Days: {user_working_days}
+  - User Work Start Time: {user_work_start_time}
+  - User Work End Time: {user_work_end_time}
+  - User Session Length: {user_session_length} - Duration of EACH slot to find.
+  - Existing Calendar Events (JSON list): {existing_events_json}
+  - Current Date: {current_date}
+  - Number of Slots to Propose: {num_slots_requested} - Find exactly this many slots.
+  - Search Start Date: {search_start_date} - **CRITICAL: Only propose slots ON or AFTER this date.**
+  - Search End Date: {search_end_date} - **CRITICAL: Only propose slots ON or BEFORE this date.**
+  - Scheduling Hints: {scheduling_hints} (Natural language constraints like 'afternoon preferred', 'not Monday', 'continuous block needed', 'can be split')
 
   **Processing Logic:**
-  1.  **Calculate Slot Duration:** Determine the required slot duration in minutes from the provided `user_session_length` input variable.
+  1.  **Calculate Slot Duration:** Use the provided `user_session_length`.
   2.  **Identify Available Time Slots:**
-      - Consider dates from the day after `current_date` up to **1-2 days BEFORE** `task_due_date`.
-      - Filter these dates based on `user_working_days`.
-      - Within each valid date, consider the time window between `user_work_start_time` and `user_work_end_time`.
-      - Check the `existing_events_json` for conflicts. An existing event conflicts if its time range overlaps *at all* with a potential session slot of the **required duration** calculated in step 1.
-      - Find time slots within the working hours that are free and match the **required duration**.
-  3.  **Select & Distribute Sessions:** From the available slots, select exactly `num_slots_requested` sessions. **Attempt to distribute these sessions reasonably** across the available period (between tomorrow and the buffer before the due date). Don't bunch them all up unless necessary. Prioritize earlier dates if distribution allows. Ensure sufficient buffer before the due date.
-  4.  **Calculate End Times:** For each selected session start time (`date`, `time`), calculate the corresponding `end_time` by adding the **required duration** (from step 1). Ensure the `end_time` does not exceed `user_work_end_time`.
-  5.  **Format Output:** Create the JSON output with unique `slot_ref` (starting from 1) for each proposal. Ensure the response is ONLY the JSON object.
+      - Consider dates **STRICTLY BETWEEN** `search_start_date` and `search_end_date` (inclusive). **DO NOT propose slots outside this range.**
+      - Filter based on `user_working_days`.
+      - Consider time window between `user_work_start_time` and `user_work_end_time`.
+      - Check `existing_events_json` for conflicts.
+      - Find time slots within working hours, free, and matching the **required duration**.
+  3.  **Select & Distribute Sessions:** From available slots within the search window, select exactly `num_slots_requested` sessions.
+      - **CRITICAL: Apply `scheduling_hints`:** Consider afternoon/morning preference, day exclusions, etc.
+      - Attempt reasonable distribution.
+  4.  **Calculate End Times:** For each selected session start time (`date`, `time`), calculate `end_time`. Ensure `end_time` <= `user_work_end_time`.
+  5.  **Format Output:** Create the JSON output.
 
   **Output Format Requirements:**
   Respond ONLY with a single, valid JSON object containing exactly two keys:
-  1.  `"proposed_sessions"`: A JSON list of proposed sessions. Each element MUST be a dictionary with "slot_ref" (integer, starting from 1), "date" (YYYY-MM-DD), "time" (HH:MM - start time), and "end_time" (HH:MM) keys. Return an empty list `[]` if no suitable slots found.
-  2.  `"response_message"`: A user-facing message summarizing the proposal or explaining failure.
-      - Success Example: "Okay, I found {N} potential slots for '{Task Description}'."
-      - Failure Example: "I looked at your calendar but couldn't find {N} free slots for '{Task Description}' (each needing {duration} duration) before the due date based on your preferences. You might need to adjust the task details or your work settings."
+  1.  `"proposed_sessions"`: A JSON list of proposed sessions. **Each element in the list MUST be a dictionary** with the following keys **EXACTLY**:
+      - `"slot_ref"`: (Integer, starting from 1)
+      - `"date"`: (String, "YYYY-MM-DD" format)
+      - **`"time"`**: (String, "HH:MM" format - **USE THIS KEY NAME FOR START TIME**)
+      - `"end_time"`: (String, "HH:MM" format)
+      Return an empty list `[]` if no suitable slots found within the specified search dates that meet all constraints.
+  2.  `"response_message"`: A user-facing message summarizing the proposal or explaining failure. Avoid claiming sessions were scheduled if the `proposed_sessions` list is empty.
 
 session_scheduler_human_prompt: |
   **Task Details:**
@@ -567,11 +750,14 @@ session_scheduler_human_prompt: |
   - **Duration of EACH slot to find**: {user_session_length}
   - **Number of Slots to Find**: {num_slots_requested}
 
-  **Calendar Context:**
+  **Calendar Context & Search Window:**
   - Today's Date: {current_date}
   - Existing Events (JSON): {existing_events_json}
+  - **Search Start Date (Inclusive)**: {search_start_date}
+  - **Search End Date (Inclusive)**: {search_end_date}
+  - **Scheduling Hints (Apply these!)**: {scheduling_hints}
 
-  **Your Task:** Propose exactly {num_slots_requested} schedule slots, each of duration {user_session_length}. Distribute slots reasonably, leaving buffer before due date. Respond ONLY in the specified JSON format (`proposed_sessions` with slot_ref, date, time, end_time; `response_message`). Ensure JSON validity
+  **Your Task:** Propose exactly {num_slots_requested} schedule slots, each of duration {user_session_length}. Proposals MUST fall strictly between {search_start_date} and {search_end_date}. Consider the **Scheduling Hints**. Respond ONLY in the specified JSON format. **Crucially, ensure each dictionary within the `proposed_sessions` list uses the exact keys: `slot_ref`, `date`, `time`, `end_time`.** Ensure JSON validity.
 
 # =====================================================
 # Prompt(s) for OnboardingAgent (Keep as is)
@@ -693,10 +879,19 @@ if bridge_type_env in ALLOWED_BRIDGES: bridge_type = bridge_type_env
 if bridge_type not in ALLOWED_BRIDGES: print(f"ERROR: Invalid bridge type '{bridge_type}'."); sys.exit(1)
 
 # --- Logger Import (must happen early) ---
+# Use a try-except block for robust logger initialization
 try:
     from tools.logger import log_info, log_error, log_warning
+    # Test log after import attempt
+    log_info("main", "init", "Logger imported successfully.")
+except ImportError as log_import_err:
+    # Fallback if logger import fails catastrophically
+    print(f"FATAL ERROR: Failed to import logger: {log_import_err}")
+    sys.exit(1)
 except Exception as log_init_e:
-     print(f"FATAL ERROR during initial logging setup: {log_init_e}"); sys.exit(1)
+    print(f"FATAL ERROR during initial logging setup: {log_init_e}")
+    sys.exit(1)
+
 
 # --- Dynamic Bridge and App Import ---
 uvicorn_app_path = None
@@ -715,7 +910,8 @@ try:
         bridge_module_name = "WhatsApp Bridge"
         bridge_instance = WhatsAppBridge(outgoing_whatsapp_messages, whatsapp_queue_lock)
     else:
-        raise ValueError(f"Logic error determining bridge type: {bridge_type}") # Should not happen
+        # This should not happen due to initial checks, but keeps linters happy
+        raise ValueError(f"Internal logic error determining bridge type: {bridge_type}")
 
     # --- Set the Bridge in the Router ---
     from bridge.request_router import set_bridge
@@ -736,103 +932,145 @@ except Exception as bridge_setup_err:
 # --- Other Imports ---
 import uvicorn
 from users.user_manager import init_all_agents
-import traceback
+import traceback # Keep traceback import
 
 # --- Scheduler Import ---
 try:
     from services.scheduler_service import start_scheduler, shutdown_scheduler
     SCHEDULER_IMPORTED = True
-except ImportError:
-    log_error("main", "import", "Scheduler service not found. Background tasks disabled.")
+    log_info("main", "import", "Scheduler service imported successfully.")
+except ImportError as sched_import_err:
+    log_error("main", "import", f"Scheduler service not found or failed import: {sched_import_err}. Background tasks disabled.", sched_import_err)
     SCHEDULER_IMPORTED = False
+    # Define dummy functions to prevent crashes
     def start_scheduler(): return False
     def shutdown_scheduler(): pass
 # ----------------------------
 
 
-def main():
+async def handle_shutdown_signal(sig, loop):
+    """Async signal handler helper."""
+    log_warning("main", "handle_shutdown_signal", f"Received signal {sig.name}. Initiating shutdown...")
+    # Signal the main tasks to stop (implementation depends on how server/tasks are managed)
+    # For Uvicorn, we can tell the server instance to exit
+    if server: # Check if server object exists
+         server.should_exit = True
+    # Additionally, cancel other background tasks if necessary
+    # Example: Cancel a long-running task
+    # if some_background_task and not some_background_task.done():
+    #    some_background_task.cancel()
+
+    # Give tasks a moment to finish cleanup
+    await asyncio.sleep(1)
+
+    # Optionally force stop loop if tasks don't exit gracefully
+    # loop.stop()
+
+
+server: uvicorn.Server | None = None # Define server variable in outer scope
+
+async def main_async():
+    global server # Allow modification of the global server variable
     # Agent state init
-    log_info("main", "main", "Initializing agent states...")
+    log_info("main", "main_async", "Initializing agent states...")
     try:
         init_all_agents()
-        log_info("main", "main", "Agent state initialization complete.")
+        log_info("main", "main_async", "Agent state initialization complete.")
     except Exception as init_e:
-        log_error("main", "main", "CRITICAL error during init_all_agents.", init_e)
-        sys.exit(1)
+        log_error("main", "main_async", "CRITICAL error during init_all_agents.", init_e)
+        sys.exit(1) # Exit if agent init fails
 
     # Scheduler start
     if SCHEDULER_IMPORTED:
         try:
-            log_info("main", "main", "Starting scheduler service...")
+            log_info("main", "main_async", "Starting scheduler service...")
             if start_scheduler():
-                log_info("main", "main", "Scheduler service started successfully.")
+                log_info("main", "main_async", "Scheduler service started successfully.")
             else:
-                log_error("main", "main", "Scheduler service FAILED to start.")
+                # Error should be logged by start_scheduler if it returns False
+                log_error("main", "main_async", "Scheduler service FAILED to start.")
         except Exception as sched_e:
-            log_error("main", "main", "CRITICAL error starting scheduler.", sched_e)
+            log_error("main", "main_async", "CRITICAL error starting scheduler.", sched_e)
+            # Decide if this is fatal - potentially continue without scheduler?
+            # For now, let's log and continue
 
     # Uvicorn config
     reload_enabled = os.getenv("APP_ENV", "production").lower() == "development"
     log_level = "debug" if reload_enabled else "info"
-    log_info("main", "main", f"Starting FastAPI server via Uvicorn...")
-    log_info("main", "main", f"Target App: '{uvicorn_app_path}'")
-    log_info("main", "main", f"Reload: {reload_enabled}, Log Level: {log_level}")
+    # --- Define Port ---
+    server_port = int(os.getenv("PORT", "8000")) # Read from env or default to 8000
+    # -------------------
+    log_info("main", "main_async", f"Starting FastAPI server via Uvicorn...")
+    log_info("main", "main_async", f"Target App: '{uvicorn_app_path}'")
+    log_info("main", "main_async", f"Host: 0.0.0.0, Port: {server_port}") # Log the port
+    log_info("main", "main_async", f"Reload: {reload_enabled}, Log Level: {log_level}")
 
     config = uvicorn.Config(
         uvicorn_app_path,
-        host="0.0.0.0", port=8000,
-        reload=reload_enabled, access_log=False, log_level=log_level
+        host="0.0.0.0",
+        port=server_port, # Use the variable
+        reload=reload_enabled,
+        access_log=False, # Keep access log off unless needed for debugging
+        log_level=log_level,
+        lifespan="on" # Recommended for modern FastAPI startup/shutdown events
     )
     server = uvicorn.Server(config)
 
-    # Graceful shutdown setup
-    loop = asyncio.get_event_loop()
-    stop_event = asyncio.Event()
-    def handle_signal(sig, frame):
-        log_warning("main", "handle_signal", f"Received signal {sig}. Initiating shutdown...")
-        loop.call_soon_threadsafe(stop_event.set)
+    # --- Graceful shutdown setup (Modern asyncio) ---
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        try: loop.add_signal_handler(sig, lambda s=sig: handle_signal(s, None))
-        except NotImplementedError: signal.signal(sig, handle_signal)
+        try:
+            # Use loop.create_task for the handler to run it in the loop
+            loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(handle_shutdown_signal(s, loop)))
+        except NotImplementedError:
+            # Fallback for systems like Windows that might not support add_signal_handler
+            signal.signal(sig, lambda s, f: asyncio.create_task(handle_shutdown_signal(signal.Signals(s), loop)))
+    # --- End shutdown setup ---
 
-    # Async tasks for server and shutdown
-    async def main_server_task():
-        try: await server.serve()
-        finally:
-            if not stop_event.is_set(): stop_event.set()
-
-    async def shutdown_manager():
-         await stop_event.wait()
-         log_info("main", "shutdown_manager", "Stop event received, initiating graceful shutdown...")
-         if SCHEDULER_IMPORTED:
-             try:
-                 log_info("main", "shutdown_manager", "Shutting down scheduler...")
-                 shutdown_scheduler()
-                 log_info("main", "shutdown_manager", "Scheduler shut down.")
-             except Exception as e: log_error("main", "shutdown_manager", "Error shutting down scheduler.", e)
-         log_info("main", "shutdown_manager", "Graceful shutdown complete.")
-
-    # Run main loop
     try:
-         async def run_all():
-              server_task = asyncio.create_task(main_server_task())
-              shutdown_task = asyncio.create_task(shutdown_manager())
-              await asyncio.gather(server_task, shutdown_task)
-         asyncio.run(run_all())
-    except Exception as e:
-         log_error("main", "main", f"Error during server execution/shutdown.", e)
-         log_error("main", "main", f"Traceback:\n{traceback.format_exc()}")
-         if SCHEDULER_IMPORTED:
-             try: shutdown_scheduler()
-             except Exception as final_e: log_error("main","main", f"Error in final shutdown attempt: {final_e}")
-         sys.exit(1)
+        await server.serve()
     finally:
-         log_info("main", "main", "Main process finished.")
+        log_info("main", "main_async", "Server stopped. Performing final cleanup...")
+        if SCHEDULER_IMPORTED:
+            try:
+                log_info("main", "main_async", "Shutting down scheduler...")
+                shutdown_scheduler()
+                log_info("main", "main_async", "Scheduler shut down.")
+            except Exception as e:
+                log_error("main", "main_async", "Error shutting down scheduler.", e)
+        log_info("main", "main_async", "Main async process finished.")
+
 
 if __name__ == "__main__":
-    try: _ = log_info # Check logger exists
-    except NameError: print("FATAL: Logger not defined."); sys.exit(1)
-    main()
+    try:
+        # Check logger exists before trying to use it
+        _ = log_info
+    except NameError:
+        print("FATAL: Logger not defined or failed import.")
+        sys.exit(1)
+
+    try:
+        asyncio.run(main_async())
+    except SystemExit as se: # Catch SystemExit from Uvicorn startup failure
+         log_error("main", "__main__", f"Server exited with code: {se.code}. Check previous errors (e.g., port conflict).")
+         sys.exit(se.code) # Propagate the exit code
+    except KeyboardInterrupt:
+        log_warning("main", "__main__", "KeyboardInterrupt received. Exiting.")
+        # Perform minimal cleanup if needed
+        if SCHEDULER_IMPORTED:
+             try: shutdown_scheduler()
+             except Exception: pass
+        sys.exit(0)
+    except Exception as e:
+        log_error("main", "__main__", f"Unhandled error during server execution/shutdown.", e)
+        log_error("main", "__main__", f"Traceback:\n{traceback.format_exc()}")
+        # Final attempt to shutdown scheduler
+        if SCHEDULER_IMPORTED:
+            try: shutdown_scheduler()
+            except Exception as final_e: log_error("main","main", f"Error in final shutdown attempt: {final_e}")
+        sys.exit(1)
+    finally:
+        log_info("main", "__main__", "Application exiting.")
 
 # --- END OF FULL main.py ---
 # --- END OF FILE main.py ---
@@ -2226,8 +2464,9 @@ class ProposeTaskSlotsParams(BaseModel):
     duration: str = Field(...)
     timeframe: str = Field(...)
     description: str | None = Field(None)
-    split_preference: str | None = Field(None)
-    num_options_to_propose: int | None = Field(3) # Allow None, default applied in code if needed
+    # REMOVE split_preference: str | None = Field(None)
+    scheduling_hints: str | None = Field(None, description="User's specific scheduling preferences or constraints provided in natural language, e.g., 'in the afternoon', 'not on Monday', 'needs one continuous block', 'split into sessions'.") # <-- ADD this
+    num_options_to_propose: int | None = Field(3)
     @field_validator('num_options_to_propose')
     @classmethod
     def check_num_options(cls, v: int | None):
@@ -2417,14 +2656,14 @@ def create_task_tool(user_id, params: CreateTaskParams):
 # Returns dict
 def propose_task_slots_tool(user_id, params: ProposeTaskSlotsParams):
     """
-    Finds available work session slots based on duration/timeframe BEFORE task creation.
+    Finds available work session slots based on duration/timeframe and hints.
     Uses an LLM sub-call for intelligent slot finding, considering calendar events.
     Returns proposed slots and the search context used.
     """
     fn_name = "propose_task_slots_tool"
     fail_result = {"success": False, "proposed_slots": None, "message": "Sorry, I encountered an issue trying to propose schedule slots.", "search_context": None}
     try:
-        log_info("tool_definitions", fn_name, f"Executing user={user_id}. Search: duration='{params.duration}', timeframe='{params.timeframe}'...")
+        log_info("tool_definitions", fn_name, f"Executing user={user_id}. Search: duration='{params.duration}', timeframe='{params.timeframe}', hints='{params.scheduling_hints}'")
         search_context_to_return = params.model_dump() # Store validated input as basis for context
 
         llm_client = get_instructor_client()
@@ -2439,7 +2678,7 @@ def propose_task_slots_tool(user_id, params: ProposeTaskSlotsParams):
 
         agent_state = get_agent_state(user_id);
         prefs = agent_state.get("preferences", {}) if agent_state else {}
-        calendar_api = _get_calendar_api_from_state(user_id) # Returns instance or None
+        calendar_api = _get_calendar_api_from_state(user_id)
         preferred_session_str = prefs.get("Preferred_Session_Length", "60m")
 
         task_estimated_duration_str = params.duration;
@@ -2448,67 +2687,105 @@ def propose_task_slots_tool(user_id, params: ProposeTaskSlotsParams):
              log_error("tool_definitions", fn_name, f"Invalid duration '{task_estimated_duration_str}'")
              return {**fail_result, "message": f"Invalid duration format: '{task_estimated_duration_str}'. Use 'Xh' or 'Ym'."}
 
-        # Determine slot duration and count
+        # Determine target slot duration and count based on total duration,
+        # user preferred length, and hints about splitting/continuity.
         session_minutes = task_manager._parse_duration_to_minutes(preferred_session_str) or 60
-        num_slots_to_find = 1;
-        slot_duration_str = task_estimated_duration_str # Default: find one continuous block
-        split_pref = params.split_preference.lower() if params.split_preference else None
+        num_slots_to_find = 1
+        slot_duration_str = task_estimated_duration_str # Default to one continuous block
+        hints_lower = (params.scheduling_hints or "").lower()
 
-        # Split if requested OR if task > preferred session and preference not set to continuous
-        if split_pref == 'separate' or (split_pref is None and total_minutes > session_minutes):
-            if session_minutes > 0:
-                num_slots_to_find = (total_minutes + session_minutes - 1) // session_minutes # Ceiling division
-            else: num_slots_to_find = 1 # Avoid division by zero if session_minutes is bad
-            if num_slots_to_find <= 0 : num_slots_to_find = 1 # Ensure at least one slot
-            slot_duration_str = preferred_session_str
-            log_info("tool_definitions", fn_name, f"Requesting {num_slots_to_find} split sessions of duration: {slot_duration_str}")
-        elif split_pref == 'continuous':
-            log_info("tool_definitions", fn_name, f"Requesting 1 continuous block of duration: {slot_duration_str}")
-        else: # Default case (task <= preferred session, or error in logic)
-            log_info("tool_definitions", fn_name, f"Requesting 1 block of duration: {slot_duration_str}")
+        # Decide on splitting based on hints or duration comparison
+        # Prioritize hint if given, otherwise compare total duration to preferred session length
+        needs_split = False
+        if "continuous" in hints_lower or "one block" in hints_lower or "one slot" in hints_lower:
+             needs_split = False
+             log_info("tool_definitions", fn_name, "Hint indicates continuous block required.")
+        elif "split" in hints_lower or "separate" in hints_lower or "multiple sessions" in hints_lower:
+             needs_split = True
+             log_info("tool_definitions", fn_name, "Hint indicates split sessions required.")
+        elif session_minutes > 0 and total_minutes > session_minutes:
+             # Default to split if no hint and total > preferred
+             needs_split = True
+             log_info("tool_definitions", fn_name, "Defaulting to split sessions (total > preferred, no specific hint).")
 
-        # Determine search date range based on timeframe
-        # --- This logic seems complex but reasonable for interpreting common phrases ---
-        # --- Keeping it as is for now ---
+        if needs_split and session_minutes > 0:
+             num_slots_to_find = (total_minutes + session_minutes - 1) // session_minutes
+             if num_slots_to_find <= 0 : num_slots_to_find = 1
+             slot_duration_str = preferred_session_str # Use preferred length for each split slot
+             log_info("tool_definitions", fn_name, f"Calculated need for {num_slots_to_find} split sessions of duration: {slot_duration_str}")
+        else:
+            # Stays as 1 slot with total duration
+            log_info("tool_definitions", fn_name, f"Calculated need for 1 continuous block of duration: {slot_duration_str}")
+
+        # Timeframe parsing logic (keep as is)
         today = datetime.now().date(); start_date = today + timedelta(days=1); due_date_for_search = None
         tf = params.timeframe.lower()
-        if "tomorrow" in tf: start_date = today + timedelta(days=1); due_date_for_search = start_date
-        elif "next week" in tf: start_of_next_week = today + timedelta(days=(7 - today.weekday())); start_date = start_of_next_week; due_date_for_search = start_of_next_week + timedelta(days=6)
+        # --- Add parsing for ISO interval ---
+        iso_interval_match = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]\d{2}:\d{2}|Z))/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]\d{2}:\d{2}|Z))", params.timeframe)
+        if iso_interval_match:
+             try:
+                  start_iso, end_iso = iso_interval_match.groups()
+                  # Convert to date for search range (ignoring time part for the range boundary)
+                  start_dt_aware = datetime.fromisoformat(start_iso.replace('Z', '+00:00'))
+                  # For end date, we want the day it ends on
+                  end_dt_aware = datetime.fromisoformat(end_iso.replace('Z', '+00:00'))
+                  start_date = start_dt_aware.date()
+                  # Make sure start is not before tomorrow
+                  start_date = max(start_date, today + timedelta(days=1))
+                  due_date_for_search = end_dt_aware.date() # Use end date as effective due date
+                  log_info("tool_definitions", fn_name, f"Parsed ISO Interval: Start={start_date}, EffectiveDue={due_date_for_search}")
+             except ValueError as iso_parse_err:
+                  log_warning("tool_definitions", fn_name, f"Failed to parse ISO interval timeframe '{params.timeframe}': {iso_parse_err}")
+                  # Fallback to default window if parse fails
+        # --- Continue with existing timeframe parsing ---
+        elif "tomorrow" in tf: start_date = today + timedelta(days=1); due_date_for_search = start_date
+        elif "next week" in tf:
+             start_of_next_week = today + timedelta(days=(7 - today.weekday()))
+             start_date = start_of_next_week
+             due_date_for_search = start_of_next_week + timedelta(days=6)
+             log_info("tool_definitions", fn_name, f"Parsed 'next week': Start={start_date}, EffectiveDue={due_date_for_search}")
         elif "on " in tf:
             try: date_part = tf.split("on ")[1].strip(); parsed_date = datetime.strptime(date_part, "%Y-%m-%d").date(); start_date = max(parsed_date, today + timedelta(days=1)); due_date_for_search = start_date
             except Exception: log_warning("tool_definitions", fn_name, f"Parsing timeframe date failed: '{params.timeframe}'")
         elif "by " in tf:
-            try: date_part = tf.split("by ")[1].strip(); parsed_date = datetime.strptime(date_part, "%Y-%m-%d").date(); due_date_for_search = parsed_date; start_date = max(today + timedelta(days=1), parsed_date - timedelta(days=14)) # Search up to 2 weeks before 'by' date
+            try: date_part = tf.split("by ")[1].strip(); parsed_date = datetime.strptime(date_part, "%Y-%m-%d").date(); due_date_for_search = parsed_date; start_date = max(today + timedelta(days=1), parsed_date - timedelta(days=14))
             except Exception: log_warning("tool_definitions", fn_name, f"Parsing timeframe 'by' date failed: '{params.timeframe}'")
+        # --- Add parsing for "later today/tonight" etc. ---
+        elif "later today" in tf or "tonight" in tf or "this afternoon" in tf:
+             start_date = today # Search starts today
+             due_date_for_search = today # Due date is today
+             log_info("tool_definitions", fn_name, f"Parsed relative timeframe '{tf}': Start={start_date}, EffectiveDue={due_date_for_search}")
+             # Note: Hints should guide the sub-LLM to pick *later* slots
+        # --- Default case ---
         else: log_warning("tool_definitions", fn_name, f"Unclear timeframe '{params.timeframe}', using default window.")
 
-        # Calculate end date, ensuring buffer before due date
         default_horizon_days = 56; end_date_limit = start_date + timedelta(days=default_horizon_days - 1)
-        # Set end_date to 1 day before due date if due date exists and is after start_date
         end_date = end_date_limit
-        if due_date_for_search and due_date_for_search > start_date:
-             end_date = min(end_date_limit, due_date_for_search - timedelta(days=1))
-        end_date = max(end_date, start_date); # Ensure end is not before start
+        if due_date_for_search and due_date_for_search >= start_date: # Use >= to allow same day start/end
+             # Allow buffer unless start/end are same day
+             buffer_days = 0 if start_date == due_date_for_search else 1
+             end_date = min(end_date_limit, due_date_for_search - timedelta(days=buffer_days))
+        end_date = max(end_date, start_date); # Ensure end >= start
         start_date_str, end_date_str = start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
         log_info("tool_definitions", fn_name, f"Derived Search Range: {start_date_str} to {end_date_str}")
+        # Update search context with parsed dates and original timeframe for sub-LLM
         search_context_to_return["effective_due_date"] = due_date_for_search.strftime("%Y-%m-%d") if due_date_for_search else None
-        search_context_to_return["search_start_date"] = start_date_str # Add for clarity
-        search_context_to_return["search_end_date"] = end_date_str   # Add for clarity
+        search_context_to_return["search_start_date"] = start_date_str
+        search_context_to_return["search_end_date"] = end_date_str
+        search_context_to_return["original_timeframe"] = params.timeframe # Keep original for sub-LLM context
 
-        # Fetch existing calendar events
+        # Fetch existing calendar events (keep as is)
         existing_events = [];
-        if calendar_api is not None: # Check if API instance exists
+        if calendar_api is not None:
             log_info("tool_definitions", fn_name, f"Fetching GCal events from {start_date_str} to {end_date_str}")
             if start_date <= end_date:
                 try:
-                    events_raw = calendar_api.list_events(start_date_str, end_date_str) # Returns list of dicts or []
-                    # Ensure necessary keys exist before adding
+                    events_raw = calendar_api.list_events(start_date_str, end_date_str)
                     existing_events = [
                          {"start_datetime": ev.get("gcal_start_datetime"), "end_datetime": ev.get("gcal_end_datetime"), "summary": ev.get("title")}
                          for ev in events_raw if ev.get("gcal_start_datetime") and ev.get("gcal_end_datetime")
                     ]
                     log_info("tool_definitions", fn_name, f"Fetched {len(existing_events)} valid GCal events.")
-                    # log_info("tool_definitions", f"{fn_name}_DEBUG", f"Existing Events Sent: {json.dumps(existing_events, indent=2)}")
                 except Exception as e:
                      log_error("tool_definitions", fn_name, f"Fetch GCal events failed: {e}", e)
             else:
@@ -2518,44 +2795,50 @@ def propose_task_slots_tool(user_id, params: ProposeTaskSlotsParams):
 
         # Prepare data for LLM scheduler sub-call
         try:
-            num_options = params.num_options_to_propose if params.num_options_to_propose is not None else 3
+            # Ask sub-LLM for the number of slots we actually need
+            slots_to_request_from_llm = num_slots_to_find
             prompt_data = {
                 "task_description": params.description or "(No description)",
                 "task_due_date": search_context_to_return["effective_due_date"] or "(No specific due date)",
-                "task_estimated_duration": task_estimated_duration_str, # Total duration
+                "task_estimated_duration": task_estimated_duration_str,
                 "user_working_days": prefs.get("Work_Days", ["Mon", "Tue", "Wed", "Thu", "Fri"]),
                 "user_work_start_time": prefs.get("Work_Start_Time", "09:00"),
                 "user_work_end_time": prefs.get("Work_End_Time", "17:00"),
-                "user_session_length": slot_duration_str, # Duration of EACH slot to find
+                "user_session_length": slot_duration_str, # Duration PER slot
                 "existing_events_json": json.dumps(existing_events),
                 "current_date": today.strftime("%Y-%m-%d"),
-                "num_slots_requested": num_options # Ask LLM for N options
+                "num_slots_requested": slots_to_request_from_llm, # Use calculated number
+                "search_start_date": start_date_str,
+                "search_end_date": end_date_str,
+                "scheduling_hints": params.scheduling_hints or "None" # Pass hints
             }
-            # log_info("tool_definitions", f"{fn_name}_DEBUG", f"Data Sent to Scheduler LLM: {json.dumps(prompt_data, indent=2)}")
-            log_info("tool_definitions", fn_name, f"Scheduler prompt data prepared (event count: {len(existing_events)}).")
+            log_info("tool_definitions", fn_name, f"Scheduler prompt data prepared (requesting {slots_to_request_from_llm} slots, event count: {len(existing_events)}).")
         except Exception as e:
              log_error("tool_definitions", fn_name, f"Failed prepare prompt data for scheduler: {e}", e)
              return {**fail_result, "message": "Failed prepare data for scheduler."}
 
-        # Call LLM and parse response
+        # Call LLM and parse response (keep as is)
         raw_llm_output = None; parsed_data = None
         try:
             fmt_human = human_prompt.format(**prompt_data)
             messages = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": fmt_human}]
             log_info("tool_definitions", fn_name, ">>> Invoking Session Scheduler LLM...")
-            # Expect JSON object directly from GPT-4o
             sched_resp = llm_client.chat.completions.create(model="gpt-4o", messages=messages, temperature=0.2, response_format={"type": "json_object"})
             raw_llm_output = sched_resp.choices[0].message.content
-            # log_info("tool_definitions", fn_name, f"<<< Scheduler LLM Raw Resp: {raw_llm_output[:300]}...")
-            # log_info("tool_definitions", f"{fn_name}_DEBUG", f"Full Raw LLM Resp: {raw_llm_output}")
-            parsed_data = _parse_scheduler_llm_response(raw_llm_output) # Use helper to parse and validate
-            if parsed_data is None: # Check parse result
+            parsed_data = _parse_scheduler_llm_response(raw_llm_output)
+            if parsed_data is None:
                 log_error("tool_definitions", fn_name, "Scheduler response parse failed or returned invalid structure.")
                 return {**fail_result, "message": "Received invalid proposals format from scheduler."}
 
             log_info("tool_definitions", f"{fn_name}_DEBUG", f"Parsed Scheduler LLM Resp: {json.dumps(parsed_data, indent=2)}")
+            # --- Check if enough slots were returned ---
+            num_returned = len(parsed_data.get("proposed_sessions", []))
+            if num_returned < num_slots_to_find:
+                 log_warning("tool_definitions", fn_name, f"Sub-LLM returned only {num_returned} slots, but {num_slots_to_find} were needed.")
+                 # Append to message? Modify success? For now, just return what was found.
+                 parsed_data["response_message"] += f" (Note: Only found {num_returned} of the {num_slots_to_find} required slots)."
+            # -------------------------------------------
             log_info("tool_definitions", fn_name, f"Scheduler LLM processing successful.")
-            # Return success with parsed slots and the context used
             return {"success": True, "proposed_slots": parsed_data.get("proposed_sessions"), "message": parsed_data.get("response_message", "..."), "search_context": search_context_to_return}
         except Exception as e:
             tb_str = traceback.format_exc()
@@ -2568,7 +2851,7 @@ def propose_task_slots_tool(user_id, params: ProposeTaskSlotsParams):
     except Exception as e:
          log_error("tool_definitions", fn_name, f"Unexpected error in propose_task_slots: {e}", e)
          return fail_result
-
+         
 # Returns dict
 def finalize_task_and_book_sessions_tool(user_id, params: FinalizeTaskAndBookSessionsParams):
     """Creates a task metadata record AND books the approved work sessions in GCal."""
@@ -4916,7 +5199,7 @@ def _sort_tasks(task_list: List[Dict]) -> List[Dict]:
 ================================================================================
 
 # --- START OF FILE services/notification_service.py ---
-# --- START OF FILE services/notification_service.py ---
+# --- START OF FULL services/notification_service.py ---
 """
 Handles checking for upcoming events and sending notifications.
 Uses an in-memory set within agent_state to track sent notifications for the day.
@@ -4933,7 +5216,7 @@ from bridge.request_router import send_message # Direct import for sending
 from services.task_manager import _parse_duration_to_minutes # For parsing lead time
 
 try:
-    from tools.activity_db import update_task_fields # <-- Import the new function
+    from tools.activity_db import update_task_fields
     DB_IMPORTED = True
 except ImportError:
     DB_IMPORTED = False
@@ -4942,51 +5225,30 @@ except ImportError:
 # --- End Imports ---
 
 NOTIFICATION_CHECK_INTERVAL_MINUTES = 5
-
 DEFAULT_NOTIFICATION_LEAD_TIME_MINUTES = 15
 
 def generate_event_notification_message(event_data, user_timezone_str="UTC"):
     """
     Formats a simple notification message for an event, converting the start time
     to the user's local timezone.
-
-    Args:
-        event_data (dict): Dictionary containing item data, expects 'gcal_start_datetime' and 'title'.
-        user_timezone_str (str): The user's Olson timezone string (e.g., 'America/New_York').
-                                 Defaults to 'UTC' if not provided or invalid.
-
-    Returns:
-        str: Formatted notification string or None if formatting fails.
     """
     fn_name = "generate_event_notification_message"
     title = event_data.get('title', '(No Title)')
     start_time_str = event_data.get('gcal_start_datetime')
-
     if not start_time_str:
         log_warning("notification_service", fn_name, f"Cannot generate notification for event '{title}' - missing gcal_start_datetime.")
         return None
-
     try:
-        # Determine User Timezone Object
-        user_tz = pytz.utc # Default to UTC
+        user_tz = pytz.utc
         try:
-            if user_timezone_str:
-                 user_tz = pytz.timezone(user_timezone_str)
+            if user_timezone_str: user_tz = pytz.timezone(user_timezone_str)
         except pytz.UnknownTimeZoneError:
             log_warning("notification_service", fn_name, f"Unknown timezone '{user_timezone_str}'. Using UTC for notification message for event '{title}'.")
-            user_timezone_str = "UTC" # Update string for consistency
-
-        # Parse the aware datetime string from GCal
+            user_timezone_str = "UTC"
         dt_aware = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
-
-        # Convert to user's local timezone
         dt_local = dt_aware.astimezone(user_tz)
-
-        # Format the time string using local time and timezone abbreviation
-        time_str = dt_local.strftime('%H:%M %Z') # e.g., 10:00 EDT
-
+        time_str = dt_local.strftime('%H:%M %Z')
         return f"🔔 Reminder: '{title}' is starting soon at {time_str}."
-
     except (ValueError, TypeError) as parse_err:
         log_error("notification_service", fn_name, f"Error parsing/converting start time '{start_time_str}' for event '{title}'. Error: {parse_err}", parse_err)
         return None
@@ -5003,6 +5265,7 @@ def check_event_notifications():
     log_info("notification_service", fn_name, "Running scheduled check for event notifications...")
     now_utc = datetime.now(timezone.utc)
 
+    # --- Outermost Try ---
     try:
         registry = get_registry()
         if not registry:
@@ -5013,86 +5276,77 @@ def check_event_notifications():
         log_info("notification_service", fn_name, f"Checking notifications for {len(user_ids)} users.")
 
         for user_id in user_ids:
-            prefs = None # Define prefs before try block
+            prefs = None
+            # --- Inner Try (User Level) ---
             try:
                 prefs = get_user_preferences(user_id)
-                # Skip if user inactive, no prefs, or calendar not enabled (needed for notifications)
                 if not prefs or prefs.get("status") != "active" or not prefs.get("Calendar_Enabled"):
                     continue
 
                 lead_time_str = prefs.get("Notification_Lead_Time", "15m")
                 lead_time_minutes = _parse_duration_to_minutes(lead_time_str)
                 if lead_time_minutes is None:
-                     log_warning("notification_service", fn_name, f"Invalid Notification_Lead_Time '{lead_time_str}' for user {user_id}. Using default.", user_id=user_id)
-                     lead_time_minutes = DEFAULT_NOTIFICATION_LEAD_TIME_MINUTES
+                    log_warning("notification_service", fn_name, f"Invalid Notification_Lead_Time '{lead_time_str}' for user {user_id}. Using default.", user_id=user_id)
+                    lead_time_minutes = DEFAULT_NOTIFICATION_LEAD_TIME_MINUTES
 
-                # Define the window to check
-                check_end_utc = now_utc + timedelta(minutes=lead_time_minutes + NOTIFICATION_CHECK_INTERVAL_MINUTES)
-                start_date_str = now_utc.strftime("%Y-%m-%d")
-                end_date_str = check_end_utc.strftime("%Y-%m-%d")
-
-                # Get combined context (WT tasks from DB + GCal Events from API)
-                aggregated_context = get_synced_context_snapshot(user_id, start_date_str, end_date_str)
+                notification_window_end_utc = now_utc + timedelta(minutes=lead_time_minutes)
+                today_date_str = now_utc.strftime("%Y-%m-%d")
+                aggregated_context = get_synced_context_snapshot(user_id, today_date_str, today_date_str)
                 if not aggregated_context: continue
 
                 notified_today_set = get_notified_event_ids(user_id)
 
                 for item in aggregated_context:
                     event_id = item.get("event_id")
-                    # Use gcal_start_datetime as the definitive time for notifications
                     start_time_iso = item.get("gcal_start_datetime")
 
-                    # Skip if missing ID, start time, or if it's an all-day event without a specific time
-                    if not event_id or not start_time_iso or 'T' not in start_time_iso:
-                        continue
-                    # Skip if already notified today
+                    if not event_id or not start_time_iso or 'T' not in start_time_iso: continue
                     if event_id in notified_today_set: continue
 
+                    # --- Innermost Try (Item Level) ---
                     try:
                         start_dt_aware = datetime.fromisoformat(start_time_iso.replace('Z', '+00:00'))
-                        notification_trigger_time = start_dt_aware - timedelta(minutes=lead_time_minutes)
 
-                        # Check if it's time to notify
-                        if notification_trigger_time <= now_utc:
-                             log_info("notification_service", fn_name, f"Triggering notification for user {user_id}, event: {event_id} ('{item.get('title')}')", user_id=user_id)
+                        # Corrected check logic
+                        if start_dt_aware > now_utc and start_dt_aware <= notification_window_end_utc:
+                            log_info("notification_service", fn_name, f"Triggering notification for user {user_id}, event: {event_id} ('{item.get('title')}')")
 
-                             notification_message = generate_event_notification_message(item, prefs.get("TimeZone", "UTC"))
+                            notification_message = generate_event_notification_message(item, prefs.get("TimeZone", "UTC"))
 
-                             if notification_message:
-                                 send_message(user_id, notification_message)
-                                 add_notified_event_id(user_id, event_id) # Mark in memory
-                                 log_info("notification_service", fn_name, f"Sent notification and marked as notified (memory) for event {event_id}, user {user_id}", user_id=user_id)
+                            if notification_message:
+                                send_message(user_id, notification_message)
+                                add_notified_event_id(user_id, event_id)
+                                log_info("notification_service", fn_name, f"Sent notification and marked as notified (memory) for event {event_id}, user {user_id}")
 
-                                 # --- Update DB for WT items ---
-                                 # Check if it's a task or reminder managed by WT
-                                 if item.get("type") in ["task", "reminder"] and DB_IMPORTED:
-                                     sent_time_utc_str = datetime.now(timezone.utc).isoformat(timespec='seconds')+'Z'
-                                     update_payload = {"internal_reminder_sent": sent_time_utc_str}
-                                     # Call the specific update function
-                                     db_update_success = update_task_fields(event_id, update_payload)
-                                     if db_update_success:
-                                         log_info("notification_service", fn_name, f"Updated internal_reminder_sent in DB for WT item {event_id}", user_id=user_id)
-                                     else:
-                                          log_warning("notification_service", fn_name, f"Failed to update internal_reminder_sent in DB for WT item {event_id}", user_id=user_id)
-                                 # --- End DB Update ---
-                             else:
-                                 log_warning("notification_service", fn_name, f"Failed to generate notification message for event {event_id}.", user_id=user_id)
+                                if item.get("type") in ["task", "reminder"] and DB_IMPORTED:
+                                    sent_time_utc_str = datetime.now(timezone.utc).isoformat(timespec='seconds')+'Z'
+                                    update_payload = {"internal_reminder_sent": sent_time_utc_str}
+                                    db_update_success = update_task_fields(event_id, update_payload)
+                                    if db_update_success:
+                                        log_info("notification_service", fn_name, f"Updated internal_reminder_sent in DB for WT item {event_id}")
+                                    else:
+                                        log_warning("notification_service", fn_name, f"Failed to update internal_reminder_sent in DB for WT item {event_id}", user_id=user_id)
+                            else:
+                                log_warning("notification_service", fn_name, f"Failed to generate notification message for event {event_id}.", user_id=user_id)
 
                     except ValueError:
                         log_warning("notification_service", fn_name, f"Could not parse start time '{start_time_iso}' for event {event_id}. Skipping.", user_id=user_id)
                     except Exception as item_err:
                         log_error("notification_service", fn_name, f"Error processing item {event_id} for user {user_id}", item_err, user_id=user_id)
+                    # --- End Innermost Try ---
 
-            except Exception as user_err:
-                 # Log error with user context if prefs was loaded
-                 user_context = user_id if prefs else f"Unknown User (Error before prefs load)"
-                 log_error("notification_service", fn_name, f"Error processing notifications for user {user_id}", user_err, user_id=user_context)
+            except Exception as user_err: # <-- Correctly indented for Inner Try
+                user_context = user_id if prefs else f"Unknown User (Error before prefs load)"
+                log_error("notification_service", fn_name, f"Error processing notifications for user {user_id}", user_err, user_id=user_context)
+            # --- End Inner Try ---
 
-    except Exception as main_err:
+    # --- <<< CORRECTED INDENTATION FOR FINAL EXCEPT >>> ---
+    except Exception as main_err: # <-- Correctly indented for Outermost Try
         log_error("notification_service", fn_name, f"General error during notification check run", main_err)
+    # --- <<< END CORRECTION >>> ---
 
+    # --- Correctly indented final log ---
     log_info("notification_service", fn_name, "Finished scheduled check for event notifications.")
-
 
 # --- END OF FILE services/notification_service.py ---
 # --- END OF FILE services/notification_service.py ---
@@ -5388,6 +5642,8 @@ def daily_cleanup():
 # --- START OF FULL tools/google_calendar_api.py ---
 
 import os
+import re  # <--- ADD THIS IMPORT
+
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, TYPE_CHECKING # Removed Optional
 
@@ -5893,7 +6149,7 @@ class GoogleCalendarAPI:
 ================================================================================
 
 # --- START OF FILE tools/calendar_tool.py ---
-# tools/calendar_tool.py
+# --- START OF FULL tools/calendar_tool.py ---
 
 import os
 import requests
@@ -5901,16 +6157,16 @@ import json # For logging potentially
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import HTMLResponse
 from tools.logger import log_info, log_error, log_warning
-from tools.encryption import encrypt_data # Need encrypt
+from tools.encryption import encrypt_data # Only need encrypt_data from here
 import jwt
 import requests.compat # Needed for urlencode in authenticate
 from datetime import datetime # Keep if used elsewhere
 
-# --- TEMPORARY PHASE 1 IMPORTS ---
-# This direct import is specific to Phase 1 testing.
-# Later phases might use a service (ConfigManager) to update preferences.
+# --- REMOVE service layer import attempt from module level ---
+# --- Keep ONLY direct registry update as fallback ---
 from users.user_registry import update_preferences as update_prefs_direct
-# ----------------------------------
+log_warning("calendar_tool", "import", "Using direct registry update for preferences in callback.")
+# ----------------------------------------------
 
 router = APIRouter()
 
@@ -5922,47 +6178,40 @@ SCOPE = "https://www.googleapis.com/auth/calendar"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 AUTH_URL_BASE = "https://accounts.google.com/o/oauth2/auth"
 
-# Check essential config on load
 if not GOOGLE_CLIENT_SECRET or not CLIENT_ID:
     log_error("calendar_tool", "config", "CRITICAL: GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET env var not set.")
 
 log_info("calendar_tool", "config", f"Calendar Tool loaded. Client ID starts with: {str(CLIENT_ID)[:10]}")
 
-
-# --- Core Authentication Check Function (Phase 1) ---
+# --- Core Authentication Check Function ---
 def authenticate(user_id: str, prefs: dict) -> dict:
     """
-    Checks user's calendar auth status based on provided preferences (Phase 1).
+    Checks user's calendar auth status based on provided preferences.
     Returns status and auth URL if needed, or status/message if token exists.
-    Does NOT attempt to load/test the token here.
     """
     log_info("calendar_tool", "authenticate", f"Checking auth status for user {user_id}")
-    token_file_path = prefs.get("token_file")
+    from tools.token_store import get_user_token # Import here
+    token_data = get_user_token(user_id)
     calendar_enabled = prefs.get("Calendar_Enabled", False)
 
-    # Scenario 1: Token file exists and system thinks it's enabled
-    if calendar_enabled and token_file_path and os.path.exists(token_file_path):
-        log_info("calendar_tool", "authenticate", f"Token file exists and enabled flag is True for {user_id}.")
-        # Report that token exists, actual validation happens when GCalAPI is initialized
+    if token_data is not None and calendar_enabled:
+        log_info("calendar_tool", "authenticate", f"Token data exists and enabled flag is True for {user_id}.")
         return {"status": "token_exists", "message": "Stored calendar credentials found. Attempting to use..."}
-
-    # Scenario 2: Initiate new authorization
     else:
-        log_info("calendar_tool", "authenticate", f"No valid token file found or not enabled for {user_id}. Initiating auth.")
-        # Check essential config needed to generate URL
+        # ... (rest of auth URL generation logic remains the same) ...
+        if token_data is not None and not calendar_enabled:
+             log_info("calendar_tool", "authenticate", f"Token data exists but Calendar_Enabled=False for {user_id}. Initiating re-auth/enable.")
+        else: # token_data is None
+             log_info("calendar_tool", "authenticate", f"No valid token data found for {user_id}. Initiating auth.")
+
         if not CLIENT_ID or not REDIRECT_URI:
              log_error("calendar_tool", "authenticate", f"Client ID or Redirect URI missing for auth URL generation.")
              return {"status": "fails", "message": "Server configuration error prevents authentication."}
 
-        normalized_state = user_id.replace("@c.us", "").replace("+","") # Basic normalization
+        normalized_state = user_id.replace("@c.us", "").replace("+","")
         params = {
-            "client_id": CLIENT_ID,
-            "redirect_uri": REDIRECT_URI,
-            "scope": SCOPE,
-            "response_type": "code",
-            "access_type": "offline", # Crucial for refresh token
-            "state": normalized_state,
-            "prompt": "consent" # Force consent screen for refresh token reliability
+            "client_id": CLIENT_ID, "redirect_uri": REDIRECT_URI, "scope": SCOPE,
+            "response_type": "code", "access_type": "offline", "state": normalized_state, "prompt": "consent"
         }
         try:
              encoded_params = requests.compat.urlencode(params)
@@ -5974,15 +6223,27 @@ def authenticate(user_id: str, prefs: dict) -> dict:
              return {"status": "fails", "message": "Failed to generate authentication URL."}
 
 
-# --- OAuth Callback Endpoint (Cleaned "OLD STYLE" Logic) ---
+# --- OAuth Callback Endpoint (Corrected Scope) ---
 @router.get("/oauth2callback", response_class=HTMLResponse)
 async def oauth2callback(request: Request, code: str | None = None, state: str | None = None, error: str | None = None):
     """
     Handles the OAuth2 callback from Google.
-    Exchanges code, saves token (WITHOUT immediate verification), updates registry.
+    Exchanges code, saves token, updates preferences.
     """
+    # --- Define flag and function placeholder INSIDE the function scope ---
+    config_manager_imported_locally = False
+    update_prefs_service = None
+    # --- Attempt import locally ---
+    try:
+        from services.config_manager import update_preferences
+        update_prefs_service = update_preferences
+        config_manager_imported_locally = True
+    except ImportError:
+         # Error/warning already logged at module level, no need to repeat
+         pass # Keep flag as False, function as None
+    # ---------------------------------------------------------------------
+
     html_error_template = "<html><body><h1>Authentication Error</h1><p>Details: {details}</p><p>Please try authenticating again or contact support if the issue persists.</p></body></html>"
-    # Simple success message assuming token *will* work later
     html_success_template = "<html><body><h1>Authentication Successful!</h1><p>Your credentials have been saved. The connection will be fully tested when first used. You can close this window and return to the chat.</p></body></html>"
 
     if error:
@@ -5996,8 +6257,8 @@ async def oauth2callback(request: Request, code: str | None = None, state: str |
     log_info("calendar_tool", "oauth2callback", f"Callback received for user {user_id}.")
 
     if not GOOGLE_CLIENT_SECRET or not CLIENT_ID:
-         log_error("calendar_tool", "oauth2callback", "Server configuration error: Client ID/Secret not set.")
-         return HTMLResponse(content=html_error_template.format(details="Server configuration error."), status_code=500)
+        log_error("calendar_tool", "oauth2callback", "Server configuration error: Client ID/Secret not set.")
+        return HTMLResponse(content=html_error_template.format(details="Server configuration error."), status_code=500)
 
     try:
         # --- 1. Exchange Code for Tokens ---
@@ -6011,59 +6272,55 @@ async def oauth2callback(request: Request, code: str | None = None, state: str |
         tokens = token_response.json()
         log_info("calendar_tool", "oauth2callback", f"Tokens received successfully. Keys: {list(tokens.keys())}")
 
-        # --- Basic Token Checks ---
         if 'access_token' not in tokens:
-             log_error("calendar_tool", "oauth2callback", f"Access token *NOT* received for user {user_id}.")
-             return HTMLResponse(content=html_error_template.format(details="Failed to obtain access token from Google."), status_code=500)
+            log_error("calendar_tool", "oauth2callback", f"Access token *NOT* received for user {user_id}.")
+            return HTMLResponse(content=html_error_template.format(details="Failed to obtain access token from Google."), status_code=500)
         if 'refresh_token' not in tokens:
-             log_warning("calendar_tool", "oauth2callback", f"Refresh token *NOT* received for user {user_id}. Offline access might fail later.")
-        # --- End Basic Checks ---
+            log_warning("calendar_tool", "oauth2callback", f"Refresh token *NOT* received for user {user_id}. Offline access might fail later.")
 
-        # --- Verification Block REMOVED ---
-
-        # --- 3. Extract Email ---
+        # --- 2. Extract Email ---
         email = ""
         id_token = tokens.get("id_token")
         if id_token:
             try:
-                decoded = jwt.decode(id_token, options={"verify_signature": False})
+                decoded = jwt.decode(id_token, options={"verify_signature": False, "verify_aud": False})
                 email = decoded.get("email", "")
                 log_info("calendar_tool", "oauth2callback", f"Extracted email '{email}' for user {user_id}.")
             except jwt.exceptions.DecodeError as jwt_e:
-                 log_warning("calendar_tool", "oauth2callback", f"Failed to decode id_token for {user_id}, proceeding without email.", jwt_e)
+                log_warning("calendar_tool", "oauth2callback", f"Failed decode id_token for {user_id}, proceeding without email.", jwt_e)
 
-        # --- 4. Encrypt and Save Tokens ---
-        log_info("calendar_tool", "oauth2callback", f"Proceeding to encrypt and save token for {user_id} (no immediate verification).")
-        encrypted_tokens = encrypt_data(tokens)
-        if not encrypted_tokens:
-             log_error("calendar_tool", "oauth2callback", f"Encryption failed for {user_id}'s tokens.")
-             return HTMLResponse(content=html_error_template.format(details="Failed to secure credentials."), status_code=500)
+        # --- 3. Save Tokens Encrypted ---
+        from tools.token_store import save_user_token_encrypted # Import locally
+        if not save_user_token_encrypted(user_id, tokens):
+             log_error("calendar_tool", "oauth2callback", f"Failed to save token via token_store for {user_id}.")
+             return HTMLResponse(content=html_error_template.format(details="Failed to save credentials securely."), status_code=500)
+        log_info("calendar_tool", "oauth2callback", f"Tokens stored successfully via token_store for {user_id}.")
 
-        token_file_path = os.path.join("data", f"tokens_{user_id}.json.enc")
-        try:
-            os.makedirs(os.path.dirname(token_file_path), exist_ok=True)
-            with open(token_file_path, "wb") as f: f.write(encrypted_tokens)
-            log_info("calendar_tool", "oauth2callback", f"Tokens stored successfully for {user_id}.")
+        # --- 4. Update Preferences ---
+        prefs_update = { "email": email, "Calendar_Enabled": True }
+        pref_update_success = False
+        # --- Use locally checked flag and function ---
+        if config_manager_imported_locally and update_prefs_service:
+            pref_update_success = update_prefs_service(user_id, prefs_update)
+            if pref_update_success:
+                 log_info("calendar_tool", "oauth2callback", f"Preferences updated via ConfigManager for {user_id}: {prefs_update}")
+            else:
+                 log_error("calendar_tool", "oauth2callback", f"ConfigManager failed update preferences for {user_id} after token save.")
+        else:
+             # Fallback to direct update
+             # Warning already logged at module level
+             pref_update_success = update_prefs_direct(user_id, prefs_update) # Use direct update
+             if pref_update_success:
+                  log_info("calendar_tool", "oauth2callback", f"Preferences updated DIRECTLY for {user_id}: {prefs_update}")
+             else:
+                  log_error("calendar_tool", "oauth2callback", f"Direct registry update failed for {user_id} after token save.")
+        # -----------------------------------------
 
-            # --- 5. Update Preferences (DIRECTLY in Registry - Phase 1 Only) ---
-            prefs_update = {
-                "email": email,
-                "token_file": token_file_path,
-                "Calendar_Enabled": True,
-                "status": "active" # Set user active after successful save for Phase 1
-            }
-            try:
-                update_prefs_direct(user_id, prefs_update)
-                log_info("calendar_tool", "oauth2callback", f"Preferences updated DIRECTLY for {user_id}: {prefs_update}")
-                # Return simple SUCCESS response to user
-                return HTMLResponse(content=html_success_template, status_code=200)
-            except Exception as pref_e:
-                log_error("calendar_tool", "oauth2callback", f"Failed to update preferences registry for {user_id} after token save.", pref_e)
-                return HTMLResponse(content=html_error_template.format(details="Credentials saved, but failed to update user profile. Contact support."), status_code=500)
-
-        except IOError as io_e:
-             log_error("calendar_tool", "oauth2callback", f"Failed to write token file {token_file_path}", io_e)
-             return HTMLResponse(content=html_error_template.format(details="Failed to save credentials locally."), status_code=500)
+        if pref_update_success:
+             return HTMLResponse(content=html_success_template, status_code=200)
+        else:
+             # Tokens saved, but profile update failed
+             return HTMLResponse(content=html_error_template.format(details="Credentials saved, but failed to update user profile. Contact support."), status_code=500)
 
     except requests.exceptions.HTTPError as http_e:
         response_text = http_e.response.text; status_code = http_e.response.status_code
@@ -6075,14 +6332,9 @@ async def oauth2callback(request: Request, code: str | None = None, state: str |
     except Exception as e:
         log_error("calendar_tool", "oauth2callback", f"Generic unexpected error during callback for {user_id}", e)
         return HTMLResponse(content=html_error_template.format(details=f"An unexpected server error occurred: {e}."), status_code=500)
+
+# --- END OF FULL tools/calendar_tool.py ---
 # --- END OF FILE tools/calendar_tool.py ---
-
-
-================================================================================
-📄 tools/metadata_store.py
-================================================================================
-
-# ⚠️ File does not exist.
 
 
 ================================================================================
@@ -6090,99 +6342,99 @@ async def oauth2callback(request: Request, code: str | None = None, state: str |
 ================================================================================
 
 # --- START OF FILE tools/token_store.py ---
-# tools/token_store.py
+# --- START OF FULL tools/token_store.py ---
 
 import os
 import json
-# Remove: from cryptography.fernet import Fernet # No longer needed here
-from tools.encryption import decrypt_data # <-- IMPORT THIS
-from tools.logger import log_info, log_error, log_warning # <-- Added log_error
-from tools.encryption import decrypt_data, encrypt_data
+from tools.encryption import decrypt_data
+from tools.logger import log_info, log_error, log_warning
 
-TOKEN_DIR = "data" # Keep this if already defined
+TOKEN_DIR = "data"
 
-# Remove or comment out: ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY") # No longer needed here
-
-def get_user_token(user_id: str) -> dict | None: # <-- Return type changed to dict | None
+def get_user_token(user_id: str) -> dict | None:
     """Loads and decrypts the user's token from the encrypted file."""
-    path = os.path.join(TOKEN_DIR, f"tokens_{user_id}.json.enc")
-    if not os.path.exists(path):
-        # This is not necessarily an error, just means no token yet.
-        log_info("token_store", "get_user_token", f"No token file found for user {user_id} at {path}")
-        return None # <-- Return None if file not found
+    fn_name = "get_user_token"
+    relative_path = os.path.join(TOKEN_DIR, f"tokens_{user_id}.json.enc")
 
     try:
-        with open(path, "rb") as f:
+        cwd = os.getcwd()
+        # --- Generate Absolute Path FIRST ---
+        absolute_path = os.path.abspath(relative_path)
+        # --- Log Both ---
+        log_info("token_store", fn_name, f"DEBUG: Checking for token file. User: {user_id}, Relative Path: '{relative_path}', CWD: '{cwd}', Absolute Path Check: '{absolute_path}'")
+    except Exception as debug_e:
+        log_warning("token_store", fn_name, f"DEBUG: Error getting CWD/abspath: {debug_e}")
+        absolute_path = relative_path # Fallback to relative if abspath fails
+
+    # --- MODIFY: Check existence using the generated ABSOLUTE path ---
+    file_exists = os.path.exists(absolute_path)
+    # ------------------------------------------------------------------
+
+    if not file_exists:
+        log_info("token_store", fn_name, f"Result: os.path.exists returned FALSE for path '{absolute_path}'")
+        return None
+
+    log_info("token_store", fn_name, f"Result: os.path.exists returned TRUE for path '{absolute_path}'. Attempting to read.")
+
+    try:
+        # --- Use the absolute path to open the file too ---
+        with open(absolute_path, "rb") as f:
+        # -------------------------------------------------
             encrypted_data = f.read()
 
-        # Use the new decrypt function
-        token_data = decrypt_data(encrypted_data) # <-- USE THIS
+        token_data = decrypt_data(encrypted_data)
 
         if token_data:
-            # Log a summary of the token data without exposing full details.
-            log_info("token_store", "get_user_token", f"Decrypted token data keys for user {user_id}: {list(token_data.keys())}")
+            log_info("token_store", fn_name, f"Decrypted token data keys for user {user_id}: {list(token_data.keys())}")
             return token_data
         else:
-            # Decryption failed (logged within decrypt_data)
-            log_error("token_store", "get_user_token", f"Failed to decrypt token for user {user_id} from {path}.")
-            # Consider deleting the corrupted file? os.remove(path)
+            log_error("token_store", fn_name, f"Failed to decrypt token for user {user_id} from {absolute_path}.")
             return None
 
     except FileNotFoundError:
-         log_info("token_store", "get_user_token", f"Token file not found for user {user_id} at {path} (race condition?).")
+         # This shouldn't happen if os.path.exists was True, but good to keep
+         log_info("token_store", fn_name, f"Token file not found for user {user_id} at {absolute_path} (race condition?).")
+         return None
+    except PermissionError as pe:
+         log_error("token_store", fn_name, f"Permission denied reading token file for user {user_id} from {absolute_path}: {pe}", pe)
          return None
     except Exception as e:
-        # Catch any other unexpected errors during file reading etc.
-        log_error("token_store", "get_user_token", f"Unexpected error loading token for user {user_id} from {path}: {str(e)}", e)
+        log_error("token_store", fn_name, f"Unexpected error loading token for user {user_id} from {absolute_path}: {str(e)}", e)
         return None
 
 
 def save_user_token_encrypted(user_id: str, token_data: dict) -> bool:
     """
     Encrypts and saves the user's token data to a file using atomic write.
-
-    Args:
-        user_id: The user's identifier.
-        token_data: The dictionary containing token information. It expects keys like
-                    'access_token', 'refresh_token', 'token_uri', etc. It handles if
-                    the access token key is 'token' coming from the Credentials object.
-
-    Returns:
-        True if saving was successful, False otherwise.
     """
     log_info("token_store", "save_user_token_encrypted", f"Attempting to save token for user {user_id}")
-    path = os.path.join(TOKEN_DIR, f"tokens_{user_id}.json.enc")
-    temp_path = path + ".tmp" # Temporary file path
+    # Use absolute path for saving too for consistency
+    relative_path = os.path.join(TOKEN_DIR, f"tokens_{user_id}.json.enc")
+    path = os.path.abspath(relative_path)
+    temp_path = path + ".tmp"
 
     try:
-        # Standardize access token key to 'access_token' before saving
         data_to_save = token_data.copy()
         if 'token' in data_to_save and 'access_token' not in data_to_save:
             data_to_save['access_token'] = data_to_save.pop('token')
 
-        # Basic validation: Check if critical tokens are present AFTER standardization
         if not data_to_save.get('access_token'):
-             log_error("token_store", "save_user_token_encrypted", f"Attempted to save token data missing access_token for {user_id}.")
-             return False
+            log_error("token_store", "save_user_token_encrypted", f"Attempted to save token data missing access_token for {user_id}.")
+            return False
         if not data_to_save.get('refresh_token'):
-             # Allow saving even if refresh token is missing, but log warning.
-             log_warning("token_store", "save_user_token_encrypted", f"Saving token data potentially missing refresh_token for {user_id}.")
+            log_warning("token_store", "save_user_token_encrypted", f"Saving token data potentially missing refresh_token for {user_id}.")
 
-        # Encrypt the standardized data
+        from tools.encryption import encrypt_data
         encrypted_tokens = encrypt_data(data_to_save)
         if not encrypted_tokens:
-            # Error already logged by encrypt_data
             log_error("token_store", "save_user_token_encrypted", f"Encryption failed for {user_id}'s tokens during save.")
             return False
 
-        # Ensure directory exists
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
-        # Write to temporary file first
         with open(temp_path, "wb") as f:
             f.write(encrypted_tokens)
 
-        # Atomically replace original file with temp file
         os.replace(temp_path, path)
 
         log_info("token_store", "save_user_token_encrypted", f"Token stored successfully for {user_id} at {path}.")
@@ -6190,11 +6442,11 @@ def save_user_token_encrypted(user_id: str, token_data: dict) -> bool:
 
     except Exception as e:
         log_error("token_store", "save_user_token_encrypted", f"Failed to write token file {path}", e)
-        # Clean up temp file if it exists after an error
         if os.path.exists(temp_path):
             try: os.remove(temp_path)
-            except OSError as rm_err: log_error("...", f"Failed to remove temp file {temp_path}: {rm_err}")
+            except OSError as rm_err: log_error("token_store", "save_user_token_encrypted", f"Failed to remove temp file {temp_path}: {rm_err}")
         return False
+# --- END OF FULL tools/token_store.py ---
 # --- END OF FILE tools/token_store.py ---
 
 
@@ -6307,67 +6559,107 @@ if __name__ == "__main__":
 # --- START OF FULL tools/logger.py ---
 import os
 import pytz
-from datetime import datetime, timezone # Added timezone
+from datetime import datetime, timezone
 import traceback
-import json # Added for potential detail formatting
+import json
 
 # --- Database Logging Import ---
+# REMOVE the direct import attempt from here
+# import tools.activity_db as activity_db # REMOVE THIS LINE
+ACTIVITY_DB_IMPORTED = False # Assume not imported initially
+_activity_db_log_func = None # Placeholder for the function
+
+# Try to import ONLY the function we need, later, within the logging calls
 try:
-    import tools.activity_db as activity_db
-    ACTIVITY_DB_IMPORTED = True
+    # This import happens when the logger *module* is loaded.
+    # We want to defer accessing the function until it's actually called.
+    pass # We will import inside the function call instead
 except ImportError:
-    # Fallback print if DB logging fails during import itself
-    print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')+'Z'}] [ERROR] [logger:import] Failed to import activity_db. Database logging disabled.")
-    ACTIVITY_DB_IMPORTED = False
-    # Define a dummy function if import fails
-    class activity_db:
-        @staticmethod
-        def log_system_event(*args, **kwargs): pass
-# --- End DB Import ---
+    print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')+'Z'}] [ERROR] [logger:import_check] Failed initial check for activity_db module. DB logging disabled.")
 
 
 # === Config ===
-# Read DEBUG_MODE from environment variable, default to True for safety during dev
 DEBUG_MODE = os.getenv("DEBUG_MODE", "True").lower() in ('true', '1', 't', 'yes', 'y')
 LOG_DIR = "logs"
 LOG_FILE = os.path.join(LOG_DIR, "whats_tasker.log")
-# Use a consistent timezone, UTC is generally best for logs
-LOG_TIMEZONE = pytz.utc # Changed from Asia/Jerusalem to UTC
+LOG_TIMEZONE = pytz.utc
 
-# Ensure logs directory exists
 try:
     os.makedirs(LOG_DIR, exist_ok=True)
 except OSError as e:
-     print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')+'Z'}] [ERROR] [logger:init] Failed to create log directory '{LOG_DIR}': {e}")
-
+    print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')+'Z'}] [ERROR] [logger:init] Failed to create log directory '{LOG_DIR}': {e}")
 
 # === Helpers ===
 def _timestamp():
-    # Return timestamp in UTC ISO format with Z suffix
     return datetime.now(LOG_TIMEZONE).isoformat(timespec='seconds').replace('+00:00', 'Z')
 
 def _format_log_entry(level: str, module: str, func: str, message: str):
-    # Format for console/file logging
-    ts = datetime.now(LOG_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %Z") # Human-readable timestamp for file/console
+    ts = datetime.now(LOG_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %Z")
     return f"[{ts}] [{level}] [{module}:{func}] {message}"
 
 # === Log functions ===
 def log_info(module: str, func: str, message: str):
     """Logs informational messages. Prints only if DEBUG_MODE is True."""
-    # INFO logs typically don't go to the persistent system_logs DB unless specifically needed
     if DEBUG_MODE:
         entry = _format_log_entry("INFO", module, func, message)
         print(entry)
     # Optionally write INFO to file log even in production?
     # else:
-    #     with open(LOG_FILE, "a", encoding="utf-8") as f:
-    #         f.write(entry + "\n")
+    #     try:
+    #         with open(LOG_FILE, "a", encoding="utf-8") as f:
+    #             f.write(entry + "\n")
+    #     except Exception: pass # Avoid errors during info logging
+
+def _try_log_to_db(level: str, module: str, function: str, message: str, traceback_str: str | None = None, user_id_context: str | None = None, timestamp: str | None = None):
+    """Internal helper to attempt DB logging dynamically."""
+    global _activity_db_log_func, ACTIVITY_DB_IMPORTED
+
+    # Try to import and get the function only once if not already done
+    if not ACTIVITY_DB_IMPORTED and _activity_db_log_func is None:
+        try:
+            from tools.activity_db import log_system_event
+            _activity_db_log_func = log_system_event
+            ACTIVITY_DB_IMPORTED = True
+            # Use internal print as logger might not be fully ready
+            print(f"[{_timestamp()}] [INFO] [logger:_try_log_to_db] Successfully linked activity_db.log_system_event.")
+        except ImportError:
+            # This is expected if called before activity_db is importable
+            # print(f"[{_timestamp()}] [INFO] [logger:_try_log_to_db] activity_db not yet available for import.")
+            _activity_db_log_func = None # Ensure it's None
+            ACTIVITY_DB_IMPORTED = False # Ensure flag is false
+        except Exception as e:
+            # Catch other potential import errors
+             print(f"[{_timestamp()}] [ERROR] [logger:_try_log_to_db] Unexpected error linking activity_db.log_system_event: {e}")
+             _activity_db_log_func = None
+             ACTIVITY_DB_IMPORTED = False
+
+
+    # If the function is available, call it
+    if _activity_db_log_func:
+        try:
+            _activity_db_log_func(
+                level=level,
+                module=module,
+                function=function,
+                message=message,
+                traceback_str=traceback_str,
+                user_id_context=user_id_context,
+                timestamp=timestamp # Use provided or let DB func generate
+            )
+        except Exception as db_log_err:
+             # Fallback to print if the DB call fails *after* import succeeded
+             ts_iso = timestamp or _timestamp()
+             print(f"[{ts_iso}] [CRITICAL DB LOG FAIL] [{level}] [{module}:{function}] DB log failed: {db_log_err} | Original Msg: {message}")
+    else:
+        # Fallback print if DB import failed or function link failed
+        ts_iso = timestamp or _timestamp()
+        print(f"[{ts_iso}] [DB_LOG_SKIP] [{level}] [{module}:{function}] {message}")
 
 
 def log_error(module: str, func: str, message: str, exception: Exception = None, user_id: str | None = None):
-    """Logs error messages. Prints/logs to file AND logs to database."""
+    """Logs error messages. Prints/logs to file AND attempts to log to database."""
     level = "ERROR"
-    ts_iso = _timestamp() # Get ISO timestamp for DB
+    ts_iso = _timestamp()
     traceback_str = None
     if exception:
         traceback_str = traceback.format_exc()
@@ -6376,73 +6668,42 @@ def log_error(module: str, func: str, message: str, exception: Exception = None,
     entry = _format_log_entry(level, module, func, message)
     if DEBUG_MODE:
         print(entry)
-        if traceback_str:
-            print(traceback_str)
+        if traceback_str: print(traceback_str)
     else:
         try:
             with open(LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(entry + "\n")
-                if traceback_str:
-                    f.write(traceback_str + "\n") # Add newline after traceback in file
+                if traceback_str: f.write(traceback_str + "\n")
         except Exception as file_log_e:
-             print(f"CRITICAL: Failed to write ERROR to log file {LOG_FILE}: {file_log_e}")
+            print(f"CRITICAL: Failed to write ERROR to log file {LOG_FILE}: {file_log_e}")
 
-
-    # Log to Database
-    if ACTIVITY_DB_IMPORTED:
-        activity_db.log_system_event(
-            level=level,
-            module=module,
-            function=func,
-            message=message,
-            traceback_str=traceback_str,
-            user_id_context=user_id, # Pass user_id if provided
-            timestamp=ts_iso # Pass timestamp
-        )
-    else:
-         # Fallback if DB import failed earlier
-         print(f"[{ts_iso}] [DB_LOG_SKIP] [{level}] [{module}:{func}] {message}")
+    # Attempt to log to Database
+    _try_log_to_db(level, module, func, message, traceback_str, user_id, ts_iso)
 
 
 def log_warning(module: str, func: str, message: str, exception: Exception = None, user_id: str | None = None):
-    """Logs warning messages. Prints/logs to file AND logs to database."""
+    """Logs warning messages. Prints/logs to file AND attempts to log to database."""
     level = "WARNING"
-    ts_iso = _timestamp() # Get ISO timestamp for DB
+    ts_iso = _timestamp()
     traceback_str = None
     if exception:
-        # Optionally include traceback for warnings too? Or just the exception type/message?
-        # Let's include full traceback for now for consistency with log_error
         traceback_str = traceback.format_exc()
-
 
     # Log to Console/File
     entry = _format_log_entry(level, module, func, message)
     if DEBUG_MODE:
         print(entry)
-        if traceback_str and exception: # Only print traceback if exception was passed
-             print(f"Warning Exception Info:\n{traceback_str}")
+        if traceback_str and exception: print(f"Warning Exception Info:\n{traceback_str}")
     else:
         try:
             with open(LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(entry + "\n")
-                if traceback_str and exception:
-                    f.write(f"Warning Exception Info:\n{traceback_str}\n")
+                if traceback_str and exception: f.write(f"Warning Exception Info:\n{traceback_str}\n")
         except Exception as file_log_e:
-             print(f"CRITICAL: Failed to write WARNING to log file {LOG_FILE}: {file_log_e}")
+            print(f"CRITICAL: Failed to write WARNING to log file {LOG_FILE}: {file_log_e}")
 
-    # Log to Database
-    if ACTIVITY_DB_IMPORTED:
-        activity_db.log_system_event(
-            level=level,
-            module=module,
-            function=func,
-            message=message,
-            traceback_str=traceback_str,
-            user_id_context=user_id,
-            timestamp=ts_iso
-        )
-    else:
-         print(f"[{ts_iso}] [DB_LOG_SKIP] [{level}] [{module}:{func}] {message}")
+    # Attempt to log to Database
+    _try_log_to_db(level, module, func, message, traceback_str, user_id, ts_iso)
 
 # --- END OF FULL tools/logger.py ---
 # --- END OF FILE tools/logger.py ---
@@ -6685,7 +6946,7 @@ def delete_task(event_id: str) -> bool:
 
 def list_tasks_for_user(
     user_id: str,
-    status_filter: list[str] | None = None, # Allow filtering by multiple statuses
+    status_filter: list[str] | None = None, # Allows filtering by multiple statuses
     date_range: tuple[str, str] | None = None,
     project_filter: str | None = None
 ) -> list[dict]:
@@ -6698,24 +6959,34 @@ def list_tasks_for_user(
     if status_filter:
         # Ensure status_filter is a list or tuple
         if isinstance(status_filter, str):
-            status_filter = [status_filter]
+            status_filter = [status_filter] # Convert single string to list
         if isinstance(status_filter, (list, tuple)) and status_filter:
-            placeholders = ','.join('?' * len(status_filter))
-            conditions.append(f"status IN ({placeholders})")
-            params.extend(status_filter)
+            # Sanitize statuses just in case
+            clean_statuses = [s.lower().strip() for s in status_filter if isinstance(s, str)]
+            if clean_statuses:
+                 placeholders = ','.join('?' * len(clean_statuses))
+                 conditions.append(f"status IN ({placeholders})")
+                 params.extend(clean_statuses)
+            else:
+                 log_warning("activity_db", fn_name, f"Received empty or invalid status_filter list for user {user_id}.")
+                 # Decide behavior: fetch all? fetch none? Let's fetch none to be safe.
+                 return []
+
+    # If NO status filter is provided, we fetch ALL statuses by default currently.
+    # <<<--- This is where the change would happen if we altered the default
 
     if date_range and len(date_range) == 2:
         conditions.append("date BETWEEN ? AND ?")
         params.extend(date_range)
 
     if project_filter:
-        conditions.append("LOWER(project) = LOWER(?)") # Case-insensitive project filter
+        conditions.append("LOWER(project) = LOWER(?)")
         params.append(project_filter)
 
     if conditions:
         sql += " AND " + " AND ".join(conditions)
 
-    sql += " ORDER BY date, time" # Add default sorting
+    sql += " ORDER BY date, time"
 
     results = []
     try:
@@ -6725,11 +6996,10 @@ def list_tasks_for_user(
             cursor.execute(sql, params)
             rows = cursor.fetchall()
             for row in rows:
-                # Decode JSON field
                 try:
                     row['session_event_ids'] = json.loads(row.get('session_event_ids', '[]') or '[]')
                 except (json.JSONDecodeError, TypeError):
-                    log_warning("activity_db", fn_name, f"Failed to decode session_event_ids JSON for task {row.get('event_id')}. Using empty list.")
+                    log_warning("activity_db", fn_name, f"Failed decode session_event_ids JSON for task {row.get('event_id')}. Using empty list.")
                     row['session_event_ids'] = []
                 results.append(row)
         return results
@@ -6882,21 +7152,19 @@ import traceback
 from tools.logger import log_info, log_error, log_warning
 from users.user_registry import get_registry, register_user, get_user_preferences
 
-# --- State Manager Import ---
+# --- Database Import ---
 try:
-    # Import the specific function needed
     import tools.activity_db as activity_db
     DB_IMPORTED = True
     log_info("user_manager", "import", "Successfully imported activity_db.")
 except ImportError:
     DB_IMPORTED = False
-    # Dummy function if import fails
     class activity_db:
         @staticmethod
         def list_tasks_for_user(*args, **kwargs): return []
     log_error("user_manager", "import", "activity_db not found. Task preloading disabled.")
-from tools.logger import log_info, log_error # Ensure logger is imported
 
+# --- State Manager Import ---
 try:
     from services.agent_state_manager import (
         register_agent_instance,
@@ -6907,7 +7175,6 @@ try:
 except ImportError:
      log_error("user_manager", "import", "AgentStateManager not found.")
      AGENT_STATE_MANAGER_IMPORTED = False
-     # Fallback local dictionary (not recommended for production)
      _user_agents_in_memory: Dict[str, Dict[str, Any]] = {}
      def register_agent_instance(uid, state): _user_agents_in_memory[uid] = state
      def get_agent_state(uid): return _user_agents_in_memory.get(uid)
@@ -6919,14 +7186,22 @@ try:
     GCAL_API_IMPORTED = True
 except ImportError:
     GCAL_API_IMPORTED = False
-    GoogleCalendarAPI = None # Define as None if import fails
+    GoogleCalendarAPI = None
     log_warning("user_manager","import", "GoogleCalendarAPI not found.")
 
+# --- Token Store Import (NEEDED FOR CHECK) ---
+try:
+    from tools.token_store import get_user_token
+    TOKEN_STORE_IMPORTED = True
+except ImportError:
+     TOKEN_STORE_IMPORTED = False
+     log_error("user_manager", "import", "Failed to import token_store.get_user_token. GCalAPI check will fail.")
+     def get_user_token(*args, **kwargs): return None
+# ---------------------------------------------
 
 # --- In-Memory State Dictionary Reference ---
 _user_agents_in_memory: Dict[str, Dict[str, Any]] = {}
 if AGENT_STATE_MANAGER_IMPORTED:
-    # Initialize the state store via the manager
     initialize_state_store(_user_agents_in_memory)
 
 
@@ -6941,15 +7216,10 @@ def _preload_initial_context(user_id: str) -> list[dict]:
         return []
 
     try:
-        # Fetch all tasks for the user from the database, regardless of status or date initially.
-        # The agent state context might be filtered later if needed, but preloading all
-        # makes the initial state more complete.
-        # list_tasks_for_user returns a list of dicts.
         task_list = activity_db.list_tasks_for_user(user_id=user_id)
         log_info("user_manager", fn_name, f"Preloaded {len(task_list)} tasks from DB for {user_id}.")
         return task_list
     except Exception as e:
-        # Log error with user context
         log_error("user_manager", fn_name, f"Error preloading context for {user_id} from DB", e, user_id=user_id)
         return []
 
@@ -6971,52 +7241,50 @@ def create_and_register_agent_state(user_id: str): # REMOVED TYPE HINT
         return None
 
     # --- Refined GCal Initialization ---
-    calendar_api_instance = None # Default to None
-    if GCAL_API_IMPORTED and GoogleCalendarAPI is not None and preferences.get("Calendar_Enabled"):
-        token_file = preferences.get("token_file")
-        if token_file and os.path.exists(token_file):
-            log_info("user_manager", fn_name, f"Attempting GCalAPI init for {norm_user_id}")
-            temp_cal_api = None # Initialize temporary variable
+    calendar_api_instance = None
+    # Check if GCal enabled in prefs AND necessary libraries/functions are loaded
+    if preferences.get("Calendar_Enabled") and GCAL_API_IMPORTED and GoogleCalendarAPI is not None and TOKEN_STORE_IMPORTED:
+        # --- MODIFIED CHECK: Try loading token data ---
+        token_data = get_user_token(norm_user_id)
+        if token_data is not None:
+            # --- END MODIFIED CHECK ---
+            log_info("user_manager", fn_name, f"Valid token data found for {norm_user_id}. Attempting GCalAPI init.")
+            temp_cal_api = None
             try:
-                # Step 1: Create the instance (this calls __init__ which loads creds and builds service)
                 temp_cal_api = GoogleCalendarAPI(norm_user_id)
-                # Step 2: Explicitly check if it's active *after* __init__ completes
                 if temp_cal_api.is_active():
-                    calendar_api_instance = temp_cal_api # Assign the created instance
+                    calendar_api_instance = temp_cal_api
                     log_info("user_manager", fn_name, f"GCalAPI initialized and active for {norm_user_id}")
                 else:
-                    # This case means __init__ completed but self.service was None or is_active() returned False
                     log_warning("user_manager", fn_name, f"GCalAPI initialized but NOT active for {norm_user_id}. Calendar features disabled.")
                     calendar_api_instance = None
             except Exception as cal_e:
-                 # *** ADDED TRACEBACK LOGGING ***
                  tb_str = traceback.format_exc()
                  log_error("user_manager", fn_name, f"Exception during GCalAPI initialization or is_active() check for {norm_user_id}. Traceback:\n{tb_str}", cal_e)
-                 # *******************************
-                 calendar_api_instance = None # Ensure None on any exception
+                 calendar_api_instance = None
         else:
-            if preferences.get("Calendar_Enabled"):
-                 log_warning("user_manager", fn_name, f"GCal enabled for {norm_user_id} but token file missing/invalid path: {token_file}")
-    elif not GCAL_API_IMPORTED:
-         log_warning("user_manager", fn_name, f"GoogleCalendarAPI library not imported, skipping calendar init for {norm_user_id}.")
+            # Token data not found (logged by get_user_token)
+            log_warning("user_manager", fn_name, f"GCal enabled for {norm_user_id} but no valid token data found via token_store.")
     elif not preferences.get("Calendar_Enabled"):
          log_info("user_manager", fn_name, f"Calendar not enabled for {norm_user_id}, skipping GCal init.")
+    # Log if libs were the issue
+    elif not GCAL_API_IMPORTED:
+         log_warning("user_manager", fn_name, f"GoogleCalendarAPI library not imported, skipping calendar init for {norm_user_id}.")
+    elif not TOKEN_STORE_IMPORTED:
+         log_warning("user_manager", fn_name, f"token_store not imported, skipping calendar init for {norm_user_id}.")
     # --- End Refined GCal Initialization ---
 
-    # Preload initial task context
     initial_context = _preload_initial_context(norm_user_id)
 
-    # Assemble the full agent state dictionary
     agent_state = {
         "user_id": norm_user_id,
         "preferences": preferences,
         "active_tasks_context": initial_context,
-        "calendar": calendar_api_instance, # Store the final instance (or None)
+        "calendar": calendar_api_instance,
         "conversation_history": [],
         "notified_event_ids_today": set()
     }
 
-    # Register state using AgentStateManager
     try:
         register_agent_instance(norm_user_id, agent_state)
         log_info("user_manager", fn_name, f"Successfully registered agent state for {norm_user_id}")
@@ -7041,7 +7309,6 @@ def init_all_agents():
 
     log_info("user_manager", fn_name, f"Found {len(registered_users)} users. Initializing...")
     for user_id in registered_users:
-        # Normalize ID just in case registry contains non-normalized ones
         norm_user_id = re.sub(r'\D', '', user_id)
         if not norm_user_id:
              log_warning("user_manager", fn_name, f"Skipping invalid user_id found in registry: '{user_id}'")
@@ -7052,7 +7319,6 @@ def init_all_agents():
             if created_state:
                 initialized_count += 1
             else:
-                # Error already logged by create_and_register_agent_state
                 failed_count += 1
         except Exception as e:
             log_error("user_manager", fn_name, f"Unexpected error initializing agent state for user {norm_user_id}", e)
@@ -7072,14 +7338,13 @@ def get_agent(user_id: str) -> Optional[Dict]:
 
     agent_state = None
     try:
-        # Use state manager function (or local fallback)
         agent_state = get_agent_state(norm_user_id)
         if not agent_state:
             log_warning("user_manager", fn_name, f"State for {norm_user_id} not in memory. Creating now.")
             agent_state = create_and_register_agent_state(norm_user_id)
     except Exception as e:
          log_error("user_manager", fn_name, f"Error retrieving/creating agent state for {norm_user_id}", e)
-         agent_state = None # Ensure None is returned on error
+         agent_state = None
 
     return agent_state
 

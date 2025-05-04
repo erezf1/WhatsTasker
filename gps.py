@@ -10,7 +10,7 @@ project_files = [
     "WhatsTasker_PRD_08.txt",       # v0.8 Product Requirements
     "WhatsTasker_SRS_08.txt",       # v0.8 Software Requirements/Architecture
     "requirements.txt",             # Includes APScheduler now
-    "wa_bridge.js"                  # js cript to work with the WAweb
+    "wa_bridge.js",                  # js cript to work with the WAweb
     "monitor_whatstasker.sh",       #activation script
     # ================== CONFIGURATION ==================
     "config/prompts.yaml",          # Includes Orchestrator, Onboarding, Scheduler prompts
@@ -47,7 +47,6 @@ project_files = [
     # ================== TOOLS (Utilities & API Wrappers) ==================
     "tools/google_calendar_api.py", # Wrapper for GCal API (with is_active, updated parsing)
     "tools/calendar_tool.py",       # OAuth callback endpoint, core auth check
-    "tools/metadata_store.py",      # Metadata persistence (CSV - updated FIELDNAMES)
     "tools/token_store.py",         # Encrypted token storage
     "tools/encryption.py",          # Encryption utilities
     "tools/logger.py",              # Logging setup

@@ -12,7 +12,7 @@ PYTHON_LOG="$LOG_DIR/backend_app.log"
 NODE_LOG="$LOG_DIR/whatsapp_bridge.log"
 MONITOR_LOG="$LOG_DIR/monitor.log"
 
-CHECK_INTERVAL_SECONDS=10 # Check every hour (3600 seconds) - Set back from 10 for production
+CHECK_INTERVAL_SECONDS=1800 # Check every hour (3600 seconds) - Set back from 10 for production
 # CHECK_INTERVAL_SECONDS=10 # Use 10 for quick testing
 
 MONITOR_PID=$$ # Get the PID of this monitor script itself

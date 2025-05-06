@@ -5,7 +5,8 @@ import os
 from datetime import datetime
 from tools.logger import log_info, log_error, log_warning
 
-USER_REGISTRY_PATH = "data/users/registry.json"
+DATA_SUFFIX = os.getenv("DATA_SUFFIX", "") # Default to empty for whatsapp mode
+USER_REGISTRY_PATH = f"data/users/registry{DATA_SUFFIX}.json" # Dynamic path
 
 # --- UPDATED Default Preferences ---
 DEFAULT_PREFERENCES = {
@@ -14,8 +15,8 @@ DEFAULT_PREFERENCES = {
     "TimeZone": None, # REQUIRED during onboarding (e.g., "Asia/Jerusalem", "America/New_York")
     "Work_Start_Time": None, # REQUIRED during onboarding (HH:MM)
     "Work_End_Time": None,   # REQUIRED during onboarding (HH:MM)
-    "Work_Days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"], # Default, modifiable
-    "Preferred_Session_Length": None, # REQUIRED during onboarding (e.g., "60m", "1.5h")
+    "Work_Days": ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday"], # Default, modifiable
+    "Working_Session_Length": None, # REQUIRED during onboarding (e.g., "60m", "1.5h")
     # Routine Preferences
     "Morning_Summary_Time": None , # User local time (HH:MM), default None
     "Evening_Summary_Time": None , # User local time (HH:MM), default None

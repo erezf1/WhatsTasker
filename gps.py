@@ -45,8 +45,7 @@ FILES_TO_DUMP = [
     "users/user_manager.py",
     "users/user_registry.py",
     "tests/mock_browser_chat.py",         # New browser chat app
-    "tests/templates/browser_chat.html",  # New browser chat HTML
-    "tests/test_smtp.py",                 # SMTP Test script
+    "tests/templates/browser_chat.html"  # New browser chat HTML
     # --- Obsolete/Replaced ---
     # "tests/mock_sender.py",     # Replaced by mock_browser_chat for UI
     # "tests/simple_viewer.py",   # Replaced by mock_browser_chat

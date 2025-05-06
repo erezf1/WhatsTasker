@@ -1,0 +1,197 @@
+<!-- tests/templates/browser_chat.html -->
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }}</title>
+    <style>
+        /* Styles remain the same */
+        body { font-family: sans-serif; margin: 0; padding: 0; display: flex; flex-direction: column; height: 100vh; background-color: #f4f4f4; }
+        h1 { text-align: center; color: #333; margin: 10px 0; }
+        #chat-container { flex-grow: 1; border: 1px solid #ccc; background-color: #fff; margin: 0 10px 10px 10px; overflow-y: auto; padding: 10px; }
+        #messages { list-style-type: none; padding: 0; margin: 0; }
+        #messages li { margin-bottom: 10px; padding: 8px; border-radius: 5px; word-wrap: break-word; max-width: 80%; clear: both; }
+        #messages li.user { background-color: #dcf8c6; margin-left: auto; float: right; text-align: right; }
+        #messages li.bot { background-color: #e0e0e0; margin-right: auto; float: left; text-align: left; }
+        #messages li.system { background-color: #f0e68c; margin-left: auto; margin-right: auto; text-align: center; font-style: italic; color: #555; max-width: 90%; float: none; font-size: 0.9em;}
+        #messages li[dir="rtl"] { text-align: right; }
+        #messages li[dir="ltr"] { text-align: left; }
+        .msg-meta { font-size: 0.8em; color: #888; display: block; margin-top: 4px; }
+        .msg-content { white-space: pre-wrap; }
+        #input-area { display: flex; padding: 10px; border-top: 1px solid #ccc; background-color: #eee; }
+        #messageInput { flex-grow: 1; padding: 10px; border: 1px solid #ccc; border-radius: 3px; margin-right: 5px;}
+        #sendButton { padding: 10px 15px; cursor: pointer; }
+        #controls { text-align: right; padding: 0 10px 5px 0; font-size: 0.8em; }
+    </style>
+</head>
+<body>
+
+    <h1>{{ title }}</h1>
+    <div id="controls">
+        <button id="clearButton" title="Clear messages displayed in this browser window">Clear Display</button>
+    </div>
+
+    <div id="chat-container">
+        <ul id="messages">
+            <!-- Messages will be added dynamically -->
+        </ul>
+    </div>
+
+    <div id="input-area">
+        <input type="text" id="messageInput" placeholder="Type your message..." autocomplete="off">
+        <button id="sendButton">Send</button>
+    </div>
+
+    <script>
+        const messagesContainer = document.getElementById('messages');
+        const messageInput = document.getElementById('messageInput');
+        const sendButton = document.getElementById('sendButton');
+        const clearButton = document.getElementById('clearButton');
+
+        let displayedMessageIds = new Set(); // Track IDs shown in browser
+        let isSending = false;
+        let isFetching = false;
+
+        function containsHebrew(text) {
+            if (!text) return false;
+            return /[\u0590-\u05FF]/.test(text);
+        }
+
+        // Function to add a single message object to the display UL
+        function addMessageToDisplay(msg) {
+             if (!msg || !msg.id || displayedMessageIds.has(msg.id)) {
+                 return false; // Don't add if no message, no ID, or already displayed
+             }
+
+             const li = document.createElement('li');
+             const senderClass = msg.sender || 'system';
+             li.classList.add(senderClass);
+
+             const isRtl = containsHebrew(msg.content);
+             li.setAttribute('dir', isRtl ? 'rtl' : 'ltr');
+
+             const contentSpan = document.createElement('span');
+             contentSpan.className = 'msg-content';
+             contentSpan.textContent = msg.content;
+
+             const metaSpan = document.createElement('span');
+             metaSpan.className = 'msg-meta';
+             // Use sender from message object now
+             metaSpan.textContent = `[${msg.timestamp}] ${senderClass.toUpperCase()}`;
+
+             li.appendChild(contentSpan);
+             li.appendChild(metaSpan);
+
+             messagesContainer.appendChild(li);
+             displayedMessageIds.add(msg.id); // Mark as displayed
+             return true;
+        }
+
+        // Fetches ONLY BOT messages and adds them if not already displayed
+        async function fetchAndUpdateMessages() {
+            if (isFetching) return;
+            isFetching = true;
+            let addedNew = false;
+             try {
+                const response = await fetch('/get_messages'); // Fetches BOT messages from server store
+                if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                const result = await response.json();
+                const botMessages = result.messages || [];
+
+                botMessages.forEach(msg => {
+                    // addMessageToDisplay checks displayedMessageIds
+                    if(addMessageToDisplay(msg)) {
+                        addedNew = true;
+                    }
+                });
+
+            } catch (error) {
+                console.error('Error fetching messages:', error);
+            } finally {
+                 isFetching = false;
+                 if (addedNew) {
+                     messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                 }
+             }
+        }
+
+       async function sendMessage() {
+            const messageText = messageInput.value.trim();
+            if (!messageText || isSending) return;
+            isSending = true;
+            sendButton.disabled = true;
+            messageInput.disabled = true;
+
+            // 1. Create and display user message OBJECT immediately
+             const userTimestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+             const localUserId = `user-${Date.now()}`;
+             const userMsg = {
+                 sender: 'user',
+                 timestamp: userTimestamp,
+                 content: messageText,
+                 id: localUserId
+             };
+             if(addMessageToDisplay(userMsg)){ // Add user message to display
+                 messagesContainer.scrollTop = messagesContainer.scrollHeight;
+             }
+             messageInput.value = '';
+
+            // 2. Send message to viewer backend to forward to main backend
+            try {
+                const response = await fetch('/send_message', { // Send to viewer backend
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: messageText })
+                });
+                if (!response.ok) {
+                    const errorData = await response.json().catch(() => ({ message: response.statusText }));
+                    console.error('Error sending message via viewer:', errorData.message);
+                    // Add error message to display
+                    addMessageToDisplay({ sender: 'system', timestamp: new Date().toLocaleTimeString(), content: `Error sending: ${errorData.message}`, id:`err-${Date.now()}`});
+                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                }
+                 // Bot response will arrive via the fetchAndUpdateMessages polling
+            } catch (error) {
+                console.error('Network error sending message via viewer:', error);
+                 addMessageToDisplay({ sender: 'system', timestamp: new Date().toLocaleTimeString(), content: `Network Error: ${error}`, id:`neterr-${Date.now()}`});
+                 messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            } finally {
+                 isSending = false;
+                 sendButton.disabled = false;
+                 messageInput.disabled = false;
+                 messageInput.focus();
+            }
+        }
+
+       async function clearMessages() {
+             displayedMessageIds.clear(); // Clear JS tracking
+             messagesContainer.innerHTML = '<li>Clearing...</li>'; // Update display
+            try {
+                await fetch('/clear_messages', { method: 'POST' }); // Tell server to clear its bot store
+                 messagesContainer.innerHTML = '<li>Messages cleared.</li>';
+            } catch (error) {
+                console.error('Error signaling viewer to clear messages:', error);
+                messagesContainer.innerHTML = '<li>Error clearing messages.</li>';
+            }
+        }
+
+        // Event Listeners
+        sendButton.addEventListener('click', sendMessage);
+        messageInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') { sendMessage(); }
+        });
+        clearButton.addEventListener('click', clearMessages);
+
+        // Fetch messages periodically
+        setInterval(fetchAndUpdateMessages, 1500);
+
+        // Initial fetch
+        // No initial fetch needed, or fetch then clear display?
+        // Let's start clean
+        messagesContainer.innerHTML = '<li>Connecting...</li>'; // Initial message
+
+    </script>
+
+</body>
+</html>

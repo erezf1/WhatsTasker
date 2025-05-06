@@ -79,7 +79,7 @@ dist/
 
 # --- WhatsApp Web JS ---
 .wwebjs_auth/
-
+.wwebjs_cache/
 # --- Project Specific ---
 # Environment variables (NEVER commit secrets)
 .env

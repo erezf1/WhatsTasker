@@ -1,5 +1,6 @@
-# WhatsTasker Project Code Dump (v0.8 Architecture Target + Scheduler)
-# Generated: 2025-05-05 15:07:01
+# WhatsTasker Project Code Dump (v0.8 Target - Browser Chat)
+# Generated: 2025-05-06 14:22:51
+
 
 ================================================================================
 📄 README.md
@@ -7,7 +8,10 @@
 
 # --- START OF FILE README.md ---
 
+
+
 # --- END OF FILE README.md ---
+
 
 
 ================================================================================
@@ -15,6 +19,7 @@
 ================================================================================
 
 # --- START OF FILE WhatsTasker_PRD_08.txt ---
+
 ﻿WhatsTasker: Product Requirements (v0.8 - Orchestrator Focused)
 🧭 Overview
 WhatsTasker is a personal productivity assistant designed for individuals seeking to manage their tasks, improve focus, and reduce procrastination through a conversational interface. Accessed via WhatsApp, it functions as an intelligent Time Management Expert, integrating directly with the user's primary calendar (initially Google Calendar) and utilizing an internal metadata store for enhanced tracking. WhatsTasker aims to streamline daily planning, facilitate frictionless task capture, and support helpful routines.
@@ -80,7 +85,9 @@ The system shall act as a proactive and intelligent Time Management Expert. It m
 * The Evening Review correctly identifies incomplete Tasks and offers rescheduling options.
 * The system handles clarifications when user input is ambiguous.
 * Basic reminder functionality works without calendar integration.
+
 # --- END OF FILE WhatsTasker_PRD_08.txt ---
+
 
 
 ================================================================================
@@ -88,6 +95,7 @@ The system shall act as a proactive and intelligent Time Management Expert. It m
 ================================================================================
 
 # --- START OF FILE WhatsTasker_SRS_08.txt ---
+
 ﻿# --- START OF FILE WhatsTasker_SRS_08.txt ---
 ﻿WhatsTasker: SRS (v0.8k - WhatsApp Bridge & Active Scheduler)
 
@@ -206,7 +214,9 @@ The system shall act as a proactive and intelligent Time Management Expert. It m
 *   **Testing:** Requires end-to-end testing involving the actual WhatsApp interface, testing LLM prompt adherence, tool execution, scheduled jobs, and the bridge communication.
 
 # --- END OF FILE WhatsTasker_SRS_08.txt ---
+
 # --- END OF FILE WhatsTasker_SRS_08.txt ---
+
 
 
 ================================================================================
@@ -214,6 +224,7 @@ The system shall act as a proactive and intelligent Time Management Expert. It m
 ================================================================================
 
 # --- START OF FILE requirements.txt ---
+
 # --- START OF FILE requirements.txt ---
 # Web Framework & Server
 fastapi>=0.110.0,<0.112.0
@@ -250,8 +261,158 @@ openai>=1.0.0,<2.0.0     # Instructor depends on OpenAI v1+
 # Optional: If using pandas checks (e.g., pd.isna) - uncomment if needed
 # pandas>=2.0.0,<3.0.0
 
+Flask>=2.0.0,<4.0.0
 # --- END OF FILE requirements.txt ---
+
 # --- END OF FILE requirements.txt ---
+
+
+
+================================================================================
+📄 package.json
+================================================================================
+
+# --- START OF FILE package.json ---
+
+{
+  "dependencies": {
+    "axios": "^1.8.4",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.27.0"
+  }
+}
+
+
+# --- END OF FILE package.json ---
+
+
+
+================================================================================
+📄 .gitignore
+================================================================================
+
+# --- START OF FILE .gitignore ---
+
+# --- Python ---
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+# Compiled Python files
+*.pyc
+__pycache__/
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+# PyInstaller
+*.manifest
+*.spec
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# --- Node.js ---
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+# Diagnostic reports (https://nodejs.org/api/report.html)
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+# Dependency directories
+node_modules/
+jspm_packages/
+# Snowpack dependency directory (https://snowpack.dev/)
+web_modules/
+# Build folder
+build/
+dist/
+# TypeScript cache
+*.tsbuildinfo
+# Optional eslint cache
+.eslintcache
+# Optional stylelint cache
+.stylelintcache
+# Output of 'npm pack'
+*.tgz
+
+# --- WhatsApp Web JS ---
+.wwebjs_auth/
+
+# --- Project Specific ---
+# Environment variables (NEVER commit secrets)
+.env
+# Data files (User registry, tokens, database - contains user data/secrets)
+data/
+# Log files generated by the application
+logs/
+# Output files from tests/scripts
+startup_error.log
+mock_output.txt
+*.dump*.txt
+# Simple viewer SQLite DB if it creates one (unlikely)
+viewer_messages.db
+# Temporary files
+*.tmp
+
+# --- IDE/Editor ---
+# VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.history/
+# PyCharm
+.idea/
+*.iml
+
+# --- OS Specific ---
+# macOS
+.DS_Store
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# --- END OF FILE .gitignore ---
+
 
 
 ================================================================================
@@ -259,6 +420,7 @@ openai>=1.0.0,<2.0.0     # Instructor depends on OpenAI v1+
 ================================================================================
 
 # --- START OF FILE wa_bridge.js ---
+
 // whatsapp_bridge.js
 
 const { Client, LocalAuth } = require('whatsapp-web.js');
@@ -412,7 +574,9 @@ client.initialize().catch(err => {
 console.log('WhatsApp Bridge script started. Waiting for client ready event to start polling...');
 // NOTE: Polling now starts inside the 'ready' event handler.
 // --- End Initialization ---
+
 # --- END OF FILE wa_bridge.js ---
+
 
 
 ================================================================================
@@ -420,6 +584,7 @@ console.log('WhatsApp Bridge script started. Waiting for client ready event to s
 ================================================================================
 
 # --- START OF FILE monitor_whatstasker.sh ---
+
 #!/bin/bash
 
 # === Configuration ===
@@ -558,14 +723,17 @@ while true; do
     # Wait for the next check interval
     sleep "$CHECK_INTERVAL_SECONDS"
 done
+
 # --- END OF FILE monitor_whatstasker.sh ---
 
 
+
 ================================================================================
-📄 config\prompts.yaml
+📄 config/prompts.yaml
 ================================================================================
 
-# --- START OF FILE config\prompts.yaml ---
+# --- START OF FILE config/prompts.yaml ---
+
 # --- START OF FILE config/prompts.yaml ---
 
 # =====================================================
@@ -806,14 +974,17 @@ onboarding_agent_human_prompt: |
     User message: {message}
     Your Task: Based on the system instructions, determine the next step: Ask for the next missing REQUIRED preference (TimeZone, Work_Start_Time, Work_End_Time, Preferred_Session_Length), ask about calendar connection, call a tool (update_user_preferences or initiate_calendar_connection), or finalize onboarding (by calling update_user_preferences with status: active). Formulate your response or tool call.
 # --- END OF FILE config/prompts.yaml ---
-# --- END OF FILE config\prompts.yaml ---
+
+# --- END OF FILE config/prompts.yaml ---
+
 
 
 ================================================================================
-📄 config\messages.yaml
+📄 config/messages.yaml
 ================================================================================
 
-# --- START OF FILE config\messages.yaml ---
+# --- START OF FILE config/messages.yaml ---
+
 # config/messages.yaml
 
 # --- Add these ---
@@ -838,16 +1009,21 @@ intent_parse_error_message: "Sorry, I had trouble understanding the structure of
 intent_unknown_message: "Sorry, I'm not sure how to help with that. You can ask me to add tasks, list tasks, or change settings."
 intent_clarify_message: "Sorry, I didn't quite understand that. Could you please rephrase?"
 # ... add any other messages you have ...
-# --- END OF FILE config\messages.yaml ---
+
+# --- END OF FILE config/messages.yaml ---
+
 
 
 ================================================================================
-📄 config\settings.yaml
+📄 config/settings.yaml
 ================================================================================
 
-# --- START OF FILE config\settings.yaml ---
+# --- START OF FILE config/settings.yaml ---
 
-# --- END OF FILE config\settings.yaml ---
+
+
+# --- END OF FILE config/settings.yaml ---
+
 
 
 ================================================================================
@@ -855,6 +1031,7 @@ intent_clarify_message: "Sorry, I didn't quite understand that. Could you please
 ================================================================================
 
 # --- START OF FILE main.py ---
+
 # --- START OF FULL main.py ---
 
 import os
@@ -1073,14 +1250,17 @@ if __name__ == "__main__":
         log_info("main", "__main__", "Application exiting.")
 
 # --- END OF FULL main.py ---
+
 # --- END OF FILE main.py ---
 
 
+
 ================================================================================
-📄 bridge\request_router.py
+📄 bridge/request_router.py
 ================================================================================
 
-# --- START OF FILE bridge\request_router.py ---
+# --- START OF FILE bridge/request_router.py ---
+
 # --- START OF FULL bridge/request_router.py ---
 
 import re
@@ -1372,14 +1552,17 @@ def handle_incoming_message(user_id: str, message: str) -> str:
         return GENERIC_ERROR_MSG # Return generic error message
 
 # --- END OF FULL bridge/request_router.py ---
-# --- END OF FILE bridge\request_router.py ---
+
+# --- END OF FILE bridge/request_router.py ---
+
 
 
 ================================================================================
-📄 bridge\cli_interface.py
+📄 bridge/cli_interface.py
 ================================================================================
 
-# --- START OF FILE bridge\cli_interface.py ---
+# --- START OF FILE bridge/cli_interface.py ---
+
 # --- START OF FULL bridge/cli_interface.py ---
 
 from fastapi import FastAPI, Request, HTTPException
@@ -1537,14 +1720,17 @@ def create_cli_app() -> FastAPI:
 app = create_cli_app()
 
 # --- END OF FULL bridge/cli_interface.py ---
-# --- END OF FILE bridge\cli_interface.py ---
+
+# --- END OF FILE bridge/cli_interface.py ---
+
 
 
 ================================================================================
-📄 bridge\whatsapp_interface.py
+📄 bridge/whatsapp_interface.py
 ================================================================================
 
-# --- START OF FILE bridge\whatsapp_interface.py ---
+# --- START OF FILE bridge/whatsapp_interface.py ---
+
 # --- START OF FULL bridge/whatsapp_interface.py ---
 
 from fastapi import FastAPI, Request, HTTPException
@@ -1718,14 +1904,17 @@ def create_whatsapp_app() -> FastAPI:
 app = create_whatsapp_app()
 
 # --- END OF FULL bridge/whatsapp_interface.py ---
-# --- END OF FILE bridge\whatsapp_interface.py ---
+
+# --- END OF FILE bridge/whatsapp_interface.py ---
+
 
 
 ================================================================================
-📄 agents\orchestrator_agent.py
+📄 agents/orchestrator_agent.py
 ================================================================================
 
-# --- START OF FILE agents\orchestrator_agent.py ---
+# --- START OF FILE agents/orchestrator_agent.py ---
+
 # --- START OF FILE agents/orchestrator_agent.py ---
 import json
 import os
@@ -1960,14 +2149,17 @@ def handle_user_request(
         log_error("orchestrator_agent", fn_name, f"Core error in orchestrator logic for {user_id}. Traceback:\n{tb_str}", e)
         return GENERIC_ERROR_MSG
 # --- END OF FILE agents/orchestrator_agent.py ---
-# --- END OF FILE agents\orchestrator_agent.py ---
+
+# --- END OF FILE agents/orchestrator_agent.py ---
+
 
 
 ================================================================================
-📄 agents\onboarding_agent.py
+📄 agents/onboarding_agent.py
 ================================================================================
 
-# --- START OF FILE agents\onboarding_agent.py ---
+# --- START OF FILE agents/onboarding_agent.py ---
+
 # --- START OF FILE agents/onboarding_agent.py ---
 import json
 import os
@@ -2261,14 +2453,17 @@ def handle_onboarding_request(
         log_error(fn_name, "outer_exception", f"Core error in onboarding logic for {user_id}. Traceback:\n{tb_str}", e) # Corrected log identifier
         return GENERIC_ERROR_MSG
 # --- END OF FILE agents/onboarding_agent.py ---
-# --- END OF FILE agents\onboarding_agent.py ---
+
+# --- END OF FILE agents/onboarding_agent.py ---
+
 
 
 ================================================================================
-📄 agents\tool_definitions.py
+📄 agents/tool_definitions.py
 ================================================================================
 
-# --- START OF FILE agents\tool_definitions.py ---
+# --- START OF FILE agents/tool_definitions.py ---
+
 # --- START OF FULL agents/tool_definitions.py ---
 
 from pydantic import BaseModel, Field, field_validator, ValidationError
@@ -3112,14 +3307,17 @@ TOOL_PARAM_MODELS = {
 }
 
 # --- END OF FULL agents/tool_definitions.py ---
-# --- END OF FILE agents\tool_definitions.py ---
+
+# --- END OF FILE agents/tool_definitions.py ---
+
 
 
 ================================================================================
-📄 services\task_manager.py
+📄 services/task_manager.py
 ================================================================================
 
-# --- START OF FILE services\task_manager.py ---
+# --- START OF FILE services/task_manager.py ---
+
 # --- START OF REFACTORED services/task_manager.py ---
 """
 Service layer for managing tasks: creating, updating, cancelling, and scheduling sessions.
@@ -3743,14 +3941,17 @@ def cancel_sessions(user_id: str, task_id: str, session_ids_to_cancel: List[str]
         return {**default_fail_result, "cancelled_count": cancelled_count, "message": "Cancelled sessions in calendar, but failed to update the task link."}
 
 # --- END OF REFACTORED services/task_manager.py ---
-# --- END OF FILE services\task_manager.py ---
+
+# --- END OF FILE services/task_manager.py ---
+
 
 
 ================================================================================
-📄 services\task_query_service.py
+📄 services/task_query_service.py
 ================================================================================
 
-# --- START OF FILE services\task_query_service.py ---
+# --- START OF FILE services/task_query_service.py ---
+
 # --- START OF REFACTORED services/task_query_service.py ---
 """Service layer for querying and formatting task/reminder data from the database."""
 from datetime import datetime, timedelta, timezone # Added timezone
@@ -4150,14 +4351,17 @@ def get_context_snapshot(user_id: str, history_weeks: int = 1, future_weeks: int
     return task_context, calendar_context
 
 # --- END OF REFACTORED services/task_query_service.py ---
-# --- END OF FILE services\task_query_service.py ---
+
+# --- END OF FILE services/task_query_service.py ---
+
 
 
 ================================================================================
-📄 services\config_manager.py
+📄 services/config_manager.py
 ================================================================================
 
-# --- START OF FILE services\config_manager.py ---
+# --- START OF FILE services/config_manager.py ---
+
 # services/config_manager.py
 """Service layer for managing user configuration and preferences."""
 from tools.logger import log_info, log_error, log_warning
@@ -4255,14 +4459,17 @@ def set_user_status(user_id: str, status: str) -> bool:
         return False
     # Calls the main update function which handles both registry and memory state
     return update_preferences(user_id, {"status": status})
-# --- END OF FILE services\config_manager.py ---
+
+# --- END OF FILE services/config_manager.py ---
+
 
 
 ================================================================================
-📄 services\agent_state_manager.py
+📄 services/agent_state_manager.py
 ================================================================================
 
-# --- START OF FILE services\agent_state_manager.py ---
+# --- START OF FILE services/agent_state_manager.py ---
+
 # --- START OF FILE services/agent_state_manager.py ---
 # services/agent_state_manager.py
 """
@@ -4501,14 +4708,17 @@ def get_context(user_id: str) -> Optional[List[Dict]]:
             return copy.deepcopy(state["active_tasks_context"])
     return [] # Return empty list if user or context list not found/invalid
 # --- END OF FILE services/agent_state_manager.py ---
-# --- END OF FILE services\agent_state_manager.py ---
+
+# --- END OF FILE services/agent_state_manager.py ---
+
 
 
 ================================================================================
-📄 services\cheats.py
+📄 services/cheats.py
 ================================================================================
 
-# --- START OF FILE services\cheats.py ---
+# --- START OF FILE services/cheats.py ---
+
 # --- START OF REFACTORED services/cheats.py ---
 
 """
@@ -4737,14 +4947,17 @@ def handle_cheat_command(user_id: str, command: str, args: List[str]) -> str:
     else: return f"Unknown command: '{command}'. Try /help."
 
 # --- END OF REFACTORED services/cheats.py ---
-# --- END OF FILE services\cheats.py ---
+
+# --- END OF FILE services/cheats.py ---
+
 
 
 ================================================================================
-📄 services\llm_interface.py
+📄 services/llm_interface.py
 ================================================================================
 
-# --- START OF FILE services\llm_interface.py ---
+# --- START OF FILE services/llm_interface.py ---
+
 # llm_interface.py
 import os
 import openai
@@ -4777,14 +4990,17 @@ def get_instructor_client():
                 _client = None # Ensure it remains None on failure
     return _client
 
-# --- END OF FILE services\llm_interface.py ---
+
+# --- END OF FILE services/llm_interface.py ---
+
 
 
 ================================================================================
-📄 services\scheduler_service.py
+📄 services/scheduler_service.py
 ================================================================================
 
-# --- START OF FILE services\scheduler_service.py ---
+# --- START OF FILE services/scheduler_service.py ---
+
 # --- START OF services/scheduler_service.py ---
 
 from typing import Dict, List, Tuple # Added List, Tuple
@@ -4931,14 +5147,17 @@ def shutdown_scheduler():
         log_info("scheduler_service", fn_name, "No active scheduler instance to shut down.")
 
 # --- END OF services/scheduler_service.py ---
-# --- END OF FILE services\scheduler_service.py ---
+
+# --- END OF FILE services/scheduler_service.py ---
+
 
 
 ================================================================================
-📄 services\sync_service.py
+📄 services/sync_service.py
 ================================================================================
 
-# --- START OF FILE services\sync_service.py ---
+# --- START OF FILE services/sync_service.py ---
+
 # --- START OF REFACTORED services/sync_service.py ---
 """
 Provides functionality to get a combined view of WhatsTasker-managed items (DB)
@@ -5191,14 +5410,17 @@ def _sort_tasks(task_list: List[Dict]) -> List[Dict]:
 
 
 # --- END OF REFACTORED services/sync_service.py ---
-# --- END OF FILE services\sync_service.py ---
+
+# --- END OF FILE services/sync_service.py ---
+
 
 
 ================================================================================
-📄 services\notification_service.py
+📄 services/notification_service.py
 ================================================================================
 
-# --- START OF FILE services\notification_service.py ---
+# --- START OF FILE services/notification_service.py ---
+
 # --- START OF FULL services/notification_service.py ---
 """
 Handles checking for upcoming events and sending notifications.
@@ -5349,14 +5571,17 @@ def check_event_notifications():
     log_info("notification_service", fn_name, "Finished scheduled check for event notifications.")
 
 # --- END OF FILE services/notification_service.py ---
-# --- END OF FILE services\notification_service.py ---
+
+# --- END OF FILE services/notification_service.py ---
+
 
 
 ================================================================================
-📄 services\routine_service.py
+📄 services/routine_service.py
 ================================================================================
 
-# --- START OF FILE services\routine_service.py ---
+# --- START OF FILE services/routine_service.py ---
+
 # --- START OF FILE services/routine_service.py ---
 """
 Handles scheduled generation of Morning and Evening summaries/reviews.
@@ -5631,14 +5856,17 @@ def daily_cleanup():
         log_error("routine_service", fn_name, "Error during daily cleanup main loop", e)
 
 # --- END OF FILE services/routine_service.py ---
-# --- END OF FILE services\routine_service.py ---
+
+# --- END OF FILE services/routine_service.py ---
+
 
 
 ================================================================================
-📄 tools\google_calendar_api.py
+📄 tools/google_calendar_api.py
 ================================================================================
 
-# --- START OF FILE tools\google_calendar_api.py ---
+# --- START OF FILE tools/google_calendar_api.py ---
+
 # --- START OF FULL tools/google_calendar_api.py ---
 
 import os
@@ -6141,14 +6369,17 @@ class GoogleCalendarAPI:
 # --- END OF CLASS GoogleCalendarAPI ---
 
 # --- END OF FULL tools/google_calendar_api.py ---
-# --- END OF FILE tools\google_calendar_api.py ---
+
+# --- END OF FILE tools/google_calendar_api.py ---
+
 
 
 ================================================================================
-📄 tools\calendar_tool.py
+📄 tools/calendar_tool.py
 ================================================================================
 
-# --- START OF FILE tools\calendar_tool.py ---
+# --- START OF FILE tools/calendar_tool.py ---
+
 # --- START OF FULL tools/calendar_tool.py ---
 
 import os
@@ -6334,127 +6565,166 @@ async def oauth2callback(request: Request, code: str | None = None, state: str |
         return HTMLResponse(content=html_error_template.format(details=f"An unexpected server error occurred: {e}."), status_code=500)
 
 # --- END OF FULL tools/calendar_tool.py ---
-# --- END OF FILE tools\calendar_tool.py ---
+
+# --- END OF FILE tools/calendar_tool.py ---
+
 
 
 ================================================================================
-📄 tools\token_store.py
+📄 tools/token_store.py
 ================================================================================
 
-# --- START OF FILE tools\token_store.py ---
+# --- START OF FILE tools/token_store.py ---
+
 # --- START OF FULL tools/token_store.py ---
 
 import os
 import json
-from tools.encryption import decrypt_data
+from dotenv import load_dotenv # Added for .env loading
+from tools.encryption import decrypt_data, encrypt_data # Ensure both are imported
 from tools.logger import log_info, log_error, log_warning
 
-TOKEN_DIR = "data"
+# --- Load Environment Variables ---
+# Load variables from .env file in the current directory or parent directories
+load_dotenv()
+
+# --- Configuration ---
+# Get the data suffix (_cli or empty) from environment variables
+DATA_SUFFIX = os.getenv("DATA_SUFFIX", "") # Default to empty string if not set
+
+# Define the specific subdirectory for tokens
+TOKEN_BASE_DIR = "data"
+TOKEN_SUB_DIR = "tokens" # New subdirectory name
+TOKEN_DIR_PATH = os.path.join(TOKEN_BASE_DIR, TOKEN_SUB_DIR)
+
+# --- Helper Function to Construct Full Path ---
+def _get_token_path(user_id: str) -> str:
+    """Constructs the absolute path for a user's token file including the suffix."""
+    # Construct filename with suffix: e.g., tokens_1234_cli.json.enc or tokens_1234.json.enc
+    filename = f"tokens_{user_id}{DATA_SUFFIX}.json.enc"
+    # Construct the relative path including the subdirectory
+    relative_path = os.path.join(TOKEN_DIR_PATH, filename)
+    # Return the absolute path
+    return os.path.abspath(relative_path)
+
+# --- Core Functions ---
 
 def get_user_token(user_id: str) -> dict | None:
-    """Loads and decrypts the user's token from the encrypted file."""
+    """Loads and decrypts the user's token from the encrypted file in data/tokens."""
     fn_name = "get_user_token"
-    relative_path = os.path.join(TOKEN_DIR, f"tokens_{user_id}.json.enc")
+    absolute_path = _get_token_path(user_id) # Get the full path
 
-    try:
-        cwd = os.getcwd()
-        # --- Generate Absolute Path FIRST ---
-        absolute_path = os.path.abspath(relative_path)
-        # --- Log Both ---
-        log_info("token_store", fn_name, f"DEBUG: Checking for token file. User: {user_id}, Relative Path: '{relative_path}', CWD: '{cwd}', Absolute Path Check: '{absolute_path}'")
-    except Exception as debug_e:
-        log_warning("token_store", fn_name, f"DEBUG: Error getting CWD/abspath: {debug_e}")
-        absolute_path = relative_path # Fallback to relative if abspath fails
+    # Log the path being checked
+    log_info("token_store", fn_name, f"Attempting to load token from: '{absolute_path}'")
 
-    # --- MODIFY: Check existence using the generated ABSOLUTE path ---
-    file_exists = os.path.exists(absolute_path)
-    # ------------------------------------------------------------------
-
-    if not file_exists:
-        log_info("token_store", fn_name, f"Result: os.path.exists returned FALSE for path '{absolute_path}'")
+    # Check if the file exists
+    if not os.path.exists(absolute_path):
+        log_info("token_store", fn_name, f"Token file not found for user {user_id} at '{absolute_path}'.")
         return None
 
-    log_info("token_store", fn_name, f"Result: os.path.exists returned TRUE for path '{absolute_path}'. Attempting to read.")
-
+    # Proceed if file exists
+    log_info("token_store", fn_name, f"Token file found at '{absolute_path}'. Attempting to read and decrypt.")
     try:
-        # --- Use the absolute path to open the file too ---
         with open(absolute_path, "rb") as f:
-        # -------------------------------------------------
             encrypted_data = f.read()
 
-        token_data = decrypt_data(encrypted_data)
+        # Decrypt the data
+        token_data = decrypt_data(encrypted_data) # Assumes decrypt_data returns dict or None
 
         if token_data:
-            log_info("token_store", fn_name, f"Decrypted token data keys for user {user_id}: {list(token_data.keys())}")
+            log_info("token_store", fn_name, f"Successfully decrypted token data for user {user_id}. Keys: {list(token_data.keys())}")
             return token_data
         else:
-            log_error("token_store", fn_name, f"Failed to decrypt token for user {user_id} from {absolute_path}.")
+            # decrypt_data should log its own errors
+            log_error("token_store", fn_name, f"Decryption failed for token file: '{absolute_path}'. Check encryption logs.")
             return None
 
     except FileNotFoundError:
-         # This shouldn't happen if os.path.exists was True, but good to keep
-         log_info("token_store", fn_name, f"Token file not found for user {user_id} at {absolute_path} (race condition?).")
+         # Should ideally not happen after os.path.exists, but handles race conditions
+         log_info("token_store", fn_name, f"Token file disappeared before reading for user {user_id} at '{absolute_path}'.")
          return None
     except PermissionError as pe:
-         log_error("token_store", fn_name, f"Permission denied reading token file for user {user_id} from {absolute_path}: {pe}", pe)
+         log_error("token_store", fn_name, f"Permission denied reading token file '{absolute_path}'", pe)
          return None
     except Exception as e:
-        log_error("token_store", fn_name, f"Unexpected error loading token for user {user_id} from {absolute_path}: {str(e)}", e)
+        log_error("token_store", fn_name, f"Unexpected error loading token from '{absolute_path}'", e)
         return None
 
 
 def save_user_token_encrypted(user_id: str, token_data: dict) -> bool:
     """
-    Encrypts and saves the user's token data to a file using atomic write.
+    Encrypts and saves the user's token data to a file in data/tokens using atomic write.
     """
-    log_info("token_store", "save_user_token_encrypted", f"Attempting to save token for user {user_id}")
-    # Use absolute path for saving too for consistency
-    relative_path = os.path.join(TOKEN_DIR, f"tokens_{user_id}.json.enc")
-    path = os.path.abspath(relative_path)
-    temp_path = path + ".tmp"
+    fn_name = "save_user_token_encrypted"
+    path = _get_token_path(user_id) # Get the full target path
+    temp_path = path + ".tmp"      # Temporary file for atomic write
+
+    log_info("token_store", fn_name, f"Attempting to save encrypted token for user {user_id} to '{path}'")
 
     try:
+        # --- Data Validation ---
+        # Ensure necessary tokens are present
         data_to_save = token_data.copy()
+        # Handle potential 'token' key from oauth callback -> 'access_token'
         if 'token' in data_to_save and 'access_token' not in data_to_save:
             data_to_save['access_token'] = data_to_save.pop('token')
 
         if not data_to_save.get('access_token'):
-            log_error("token_store", "save_user_token_encrypted", f"Attempted to save token data missing access_token for {user_id}.")
+            log_error("token_store", fn_name, f"Cannot save token: Missing 'access_token' for user {user_id}.")
             return False
+        # It's critical for Google OAuth to have a refresh token for offline access
         if not data_to_save.get('refresh_token'):
-            log_warning("token_store", "save_user_token_encrypted", f"Saving token data potentially missing refresh_token for {user_id}.")
+            log_warning("token_store", fn_name, f"Saving token data missing 'refresh_token' for user {user_id}. Offline access/refresh will fail.")
+        # -----------------------
 
-        from tools.encryption import encrypt_data
+        # Encrypt the validated data
         encrypted_tokens = encrypt_data(data_to_save)
         if not encrypted_tokens:
-            log_error("token_store", "save_user_token_encrypted", f"Encryption failed for {user_id}'s tokens during save.")
+            # encrypt_data should log its own errors
+            log_error("token_store", fn_name, f"Encryption failed for user {user_id}'s tokens during save.")
             return False
 
+        # --- Atomic Write ---
+        # Ensure the target directory exists (data/tokens/)
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
+        # Write to temporary file first
         with open(temp_path, "wb") as f:
             f.write(encrypted_tokens)
 
+        # Atomically replace the old file with the new one
         os.replace(temp_path, path)
+        # --------------------
 
-        log_info("token_store", "save_user_token_encrypted", f"Token stored successfully for {user_id} at {path}.")
+        log_info("token_store", fn_name, f"Token stored successfully for {user_id} at '{path}'.")
         return True
 
-    except Exception as e:
-        log_error("token_store", "save_user_token_encrypted", f"Failed to write token file {path}", e)
-        if os.path.exists(temp_path):
-            try: os.remove(temp_path)
-            except OSError as rm_err: log_error("token_store", "save_user_token_encrypted", f"Failed to remove temp file {temp_path}: {rm_err}")
+    except PermissionError as pe:
+        log_error("token_store", fn_name, f"Permission denied writing token file to '{path}' or temp file '{temp_path}'.", pe)
         return False
+    except Exception as e:
+        log_error("token_store", fn_name, f"Unexpected error saving token file to '{path}'", e)
+        # Clean up temporary file if it exists after an error
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+                log_info("token_store", fn_name, f"Removed temporary token file '{temp_path}' after error.")
+            except OSError as rm_err:
+                log_error("token_store", fn_name, f"Failed to remove temporary token file '{temp_path}' after error: {rm_err}")
+        return False
+
 # --- END OF FULL tools/token_store.py ---
-# --- END OF FILE tools\token_store.py ---
+
+# --- END OF FILE tools/token_store.py ---
+
 
 
 ================================================================================
-📄 tools\encryption.py
+📄 tools/encryption.py
 ================================================================================
 
-# --- START OF FILE tools\encryption.py ---
+# --- START OF FILE tools/encryption.py ---
+
 # tools/encryption.py
 
 import os
@@ -6548,14 +6818,17 @@ if __name__ == "__main__":
     print("Generated Fernet Key (set this as your ENCRYPTION_KEY environment variable):")
     print(new_key)
     print("\nWARNING: Keep this key secure and secret!")
-# --- END OF FILE tools\encryption.py ---
+
+# --- END OF FILE tools/encryption.py ---
+
 
 
 ================================================================================
-📄 tools\logger.py
+📄 tools/logger.py
 ================================================================================
 
-# --- START OF FILE tools\logger.py ---
+# --- START OF FILE tools/logger.py ---
+
 # --- START OF FULL tools/logger.py ---
 import os
 import pytz
@@ -6706,14 +6979,17 @@ def log_warning(module: str, func: str, message: str, exception: Exception = Non
     _try_log_to_db(level, module, func, message, traceback_str, user_id, ts_iso)
 
 # --- END OF FULL tools/logger.py ---
-# --- END OF FILE tools\logger.py ---
+
+# --- END OF FILE tools/logger.py ---
+
 
 
 ================================================================================
-📄 tools\activity_db.py
+📄 tools/activity_db.py
 ================================================================================
 
-# --- START OF FILE tools\activity_db.py ---
+# --- START OF FILE tools/activity_db.py ---
+
 # --- START OF FULL tools/activity_db.py ---
 
 import sqlite3
@@ -6725,8 +7001,9 @@ from typing import Dict, List, Any, Tuple # <--- ADD Dict, List, Any, Tuple HERE
 from tools.logger import log_info, log_error, log_warning
 
 # --- Configuration ---
+DATA_SUFFIX = os.getenv("DATA_SUFFIX", "")
 DB_DIR = "data"
-DB_FILE = os.path.join(DB_DIR, "whatstasker_activity.db")
+DB_FILE = os.path.join(DB_DIR, f"whatstasker_activity{DATA_SUFFIX}.db") # Dynamic DB file name
 DB_LOCK = threading.Lock() # Lock for thread-safe writes if needed later
 
 # --- Initialization ---
@@ -7134,14 +7411,17 @@ def update_task_fields(event_id: str, updates: Dict[str, Any]) -> bool:
 init_db()
 
 # --- END OF tools/activity_db.py ---
-# --- END OF FILE tools\activity_db.py ---
+
+# --- END OF FILE tools/activity_db.py ---
+
 
 
 ================================================================================
-📄 users\user_manager.py
+📄 users/user_manager.py
 ================================================================================
 
-# --- START OF FILE users\user_manager.py ---
+# --- START OF FILE users/user_manager.py ---
+
 # --- START OF FILE users/user_manager.py ---
 
 import os
@@ -7349,14 +7629,17 @@ def get_agent(user_id: str) -> Optional[Dict]:
     return agent_state
 
 # --- END OF FILE users/user_manager.py ---
-# --- END OF FILE users\user_manager.py ---
+
+# --- END OF FILE users/user_manager.py ---
+
 
 
 ================================================================================
-📄 users\user_registry.py
+📄 users/user_registry.py
 ================================================================================
 
-# --- START OF FILE users\user_registry.py ---
+# --- START OF FILE users/user_registry.py ---
+
 # --- START OF FILE users/user_registry.py ---
 
 import json
@@ -7364,7 +7647,8 @@ import os
 from datetime import datetime
 from tools.logger import log_info, log_error, log_warning
 
-USER_REGISTRY_PATH = "data/users/registry.json"
+DATA_SUFFIX = os.getenv("DATA_SUFFIX", "") # Default to empty for whatsapp mode
+USER_REGISTRY_PATH = f"data/users/registry{DATA_SUFFIX}.json" # Dynamic path
 
 # --- UPDATED Default Preferences ---
 DEFAULT_PREFERENCES = {
@@ -7536,167 +7820,412 @@ load_registry()
 # (Keep __main__ block for testing if desired)
 
 # --- END OF FILE users/user_registry.py ---
-# --- END OF FILE users\user_registry.py ---
+
+# --- END OF FILE users/user_registry.py ---
+
 
 
 ================================================================================
-📄 tests\mock_sender.py
+📄 tests/mock_browser_chat.py
 ================================================================================
 
-# --- START OF FILE tests\mock_sender.py ---
-# --- START of tests/mock_sender.py ---
-import requests
-import sys
+# --- START OF FILE tests/mock_browser_chat.py ---
+
+# tests/mock_browser_chat.py
+# Simplified version using only print() for errors/info
+
 import os
+import requests
 import json
 import time
 import threading
+from flask import Flask, render_template, request, jsonify
+from collections import deque
+from datetime import datetime
+from dotenv import load_dotenv
+import logging # <--- Added missing import for logging module
 
-# Add project root to sys.path
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, project_root)
+# --- Load Environment Variables ---
+load_dotenv()
 
-# Use the project logger, but primarily for errors/warnings in this script
-from tools.logger import log_info, log_error, log_warning
+# --- Configuration ---
+VIEWER_PORT = int(os.getenv("VIEWER_PORT", "5001"))
+MAX_MESSAGES = 100
 
-DEFAULT_USER = "1234" # Example default
-BASE_URL = "http://localhost:8000"
-INCOMING_URL = f"{BASE_URL}/incoming"
-OUTGOING_URL = f"{BASE_URL}/outgoing"
-ACK_URL = f"{BASE_URL}/ack"
+# --- Main Backend Configuration ---
+MAIN_BACKEND_PORT = os.getenv("PORT", "8001")
+MAIN_BACKEND_BASE_URL = f"http://localhost:{MAIN_BACKEND_PORT}"
+MAIN_BACKEND_INCOMING_URL = f"{MAIN_BACKEND_BASE_URL}/incoming"
+MAIN_BACKEND_OUTGOING_URL = f"{MAIN_BACKEND_BASE_URL}/outgoing"
+MAIN_BACKEND_ACK_URL = f"{MAIN_BACKEND_BASE_URL}/ack"
 
-_stop_polling = threading.Event()
+# --- Mock User ID ---
+MOCK_USER_ID = os.getenv("MOCK_SENDER_DEFAULT_USER", "1234")
 
-def poll_for_messages(user_id_raw: str):
-    # ... (polling function remains the same) ...
-    log_info("mock_sender", "poll_thread", f"Polling thread started for user {user_id_raw}.") # Keep start message
+# --- In-memory message store (bot messages only) ---
+message_store_bot = deque(maxlen=MAX_MESSAGES)
+message_lock = threading.Lock()
+_stop_polling_event = threading.Event()
+
+# --- Flask App Setup ---
+script_dir = os.path.dirname(os.path.abspath(__file__))
+template_dir = os.path.join(script_dir, 'templates')
+app = Flask(__name__, template_folder=template_dir)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", os.urandom(24))
+
+# --- Background Polling Function (Simplified Output) ---
+def poll_main_backend():
+    """Polls the main backend for outgoing messages and sends ACKs. Prints only errors."""
+    print(f"[Polling Thread] Started. Target: {MAIN_BACKEND_OUTGOING_URL}")
     session = requests.Session()
-    connection_lost = False # Flag to track connection state
+    connection_lost = False
+    last_successful_poll = time.time()
 
-    while not _stop_polling.is_set():
+    while not _stop_polling_event.is_set():
         try:
-            res = session.get(OUTGOING_URL, timeout=10)
-            res.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-
-            if connection_lost:
-                print("[SYSTEM]: Connection to server restored.")
-                log_warning("mock_sender", "poll_thread", "Connection restored.") # Use warning for visibility
-                connection_lost = False
-
+            res = session.get(MAIN_BACKEND_OUTGOING_URL, timeout=10)
+            res.raise_for_status()
+            if connection_lost: print("[Polling Thread] Connection restored."); connection_lost = False
+            last_successful_poll = time.time()
             data = res.json()
             messages = data.get("messages", [])
 
             if messages:
-                for msg in messages:
-                    print(f"\n[BOT]: {msg.get('message', '[No message content]')}")
-                    try:
-                        ack_payload = {"message_id": msg.get("message_id"), "user_id": msg.get("user_id")}
-                        ack_res = session.post(ACK_URL, json=ack_payload, timeout=5)
-                        if ack_res.status_code != 200:
-                             log_warning("mock_sender", "poll_thread", f"Failed ACK for {msg.get('message_id')}. Status: {ack_res.status_code}")
-                    except Exception as ack_e:
-                         log_warning("mock_sender", "poll_thread", f"Error sending ACK for {msg.get('message_id')}: {ack_e}")
-                print(f"[YOU]: ", end="", flush=True)
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                with message_lock:
+                    for msg in reversed(messages):
+                         message_content = msg.get('message', '[No message content]')
+                         message_id = msg.get('message_id', f'nomockid-{time.time()}')
+                         message_store_bot.append({
+                             "sender": "bot", "timestamp": timestamp,
+                             "content": message_content, "id": message_id
+                         })
+                         try:
+                             ack_payload = {"message_id": message_id, "user_id": msg.get("user_id")}
+                             ack_res = session.post(MAIN_BACKEND_ACK_URL, json=ack_payload, timeout=3)
+                             if ack_res.status_code != 200:
+                                 print(f"[Polling Thread WARNING] Failed ACK for {message_id}. Status: {ack_res.status_code}")
+                         except Exception as ack_e:
+                             print(f"[Polling Thread ERROR] Error sending ACK for {message_id}: {ack_e}")
 
         except requests.exceptions.Timeout:
-             if not connection_lost: # Log only the first time timeout happens after connection was okay
-                 log_warning("mock_sender", "poll_thread", "Polling request timed out.")
-                 print("[SYSTEM]: Polling timed out...")
-                 connection_lost = True # Assume connection might be shaky
-             time.sleep(2) # Wait longer on timeout
+            if not connection_lost and (time.time() - last_successful_poll > 30):
+                print(f"[Polling Thread WARNING] Connection lost? Repeated timeouts polling {MAIN_BACKEND_OUTGOING_URL}.")
+                connection_lost = True
         except requests.exceptions.RequestException as e:
-             if not connection_lost: # Only log the first time connection fails
-                 # Check for connection refused specifically
-                 if "actively refused it" in str(e):
-                      error_msg = "Connection error: Target machine actively refused connection. Is the server running?"
-                 else:
-                      error_msg = f"Connection error: {e}"
-                 log_error("mock_sender", "poll_thread", error_msg)
-                 print(f"[SYSTEM]: {error_msg}")
-                 connection_lost = True
-             time.sleep(5) # Wait significantly longer if connection refused/error
+             error_msg = f"Connection error polling {MAIN_BACKEND_OUTGOING_URL}: {e}"
+             if isinstance(e, requests.exceptions.ConnectionError) and "actively refused it" in str(e).lower():
+                  error_msg = f"Connection error polling {MAIN_BACKEND_OUTGOING_URL}: Target refused connection. Is main backend running?"
+             if not connection_lost: print(f"[Polling Thread ERROR] {error_msg}"); connection_lost = True
         except json.JSONDecodeError as e:
-             log_error("mock_sender", "poll_thread", f"Failed to decode JSON response: {e}. Response text: {res.text[:100]}")
-             print("[SYSTEM]: Received invalid response from server.")
-             time.sleep(2)
+             response_text_snippet = res.text[:100] if 'res' in locals() else 'N/A'
+             print(f"[Polling Thread ERROR] Failed JSON decode from {MAIN_BACKEND_OUTGOING_URL}. Response: {response_text_snippet}. Error: {e}")
         except Exception as e:
-             log_error("mock_sender", "poll_thread", f"Unexpected error in polling thread: {e}", e)
-             if not connection_lost:
-                 print(f"[SYSTEM]: Unexpected polling error: {e}")
-                 connection_lost = True
-             time.sleep(5)
+            print(f"[Polling Thread ERROR] Unexpected error: {e}")
+            connection_lost = True
+        finally:
+            sleep_time = 0.5 if not connection_lost else 2.0
+            time.sleep(sleep_time)
 
-        if not connection_lost:
-            time.sleep(0.5)
-
-    log_info("mock_sender", "poll_thread", "Polling thread stopped.")
+    print("[Polling Thread] Stopped.")
 
 
-# --- UPDATED send_mock_message ---
-def send_mock_message(user_id_raw: str, message: str):
-    """Sends message, expects only ACK back directly."""
-    payload = {"user_id": user_id_raw, "message": message}
-    # Increase timeout significantly for LLM-heavy operations
-    # Try 60 or 90 seconds
-    ack_timeout = 60
-    print(f"[DEBUG] Sending POST to: {INCOMING_URL}")
+# --- Flask Routes (Simplified Output) ---
+@app.route('/')
+def index():
+    return render_template('browser_chat.html', title=f"WhatsTasker Chat (User: {MOCK_USER_ID})")
 
+@app.route('/send_message', methods=['POST'])
+def send_message():
+    """Receives message from browser, forwards to main backend."""
     try:
-        # Use the increased timeout here
-        res = requests.post(INCOMING_URL, json=payload, timeout=ack_timeout)
-        res.raise_for_status()
-        response_data = res.json()
-        if not response_data.get("ack"):
-             log_warning("mock_sender", "send_mock_message", f"Server response did not contain expected ack: {response_data}")
+        data = request.get_json()
+        message_text = data.get('message')
+        if not message_text: return jsonify({"status": "error", "message": "No message content"}), 400
 
-    except requests.exceptions.ReadTimeout:
-        # Log specifically that the ACK timed out, but the message was likely sent
-        log_warning("mock_sender", "send_mock_message", f"ACK response timed out after {ack_timeout}s (message likely sent, server processing).")
-        print(f"[SYSTEM]: Server took too long to acknowledge message (>{ack_timeout}s), but it was likely sent. Check for BOT response.")
-    except requests.exceptions.RequestException as e:
-        log_error("mock_sender", "send_mock_message", f"Failed to send message", e)
-        print(f"[SYSTEM]: Error connecting to server to send message: {e}")
-    except json.JSONDecodeError:
-        log_error("mock_sender", "send_mock_message", f"Received non-JSON ACK response: {res.text}")
-        print(f"[SYSTEM ERROR]: Received invalid ACK response from server.")
-    except Exception as e:
-        log_error("mock_sender", "send_mock_message", f"Unexpected error sending message", e)
-        print(f"[SYSTEM]: Unexpected error sending message: {e}")
+        user_id_to_send = MOCK_USER_ID
+        # print(f"Forwarding message from {user_id_to_send}: {message_text[:50]}...") # Removed info print
 
-# --- (main function remains the same) ---
-def main():
-    default_display_user = DEFAULT_USER
-    user_input_raw = input(f"Enter user ID (default: {default_display_user}): ").strip()
-    user_id_to_send = user_input_raw if user_input_raw else default_display_user
+        backend_payload = {"user_id": user_id_to_send, "message": message_text}
+        backend_timeout = 60
 
-    print(f"--- Mock Sender for User: {user_id_to_send} ---")
-    print("Polling for messages... Type your message. Use :exit to quit.")
+        try:
+            response = requests.post(MAIN_BACKEND_INCOMING_URL, json=backend_payload, timeout=backend_timeout)
+            response.raise_for_status()
+            try:
+                ack_data = response.json();
+                if not ack_data.get("ack"): print(f"[Flask WARNING] Main backend response ({response.status_code}) missing ACK.")
+            except ValueError: print(f"[Flask WARNING] Main backend response ({response.status_code}) not JSON.")
+            return jsonify({"status": "ok", "message": "Forwarded to backend"}), 200
 
-    polling_thread = threading.Thread(target=poll_for_messages, args=(user_id_to_send,), daemon=True)
+        except requests.exceptions.Timeout: print(f"[Flask ERROR] Timeout sending to {MAIN_BACKEND_INCOMING_URL}"); return jsonify({"status": "error", "message": f"Timeout sending to backend"}), 503
+        except requests.exceptions.ConnectionError: print(f"[Flask ERROR] Conn refused by {MAIN_BACKEND_INCOMING_URL}"); return jsonify({"status": "error", "message": f"Connection refused by backend"}), 503
+        except requests.exceptions.RequestException as e: print(f"[Flask ERROR] Failed forward to backend: {e}"); return jsonify({"status": "error", "message": f"Failed to forward: {e}"}), 500
+
+    except Exception as e: print(f"[Flask ERROR] Error in /send_message: {e}"); return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/get_messages')
+def get_messages():
+    """Provides ONLY BOT messages to the frontend."""
+    with message_lock:
+        bot_messages = list(message_store_bot)
+    sorted_bot_messages = sorted(bot_messages, key=lambda x: x.get('timestamp', ''))
+    return jsonify({"messages": sorted_bot_messages})
+
+@app.route('/clear_messages', methods=['POST'])
+def clear_messages():
+    """Clears the server's BOT message store."""
+    with message_lock:
+        message_store_bot.clear()
+    print("[Flask INFO] Browser chat BOT messages cleared on server.")
+    return jsonify({"status": "ok"}), 200
+
+# --- Main Execution ---
+if __name__ == '__main__':
+    print(f"--- Starting Mock Browser Chat Interface ---")
+    print(f"Serving chat UI on: http://localhost:{VIEWER_PORT}")
+    print(f"Acting as User ID:  {MOCK_USER_ID}")
+    print(f"Talking to Backend: {MAIN_BACKEND_INCOMING_URL}")
+    print(f"Polling Backend at: {MAIN_BACKEND_OUTGOING_URL}")
+    print(f"--------------------------------------------")
+
+    polling_thread = threading.Thread(target=poll_main_backend, daemon=True)
     polling_thread.start()
 
-    while True:
-        try:
-            msg = input(f"[YOU]: ")
-            if msg.strip().lower() == ":exit":
-                break
-            if msg.strip() == "": continue
-            send_mock_message(user_id_to_send, msg)
-        except (EOFError, KeyboardInterrupt):
-            print("\nCtrl+C or EOF detected.")
-            break
+    try:
+        # Disable Flask's default verbose logging by getting the logger
+        log = logging.getLogger('werkzeug') # <--- Get Flask's logger
+        log.setLevel(logging.WARNING)      # <--- Set level to WARNING
 
-    print("\nStopping polling thread...")
-    _stop_polling.set()
-    polling_thread.join(timeout=2)
-    print("Mock chat ended.")
+        app.run(host='0.0.0.0', port=VIEWER_PORT, debug=False, use_reloader=False)
+    except KeyboardInterrupt:
+        print("\nCtrl+C received, shutting down...")
+    except Exception as e:
+        print(f"[ERROR] Flask server crashed: {e}")
+    finally:
+        _stop_polling_event.set()
+        print("Waiting for polling thread to stop...")
+        polling_thread.join(timeout=2)
+        print("Mock browser chat server stopped.")
 
-if __name__ == "__main__":
-     try: log_info("mock_sender", "main", "Starting mock sender...")
-     except NameError: print("FATAL ERROR: Logger not loaded."); sys.exit(1)
-     except Exception as e: print(f"FATAL ERROR during logging setup: {e}"); sys.exit(1)
-     main()
-# --- END of tests/mock_sender.py ---
-# --- END OF FILE tests\mock_sender.py ---
+# --- END OF FILE tests/mock_browser_chat.py ---
 
+
+
+================================================================================
+📄 tests/templates/browser_chat.html
+================================================================================
+
+# --- START OF FILE tests/templates/browser_chat.html ---
+
+<!-- tests/templates/browser_chat.html -->
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }}</title>
+    <style>
+        /* Styles remain the same */
+        body { font-family: sans-serif; margin: 0; padding: 0; display: flex; flex-direction: column; height: 100vh; background-color: #f4f4f4; }
+        h1 { text-align: center; color: #333; margin: 10px 0; }
+        #chat-container { flex-grow: 1; border: 1px solid #ccc; background-color: #fff; margin: 0 10px 10px 10px; overflow-y: auto; padding: 10px; }
+        #messages { list-style-type: none; padding: 0; margin: 0; }
+        #messages li { margin-bottom: 10px; padding: 8px; border-radius: 5px; word-wrap: break-word; max-width: 80%; clear: both; }
+        #messages li.user { background-color: #dcf8c6; margin-left: auto; float: right; text-align: right; }
+        #messages li.bot { background-color: #e0e0e0; margin-right: auto; float: left; text-align: left; }
+        #messages li.system { background-color: #f0e68c; margin-left: auto; margin-right: auto; text-align: center; font-style: italic; color: #555; max-width: 90%; float: none; font-size: 0.9em;}
+        #messages li[dir="rtl"] { text-align: right; }
+        #messages li[dir="ltr"] { text-align: left; }
+        .msg-meta { font-size: 0.8em; color: #888; display: block; margin-top: 4px; }
+        .msg-content { white-space: pre-wrap; }
+        #input-area { display: flex; padding: 10px; border-top: 1px solid #ccc; background-color: #eee; }
+        #messageInput { flex-grow: 1; padding: 10px; border: 1px solid #ccc; border-radius: 3px; margin-right: 5px;}
+        #sendButton { padding: 10px 15px; cursor: pointer; }
+        #controls { text-align: right; padding: 0 10px 5px 0; font-size: 0.8em; }
+    </style>
+</head>
+<body>
+
+    <h1>{{ title }}</h1>
+    <div id="controls">
+        <button id="clearButton" title="Clear messages displayed in this browser window">Clear Display</button>
+    </div>
+
+    <div id="chat-container">
+        <ul id="messages">
+            <!-- Messages will be added dynamically -->
+        </ul>
+    </div>
+
+    <div id="input-area">
+        <input type="text" id="messageInput" placeholder="Type your message..." autocomplete="off">
+        <button id="sendButton">Send</button>
+    </div>
+
+    <script>
+        const messagesContainer = document.getElementById('messages');
+        const messageInput = document.getElementById('messageInput');
+        const sendButton = document.getElementById('sendButton');
+        const clearButton = document.getElementById('clearButton');
+
+        let displayedMessageIds = new Set(); // Track IDs shown in browser
+        let isSending = false;
+        let isFetching = false;
+
+        function containsHebrew(text) {
+            if (!text) return false;
+            return /[\u0590-\u05FF]/.test(text);
+        }
+
+        // Function to add a single message object to the display UL
+        function addMessageToDisplay(msg) {
+             if (!msg || !msg.id || displayedMessageIds.has(msg.id)) {
+                 return false; // Don't add if no message, no ID, or already displayed
+             }
+
+             const li = document.createElement('li');
+             const senderClass = msg.sender || 'system';
+             li.classList.add(senderClass);
+
+             const isRtl = containsHebrew(msg.content);
+             li.setAttribute('dir', isRtl ? 'rtl' : 'ltr');
+
+             const contentSpan = document.createElement('span');
+             contentSpan.className = 'msg-content';
+             contentSpan.textContent = msg.content;
+
+             const metaSpan = document.createElement('span');
+             metaSpan.className = 'msg-meta';
+             // Use sender from message object now
+             metaSpan.textContent = `[${msg.timestamp}] ${senderClass.toUpperCase()}`;
+
+             li.appendChild(contentSpan);
+             li.appendChild(metaSpan);
+
+             messagesContainer.appendChild(li);
+             displayedMessageIds.add(msg.id); // Mark as displayed
+             return true;
+        }
+
+        // Fetches ONLY BOT messages and adds them if not already displayed
+        async function fetchAndUpdateMessages() {
+            if (isFetching) return;
+            isFetching = true;
+            let addedNew = false;
+             try {
+                const response = await fetch('/get_messages'); // Fetches BOT messages from server store
+                if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                const result = await response.json();
+                const botMessages = result.messages || [];
+
+                botMessages.forEach(msg => {
+                    // addMessageToDisplay checks displayedMessageIds
+                    if(addMessageToDisplay(msg)) {
+                        addedNew = true;
+                    }
+                });
+
+            } catch (error) {
+                console.error('Error fetching messages:', error);
+            } finally {
+                 isFetching = false;
+                 if (addedNew) {
+                     messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                 }
+             }
+        }
+
+       async function sendMessage() {
+            const messageText = messageInput.value.trim();
+            if (!messageText || isSending) return;
+            isSending = true;
+            sendButton.disabled = true;
+            messageInput.disabled = true;
+
+            // 1. Create and display user message OBJECT immediately
+             const userTimestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+             const localUserId = `user-${Date.now()}`;
+             const userMsg = {
+                 sender: 'user',
+                 timestamp: userTimestamp,
+                 content: messageText,
+                 id: localUserId
+             };
+             if(addMessageToDisplay(userMsg)){ // Add user message to display
+                 messagesContainer.scrollTop = messagesContainer.scrollHeight;
+             }
+             messageInput.value = '';
+
+            // 2. Send message to viewer backend to forward to main backend
+            try {
+                const response = await fetch('/send_message', { // Send to viewer backend
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: messageText })
+                });
+                if (!response.ok) {
+                    const errorData = await response.json().catch(() => ({ message: response.statusText }));
+                    console.error('Error sending message via viewer:', errorData.message);
+                    // Add error message to display
+                    addMessageToDisplay({ sender: 'system', timestamp: new Date().toLocaleTimeString(), content: `Error sending: ${errorData.message}`, id:`err-${Date.now()}`});
+                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                }
+                 // Bot response will arrive via the fetchAndUpdateMessages polling
+            } catch (error) {
+                console.error('Network error sending message via viewer:', error);
+                 addMessageToDisplay({ sender: 'system', timestamp: new Date().toLocaleTimeString(), content: `Network Error: ${error}`, id:`neterr-${Date.now()}`});
+                 messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            } finally {
+                 isSending = false;
+                 sendButton.disabled = false;
+                 messageInput.disabled = false;
+                 messageInput.focus();
+            }
+        }
+
+       async function clearMessages() {
+             displayedMessageIds.clear(); // Clear JS tracking
+             messagesContainer.innerHTML = '<li>Clearing...</li>'; // Update display
+            try {
+                await fetch('/clear_messages', { method: 'POST' }); // Tell server to clear its bot store
+                 messagesContainer.innerHTML = '<li>Messages cleared.</li>';
+            } catch (error) {
+                console.error('Error signaling viewer to clear messages:', error);
+                messagesContainer.innerHTML = '<li>Error clearing messages.</li>';
+            }
+        }
+
+        // Event Listeners
+        sendButton.addEventListener('click', sendMessage);
+        messageInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') { sendMessage(); }
+        });
+        clearButton.addEventListener('click', clearMessages);
+
+        // Fetch messages periodically
+        setInterval(fetchAndUpdateMessages, 1500);
+
+        // Initial fetch
+        // No initial fetch needed, or fetch then clear display?
+        // Let's start clean
+        messagesContainer.innerHTML = '<li>Connecting...</li>'; // Initial message
+
+    </script>
+
+</body>
+</html>
+
+# --- END OF FILE tests/templates/browser_chat.html ---
+
+
+
+================================================================================
+📦 Node.js Dependencies Note
+================================================================================
+
+# The 'package.json' file lists Node.js dependencies.
+# The 'package-lock.json' file (not included) locks specific versions.
+# Run 'npm install' in the project root to install these dependencies (including whatsapp-web.js, axios, qrcode-terminal, dotenv, nodemailer).
+# The 'node_modules/' directory containing the installed packages is NOT included in this dump.
 

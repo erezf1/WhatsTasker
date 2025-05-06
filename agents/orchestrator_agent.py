@@ -1,8 +1,8 @@
-# --- START OF FILE agents/orchestrator_agent.py ---
+# --- START OF FULL agents/orchestrator_agent.py ---
 import json
 import os
 import traceback
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any # Retain Optional for Pydantic/OpenAI models
 from datetime import datetime
 import pytz
 import re
@@ -15,7 +15,9 @@ from openai.types.chat.chat_completion_message_tool_call import Function
 from openai.types.shared_params import FunctionDefinition
 
 # Tool Imports & Helpers
+# --- Uses the UPDATED tools from tool_definitions ---
 from .tool_definitions import AVAILABLE_TOOLS, TOOL_PARAM_MODELS
+# --------------------------------------------------
 import services.task_manager as task_manager # For parsing duration used in prompt prep
 
 # Utilities
@@ -38,9 +40,10 @@ GENERIC_ERROR_MSG = _messages.get("generic_error_message", "Sorry, an unexpected
 
 
 # --- Function to Load Prompt ---
-_PROMPT_CACHE = {}
+_PROMPT_CACHE: Dict[str, Optional[str]] = {}
 def load_orchestrator_prompt() -> Optional[str]:
     """Loads the orchestrator system prompt from the YAML file, with simple caching."""
+    # This function remains the same, it just loads whatever prompt is in the file
     prompts_path = os.path.join("config", "prompts.yaml"); cache_key = prompts_path
     if cache_key in _PROMPT_CACHE: return _PROMPT_CACHE[cache_key]
     prompt_text_result: Optional[str] = None
@@ -57,10 +60,8 @@ def load_orchestrator_prompt() -> Optional[str]:
     except Exception as e: log_error("orchestrator_agent", "load_orchestrator_prompt", f"CRITICAL: Failed to load/parse orchestrator prompt: {e}", e); prompt_text_result = None
     _PROMPT_CACHE[cache_key] = prompt_text_result; return prompt_text_result
 
-# --- REMOVED Pending Context Helpers ---
 
-# --- Main Handler Function ---
-# --- Main Handler Function (Corrected Version) ---
+# --- Main Handler Function (Core logic remains the same) ---
 def handle_user_request(
     user_id: str, message: str, history: List[Dict], preferences: Dict,
     task_context: List[Dict], calendar_context: List[Dict]
@@ -78,7 +79,7 @@ def handle_user_request(
          log_error("orchestrator_agent", fn_name, "Orchestrator system prompt could not be loaded.")
          return GENERIC_ERROR_MSG
 
-    client: OpenAI = get_instructor_client()
+    client: Optional[OpenAI] = get_instructor_client()
     if not client:
         log_error("orchestrator_agent", fn_name, "LLM client unavailable.")
         return GENERIC_ERROR_MSG
@@ -113,25 +114,34 @@ def handle_user_request(
         {"role": "user", "content": message}
     ]
 
-    # --- Define Tools (No change needed here) ---
+    # --- Define Tools (Uses the UPDATED tools from tool_definitions) ---
     tools_for_llm: List[ChatCompletionToolParam] = []
     for tool_name, model in TOOL_PARAM_MODELS.items():
-        if tool_name not in AVAILABLE_TOOLS: continue
+        if tool_name not in AVAILABLE_TOOLS: continue # Check against updated AVAILABLE_TOOLS
         func = AVAILABLE_TOOLS.get(tool_name)
         description = func.__doc__.strip() if func and func.__doc__ else f"Executes {tool_name}"
         try:
             params_schema = model.model_json_schema();
-            if not params_schema.get('properties'): params_schema = {}
+            # Allow empty schema for tools with no params
+            if not params_schema.get('properties') and not model.model_fields: params_schema = {}
+            elif not params_schema.get('properties'):
+                 log_warning("orchestrator_agent", fn_name, f"Model {model.__name__} for tool {tool_name} has fields but generated empty properties schema.")
+                 params_schema = {} # Default to empty if unexpected
+
             func_def: FunctionDefinition = {"name": tool_name, "description": description, "parameters": params_schema}
             tool_param: ChatCompletionToolParam = {"type": "function", "function": func_def}; tools_for_llm.append(tool_param)
         except Exception as e: log_error("orchestrator_agent", fn_name, f"Schema error for tool {tool_name}: {e}", e)
     if not tools_for_llm: log_error("orchestrator_agent", fn_name, "No tools defined for LLM."); return GENERIC_ERROR_MSG
 
-    # --- Interaction Loop ---
+    # --- Interaction Loop (No structural change needed) ---
     try:
         log_info("orchestrator_agent", fn_name, f"Invoking LLM for {user_id} (Initial Turn)...")
         response = client.chat.completions.create(
-            model="gpt-4o", messages=messages, tools=tools_for_llm, tool_choice="auto", temperature=0.1,
+            model="gpt-4o", # Or other capable model
+            messages=messages, # type: ignore
+            tools=tools_for_llm,
+            tool_choice="auto",
+            temperature=0.1,
         )
         response_message = response.choices[0].message
         tool_calls = response_message.tool_calls
@@ -147,19 +157,18 @@ def handle_user_request(
 
         # --- Scenario 2: LLM Calls One or More Tools ---
         log_info("orchestrator_agent", fn_name, f"LLM requested {len(tool_calls)} tool call(s).")
-        # Append the assistant's message containing the tool call requests
-        messages.append(response_message.model_dump(exclude_unset=True))
-        tool_results_messages = [] # Store results to append later
+        messages.append(response_message.model_dump(exclude_unset=True)) # Add assistant's tool call request
+        tool_results_messages = []
 
-        # --- Loop through ALL requested tool calls ---
         for tool_call in tool_calls:
             tool_name = tool_call.function.name
             tool_call_id = tool_call.id
             tool_args_str = tool_call.function.arguments
-            tool_result_content = GENERIC_ERROR_MSG # Default in case of error
+            tool_result_content = GENERIC_ERROR_MSG # Default
 
             log_info("orchestrator_agent", fn_name, f"Processing Tool Call ID: {tool_call_id}, Name: {tool_name}, Args: {tool_args_str[:150]}...")
 
+            # Use updated AVAILABLE_TOOLS and TOOL_PARAM_MODELS here
             if tool_name not in AVAILABLE_TOOLS:
                 log_warning("orchestrator_agent", fn_name, f"LLM tried unknown tool: {tool_name}. Sending error result back.")
                 tool_result_content = json.dumps({"success": False, "message": f"Error: Unknown action '{tool_name}' requested."})
@@ -167,14 +176,12 @@ def handle_user_request(
                 tool_func = AVAILABLE_TOOLS[tool_name]
                 param_model = TOOL_PARAM_MODELS[tool_name]
                 try:
-                    # Parse and validate arguments
                     tool_args_dict = {}
                     if tool_args_str and tool_args_str.strip() != '{}': tool_args_dict = json.loads(tool_args_str)
-                    elif not param_model.model_fields: tool_args_dict = {}
-                    validated_params = param_model(**tool_args_dict)
+                    elif not param_model.model_fields: tool_args_dict = {} # Handle no-arg tools
 
-                    # Execute the tool function
-                    tool_result_dict = tool_func(user_id, validated_params)
+                    validated_params = param_model(**tool_args_dict)
+                    tool_result_dict = tool_func(user_id, validated_params) # Call the tool
                     log_info("orchestrator_agent", fn_name, f"Tool {tool_name} (ID: {tool_call_id}) executed. Result: {tool_result_dict}")
                     tool_result_content = json.dumps(tool_result_dict)
 
@@ -189,24 +196,19 @@ def handle_user_request(
                     log_error("orchestrator_agent", fn_name, f"Error executing tool {tool_name} (ID: {tool_call_id}). Trace:\n{traceback.format_exc()}", e);
                     tool_result_content = json.dumps({"success": False, "message": f"Error performing action {tool_name}."})
 
-            # Append the result message for THIS tool call
             tool_results_messages.append({
-                "tool_call_id": tool_call_id,
-                "role": "tool",
-                "name": tool_name,
-                "content": tool_result_content,
+                "tool_call_id": tool_call_id, "role": "tool",
+                "name": tool_name, "content": tool_result_content,
             })
-        # --- End loop through tool calls ---
 
-        # Append ALL tool result messages to the main message history
-        messages.extend(tool_results_messages)
+        messages.extend(tool_results_messages) # Add all tool results
 
         # --- Make SECOND LLM call with ALL tool results ---
         log_info("orchestrator_agent", fn_name, f"Invoking LLM again for {user_id} with {len(tool_results_messages)} tool result(s)...")
         second_response = client.chat.completions.create(
             model="gpt-4o", # Use the same model
-            messages=messages,
-            # No tools needed here, LLM should just generate response based on results
+            messages=messages, # type: ignore
+            # No tools needed here
         )
         second_response_message = second_response.choices[0].message
 
@@ -215,7 +217,6 @@ def handle_user_request(
             return second_response_message.content
         else:
             log_warning("orchestrator_agent", fn_name, "LLM provided no content after processing tool result(s).")
-            # Try to construct a fallback from the first tool's message if possible
             try: fallback_msg = json.loads(tool_results_messages[0]['content']).get("message", GENERIC_ERROR_MSG)
             except: fallback_msg = GENERIC_ERROR_MSG
             return fallback_msg
@@ -225,10 +226,4 @@ def handle_user_request(
         tb_str = traceback.format_exc()
         log_error("orchestrator_agent", fn_name, f"Core error in orchestrator logic for {user_id}. Traceback:\n{tb_str}", e)
         return GENERIC_ERROR_MSG
-
-    # --- Outer Exception Handling ---
-    except Exception as e:
-        tb_str = traceback.format_exc()
-        log_error("orchestrator_agent", fn_name, f"Core error in orchestrator logic for {user_id}. Traceback:\n{tb_str}", e)
-        return GENERIC_ERROR_MSG
-# --- END OF FILE agents/orchestrator_agent.py ---
+# --- END OF FULL agents/orchestrator_agent.py ---

@@ -34,4 +34,5 @@ openai>=1.0.0,<2.0.0     # Instructor depends on OpenAI v1+
 # Optional: If using pandas checks (e.g., pd.isna) - uncomment if needed
 # pandas>=2.0.0,<3.0.0
 
+Flask>=2.0.0,<4.0.0
 # --- END OF FILE requirements.txt ---

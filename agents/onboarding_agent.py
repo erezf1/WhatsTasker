@@ -1,19 +1,19 @@
-# --- START OF FILE agents/onboarding_agent.py ---
+# --- START OF FULL agents/onboarding_agent.py ---
 import json
 import os
 import traceback
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any # Retain Optional for type hints as Pydantic/OpenAI models use it
 from datetime import datetime
 import pytz
 
 # Instructor/LLM Imports
 from services.llm_interface import get_instructor_client
-from openai import OpenAI
-from openai.types.chat import ChatCompletionMessage, ChatCompletionToolParam, ChatCompletionMessageToolCall
-from openai.types.chat.chat_completion_message_tool_call import Function
+from openai import OpenAI # Base client for types if needed
+from openai.types.chat import ChatCompletionMessage, ChatCompletionToolParam
+from openai.types.chat.chat_completion_message_tool_call import Function as ToolFunctionCall # Renamed to avoid conflict
 from openai.types.shared_params import FunctionDefinition
 
-# Tool Imports (Limited Set)
+# Tool Imports (Limited Set for Onboarding)
 from .tool_definitions import (
     AVAILABLE_TOOLS,
     TOOL_PARAM_MODELS,
@@ -26,7 +26,7 @@ from tools.logger import log_info, log_error, log_warning
 import yaml
 import pydantic
 
-# --- Load Standard Messages ---
+# --- Load Standard Messages (Mainly for GENERIC_ERROR_MSG) ---
 _messages = {}
 try:
     messages_path = os.path.join("config", "messages.yaml")
@@ -38,75 +38,56 @@ try:
     else: log_warning("onboarding_agent", "init", f"{messages_path} not found."); _messages = {}
 except Exception as e: log_error("onboarding_agent", "init", f"Failed to load messages.yaml: {e}", e); _messages = {}
 GENERIC_ERROR_MSG = _messages.get("generic_error_message", "Sorry, an unexpected error occurred.")
-SETUP_START_MSG = _messages.get("setup_starting_message", "Great! Let's set things up.")
+# SETUP_START_MSG no longer used directly by Python, LLM will handle greetings
 
 # --- Function to Load Onboarding Prompt ---
-_ONBOARDING_PROMPT_CACHE = {}
-def load_onboarding_prompt() -> Optional[str]:
-    """Loads the onboarding system prompt from the YAML file, with caching."""
-    prompts_path = os.path.join("config", "prompts.yaml")
-    cache_key = prompts_path + "_onboarding"
-    if cache_key in _ONBOARDING_PROMPT_CACHE:
-        return _ONBOARDING_PROMPT_CACHE[cache_key]
+_ONBOARDING_PROMPT_CACHE: Dict[str, Optional[str]] = {} # Specify cache type
+_ONBOARDING_HUMAN_PROMPT_CACHE: Dict[str, Optional[str]] = {}
 
-    prompt_text_result: Optional[str] = None
+def load_onboarding_prompts() -> tuple[Optional[str], Optional[str]]:
+    """Loads the onboarding system and human prompts from the YAML file, with caching."""
+    prompts_path = os.path.join("config", "prompts.yaml")
+    system_cache_key = prompts_path + "_onboarding_system"
+    human_cache_key = prompts_path + "_onboarding_human"
+
+    cached_system_prompt = _ONBOARDING_PROMPT_CACHE.get(system_cache_key)
+    cached_human_prompt = _ONBOARDING_HUMAN_PROMPT_CACHE.get(human_cache_key)
+
+    if cached_system_prompt is not None and cached_human_prompt is not None:
+        return cached_system_prompt, cached_human_prompt
+
+    system_prompt_text: Optional[str] = None
+    human_prompt_text: Optional[str] = None
     try:
         if not os.path.exists(prompts_path): raise FileNotFoundError(f"{prompts_path} not found.")
         with open(prompts_path, "r", encoding="utf-8") as f:
-            content = f.read();
+            content = f.read()
             if not content.strip(): raise ValueError("Prompts file is empty.")
             f.seek(0); all_prompts = yaml.safe_load(f)
             if not all_prompts: raise ValueError("YAML parsing resulted in empty prompts.")
-            prompt_text = all_prompts.get("onboarding_agent_system_prompt")
-            if not prompt_text or not prompt_text.strip():
-                log_error("onboarding_agent", "load_onboarding_prompt", "Key 'onboarding_agent_system_prompt' NOT FOUND or EMPTY.")
-                prompt_text_result = None
+
+            system_prompt_text = all_prompts.get("onboarding_agent_system_prompt")
+            if not system_prompt_text or not system_prompt_text.strip():
+                log_error("onboarding_agent", "load_onboarding_prompts", "Key 'onboarding_agent_system_prompt' NOT FOUND or EMPTY.")
+                system_prompt_text = None
             else:
-                log_info("onboarding_agent", "load_onboarding_prompt", "Onboarding prompt loaded successfully.")
-                prompt_text_result = prompt_text
+                log_info("onboarding_agent", "load_onboarding_prompts", "Onboarding system prompt loaded successfully.")
+
+            human_prompt_text = all_prompts.get("onboarding_agent_human_prompt")
+            if not human_prompt_text or not human_prompt_text.strip():
+                log_error("onboarding_agent", "load_onboarding_prompts", "Key 'onboarding_agent_human_prompt' NOT FOUND or EMPTY.")
+                human_prompt_text = None
+            else:
+                log_info("onboarding_agent", "load_onboarding_prompts", "Onboarding human prompt loaded successfully.")
+
     except Exception as e:
-        log_error("onboarding_agent", "load_onboarding_prompt", f"CRITICAL: Failed load/parse onboarding prompt: {e}", e)
-        prompt_text_result = None
+        log_error("onboarding_agent", "load_onboarding_prompts", f"CRITICAL: Failed load/parse onboarding prompts: {e}", e)
+        system_prompt_text = None
+        human_prompt_text = None
 
-    _ONBOARDING_PROMPT_CACHE[cache_key] = prompt_text_result
-    return prompt_text_result
-
-# --- REMOVED Onboarding State Helpers ---
-# The pure LLM flow relies on history and current prefs in context
-
-# --- Helper for LLM Clarification (If needed for onboarding - keep for now) ---
-def _get_clarification_from_llm(client: OpenAI, question: str, user_reply: str, expected_choices: List[str]) -> str:
-    """Uses LLM to interpret user reply against expected choices."""
-    # This helper might still be useful if the LLM asks a yes/no for calendar
-    log_info("onboarding_agent", "_get_clarification_from_llm", f"Asking LLM to clarify: Q='{question}' Reply='{user_reply}' Choices={expected_choices}")
-    system_message = f"""
-You are helping a user interact with a task assistant during setup.
-The assistant asked the user a question, and the user replied.
-Your task is to determine which of the expected choices the user's reply corresponds to.
-The original question was: "{question}"
-The user's reply was: "{user_reply}"
-The expected choices are: {expected_choices}
-
-Analyze the user's reply and determine the choice.
-Respond ONLY with one of the following exact strings: {', '.join([f"'{choice}'" for choice in expected_choices])} or 'unclear'.
-"""
-    try:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo", # Use a cheaper/faster model for clarification
-            messages=[{"role": "system", "content": system_message}],
-            temperature=0.0,
-            max_tokens=10
-        )
-        llm_choice = response.choices[0].message.content.strip().lower().replace("'", "")
-        log_info("onboarding_agent", "_get_clarification_from_llm", f"LLM clarification result: '{llm_choice}'")
-        if llm_choice in expected_choices or llm_choice == 'unclear':
-            return llm_choice
-        else:
-            log_warning("onboarding_agent", "_get_clarification_from_llm", f"LLM returned unexpected clarification: '{llm_choice}'")
-            return 'unclear'
-    except Exception as e:
-        log_error("onboarding_agent", "_get_clarification_from_llm", f"Error during LLM clarification call: {e}", e)
-        return 'unclear'
+    _ONBOARDING_PROMPT_CACHE[system_cache_key] = system_prompt_text
+    _ONBOARDING_HUMAN_PROMPT_CACHE[human_cache_key] = human_prompt_text
+    return system_prompt_text, human_prompt_text
 
 # --- Main Onboarding Handler Function ---
 def handle_onboarding_request(
@@ -116,86 +97,91 @@ def handle_onboarding_request(
     preferences: Dict # Current preferences passed in
 ) -> str:
     """Handles the user's request during the onboarding phase using pure LLM flow."""
-    log_info("onboarding_agent", "handle_onboarding_request", f"Handling onboarding request for {user_id}: '{message[:50]}...'")
-    fn_name = "handle_onboarding_request" # Use function name for logging
+    fn_name = "handle_onboarding_request"
+    log_info("onboarding_agent", fn_name, f"Handling onboarding request for {user_id}: '{message[:50]}...'")
 
-    onboarding_system_prompt = load_onboarding_prompt()
-    if not onboarding_system_prompt:
-         log_error(fn_name, "load_onboarding_prompt", "Onboarding system prompt could not be loaded.") # Corrected log identifier
+    onboarding_system_prompt, onboarding_human_prompt = load_onboarding_prompts()
+    if not onboarding_system_prompt or not onboarding_human_prompt:
+         log_error("onboarding_agent", fn_name, "Onboarding system or human prompt could not be loaded.")
          return GENERIC_ERROR_MSG
 
-    client: OpenAI = get_instructor_client()
+    client: Optional[OpenAI] = get_instructor_client()
     if not client:
-        log_error(fn_name, "get_instructor_client", "LLM client unavailable.") # Corrected log identifier
+        log_error("onboarding_agent", fn_name, "LLM client unavailable.")
         return GENERIC_ERROR_MSG
 
-    # --- Prepare Context (Simpler than main orchestrator, focuses on prefs) ---
+    # --- Prepare Context for Prompt ---
     try:
-        user_timezone_str = preferences.get("TimeZone", "UTC"); user_timezone = pytz.utc
-        try:
-            user_timezone = pytz.timezone(user_timezone_str)
-        except pytz.UnknownTimeZoneError:
-            log_warning(fn_name, "prepare_context", f"Unknown timezone '{user_timezone_str}'. Using UTC.") # Corrected log identifier
-        now = datetime.now(user_timezone); current_date_str = now.strftime("%Y-%m-%d"); current_time_str = now.strftime("%H:%M"); current_day_str = now.strftime("%A")
-
-        history_limit = 10
-        limited_history = history[-(history_limit*2):]
+        history_limit = 20 # Keep more history for onboarding to better detect language
+        limited_history = history[-(history_limit*2):] # Each turn is 2 entries (user, assistant/tool)
         history_str = "\n".join([f"{m['sender'].capitalize()}: {m['content']}" for m in limited_history])
-
         prefs_str = json.dumps(preferences, indent=2, default=str)
-
-        initial_interaction = len(history) <= 1 # If only user message is present
-        intro_message = SETUP_START_MSG if initial_interaction else ""
-
     except Exception as e:
-        log_error(fn_name, "prepare_context", f"Error preparing context: {e}", e) # Corrected log identifier
+        log_error("onboarding_agent", fn_name, f"Error preparing context strings for onboarding: {e}", e)
         return GENERIC_ERROR_MSG
 
-    # --- Construct Messages for Onboarding LLM ---
+    # --- Construct Initial Messages for LLM ---
+    # Human prompt is now dynamic with placeholders
+    formatted_human_prompt = onboarding_human_prompt.format(
+        current_preferences_json=prefs_str,
+        conversation_history=history_str,
+        message=message # The latest user message
+    )
+
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": onboarding_system_prompt},
-        {"role": "system", "content": f"Current User Preferences:\n```json\n{prefs_str}\n```"},
-        {"role": "system", "content": f"Conversation History:\n{history_str}"},
-        {"role": "user", "content": message}
+        # System messages with context are now part of the human prompt's preamble for this agent
+        {"role": "user", "content": formatted_human_prompt} # The user message is part of the formatted human prompt
     ]
-    if intro_message and initial_interaction:
-         messages.insert(-1, {"role": "assistant", "content": intro_message})
-
+    # Remove the logic that inserted SETUP_START_MSG; LLM will handle greeting.
 
     # --- Define Tools AVAILABLE for Onboarding ---
-    onboarding_tools_available = {
-        "update_user_preferences": AVAILABLE_TOOLS.get("update_user_preferences"),
-        "initiate_calendar_connection": AVAILABLE_TOOLS.get("initiate_calendar_connection"),
+    # (Tool definition logic is similar to orchestrator_agent)
+    onboarding_tools_for_llm_map = {
+        "update_user_preferences": {
+            "function": AVAILABLE_TOOLS.get("update_user_preferences"),
+            "model": UpdateUserPreferencesParams
+        },
+        "initiate_calendar_connection": {
+            "function": AVAILABLE_TOOLS.get("initiate_calendar_connection"),
+            "model": InitiateCalendarConnectionParams
+        },
     }
-    onboarding_tool_models = {
-        "update_user_preferences": UpdateUserPreferencesParams,
-        "initiate_calendar_connection": InitiateCalendarConnectionParams,
+    # Filter out tools that might have failed to load
+    onboarding_tools_for_llm_map = {
+        name: data for name, data in onboarding_tools_for_llm_map.items() if data["function"] and data["model"]
     }
-    onboarding_tools_available = {k:v for k,v in onboarding_tools_available.items() if v is not None}
 
     tools_for_llm: List[ChatCompletionToolParam] = []
-    for tool_name, model in onboarding_tool_models.items():
-        if tool_name not in onboarding_tools_available: continue
-        func = onboarding_tools_available.get(tool_name)
+    for tool_name, tool_data in onboarding_tools_for_llm_map.items():
+        func = tool_data["function"]
+        model = tool_data["model"]
         description = func.__doc__.strip() if func and func.__doc__ else f"Executes {tool_name}"
         try:
-            params_schema = model.model_json_schema();
-            if not params_schema.get('properties'): params_schema = {}
+            params_schema = model.model_json_schema()
+            # Ensure 'properties' is not empty for tools that expect params
+            if not params_schema.get('properties') and model.model_fields:
+                # If model has fields but schema has no properties, it might be an issue.
+                # For empty models like InitiateCalendarConnectionParams, schema might be {}
+                pass # Allow empty schema for tools with no params
+            elif not params_schema.get('properties'):
+                 params_schema = {} # For tools with truly no parameters
+
             func_def: FunctionDefinition = {"name": tool_name, "description": description, "parameters": params_schema}
-            tool_param: ChatCompletionToolParam = {"type": "function", "function": func_def}; tools_for_llm.append(tool_param)
-        except Exception as e: log_error(fn_name, "define_tools", f"Schema error for onboarding tool {tool_name}: {e}", e) # Corrected log identifier
-    # It's okay if tools_for_llm is empty if LLM decides to just talk
+            tool_param: ChatCompletionToolParam = {"type": "function", "function": func_def}
+            tools_for_llm.append(tool_param)
+        except Exception as e:
+            log_error("onboarding_agent", fn_name, f"Schema error for onboarding tool {tool_name}: {e}", e)
 
-
-    # --- Interact with LLM (using same two-step logic as orchestrator) ---
+    # --- Interaction Loop (Two-Step LLM Call) ---
     try:
-        log_info(fn_name, "LLM_call_1", f"Invoking Onboarding LLM for {user_id}...") # Corrected log identifier
+        log_info("onboarding_agent", fn_name, f"Invoking Onboarding LLM for {user_id} (Initial Turn)...")
         response = client.chat.completions.create(
-            model="gpt-4o", # Or gpt-3.5-turbo
-            messages=messages,
-            tools=tools_for_llm if tools_for_llm else None,
+            model="gpt-4o", # Or a suitable model like gpt-3.5-turbo
+            messages=messages, # type: ignore
+            tools=tools_for_llm if tools_for_llm else None, # Pass None if no tools
             tool_choice="auto" if tools_for_llm else None,
-            temperature=0.1,
+            temperature=0.2, # Slightly higher temp for more natural onboarding
         )
         response_message = response.choices[0].message
         tool_calls = response_message.tool_calls
@@ -203,91 +189,91 @@ def handle_onboarding_request(
         # --- Scenario 1: LLM Responds Directly (Asks question, gives info) ---
         if not tool_calls:
             if response_message.content:
-                log_info(fn_name, "LLM_call_1", "Onboarding LLM responded directly.") # Corrected log identifier
+                log_info("onboarding_agent", fn_name, "Onboarding LLM responded directly.")
                 return response_message.content
             else:
-                log_warning(fn_name, "LLM_call_1", "Onboarding LLM response had no tool calls and no content.") # Corrected log identifier
-                return "Sorry, I got stuck. Can you tell me what we were discussing?"
+                log_warning("onboarding_agent", fn_name, "Onboarding LLM response had no tool calls and no content.")
+                return "I'm sorry, I'm having a little trouble at the moment. Could you try rephrasing?"
 
-        # --- Scenario 2: LLM Calls an Onboarding Tool ---
-        tool_call: ChatCompletionMessageToolCall = tool_calls[0]
-        tool_name = tool_call.function.name
-        tool_call_id = tool_call.id
+        # --- Scenario 2: LLM Calls One or More Onboarding Tools ---
+        # Onboarding agent typically calls one tool at a time.
+        log_info("onboarding_agent", fn_name, f"Onboarding LLM requested {len(tool_calls)} tool call(s).")
+        messages.append(response_message.model_dump(exclude_unset=True)) # Add assistant's tool call request
+        tool_results_messages = []
 
-        if tool_name not in onboarding_tools_available:
-            log_warning(fn_name, "tool_call_check", f"Onboarding LLM tried unknown/disallowed tool: {tool_name}") # Corrected log identifier
-            return f"Sorry, I tried an action ('{tool_name}') that isn't available during setup."
-
-        log_info(fn_name, "tool_call_exec", f"Onboarding LLM requested Tool: {tool_name} with args: {tool_call.function.arguments[:150]}...") # Corrected log identifier
-        tool_func = onboarding_tools_available[tool_name]
-        param_model = onboarding_tool_models[tool_name]
-        tool_result_content = GENERIC_ERROR_MSG
-
-        try:
-            # Parse and validate arguments
-            tool_args_dict = {}
+        for tool_call in tool_calls: # Loop although expecting one for onboarding
+            tool_name = tool_call.function.name
+            tool_call_id = tool_call.id
             tool_args_str = tool_call.function.arguments
-            if tool_args_str and tool_args_str.strip() != '{}': tool_args_dict = json.loads(tool_args_str)
-            elif not param_model.model_fields: tool_args_dict = {}
+            tool_result_content = GENERIC_ERROR_MSG # Default in case of error
 
-            validated_params = param_model(**tool_args_dict)
+            log_info("onboarding_agent", fn_name, f"Processing Tool Call ID: {tool_call_id}, Name: {tool_name}, Args: {tool_args_str[:150]}...")
 
-            # Execute the tool function
-            tool_result_dict = tool_func(user_id, validated_params)
-            log_info(fn_name, "tool_call_exec", f"Onboarding Tool {tool_name} executed. Result: {tool_result_dict}") # Corrected log identifier
-            tool_result_content = json.dumps(tool_result_dict)
+            if tool_name not in onboarding_tools_for_llm_map:
+                log_warning("onboarding_agent", fn_name, f"Onboarding LLM tried unknown/disallowed tool: {tool_name}. Sending error result back.")
+                tool_result_content = json.dumps({"success": False, "message": f"Error: Unknown action '{tool_name}' requested during setup."})
+            else:
+                tool_func = onboarding_tools_for_llm_map[tool_name]["function"]
+                param_model = onboarding_tools_for_llm_map[tool_name]["model"]
+                try:
+                    tool_args_dict = {}
+                    if tool_args_str and tool_args_str.strip() != '{}': tool_args_dict = json.loads(tool_args_str)
+                    elif not param_model.model_fields : tool_args_dict = {} # Handle no-arg tools
 
-        # Handle errors during tool execution
-        except json.JSONDecodeError:
-             log_error(fn_name, "tool_call_exec", f"Failed parse JSON args for onboarding tool {tool_name}: {tool_args_str}"); # Corrected log identifier
-             tool_result_content = json.dumps({"success": False, "message": f"Error: Invalid arguments for {tool_name}."})
-        except pydantic.ValidationError as e:
-             log_error(fn_name, "tool_call_exec", f"Arg validation failed for onboarding tool {tool_name}. Err: {e.errors()}. Args: {tool_args_str}", e) # Corrected log identifier
-             err_summary = "; ".join([f"{err['loc'][0] if err.get('loc') else 'param'}: {err['msg']}" for err in e.errors()])
-             tool_result_content = json.dumps({"success": False, "message": f"Error: Invalid parameters for {tool_name} - {err_summary}"})
-        except Exception as e:
-             log_error(fn_name, "tool_call_exec", f"Error executing onboarding tool {tool_name}. Trace:\n{traceback.format_exc()}", e); # Corrected log identifier
-             tool_result_content = json.dumps({"success": False, "message": f"Error performing action {tool_name}."})
+                    validated_params = param_model(**tool_args_dict)
+                    tool_result_dict = tool_func(user_id, validated_params) # Call the tool
+                    log_info("onboarding_agent", fn_name, f"Onboarding Tool {tool_name} (ID: {tool_call_id}) executed. Result: {tool_result_dict}")
+                    tool_result_content = json.dumps(tool_result_dict)
 
-        # --- Make SECOND LLM call with the tool result ---
-        # *** FIXED: Convert response_message object to dict before appending ***
-        # Append the assistant's first message (the tool call request) as a dict
-        messages.append(response_message.model_dump(exclude_unset=True))
-        # Append the tool execution result
-        messages.append({
-            "tool_call_id": tool_call_id, "role": "tool",
-            "name": tool_name, "content": tool_result_content,
-        })
+                except json.JSONDecodeError:
+                    log_error("onboarding_agent", fn_name, f"Failed parse JSON args for onboarding tool {tool_name} (ID: {tool_call_id}): {tool_args_str}");
+                    tool_result_content = json.dumps({"success": False, "message": f"Error: Invalid arguments format for {tool_name}."})
+                except pydantic.ValidationError as e:
+                    log_error("onboarding_agent", fn_name, f"Arg validation failed for onboarding tool {tool_name} (ID: {tool_call_id}). Err: {e.errors()}. Args: {tool_args_str}", e)
+                    err_summary = "; ".join([f"{err['loc'][0] if err.get('loc') else 'param'}: {err['msg']}" for err in e.errors()])
+                    tool_result_content = json.dumps({"success": False, "message": f"Error: Invalid parameters for {tool_name} - {err_summary}"})
+                except Exception as e:
+                    log_error("onboarding_agent", fn_name, f"Error executing onboarding tool {tool_name} (ID: {tool_call_id}). Trace:\n{traceback.format_exc()}", e);
+                    tool_result_content = json.dumps({"success": False, "message": f"Error performing action {tool_name}."})
 
-        log_info(fn_name, "LLM_call_2", f"Invoking Onboarding LLM again for {user_id} with tool result...") # Corrected log identifier
+            tool_results_messages.append({
+                "tool_call_id": tool_call_id, "role": "tool",
+                "name": tool_name, "content": tool_result_content,
+            })
+
+        messages.extend(tool_results_messages) # Add all tool results
+
+        # --- Make SECOND LLM call with ALL tool results ---
+        log_info("onboarding_agent", fn_name, f"Invoking Onboarding LLM again for {user_id} with {len(tool_results_messages)} tool result(s)...")
         second_response = client.chat.completions.create(
-            model="gpt-4o", messages=messages, # No tools needed here
+            model="gpt-4o", # Or gpt-3.5-turbo
+            messages=messages, # type: ignore
+            # No tools needed here, LLM should just generate response based on results
         )
         second_response_message = second_response.choices[0].message
 
         if second_response_message.content:
-            log_info(fn_name, "LLM_call_2", "Onboarding LLM generated final response after processing tool result.") # Corrected log identifier
-            # Check if the LAST action was setting status to active
-            if tool_name == "update_user_preferences":
+            log_info("onboarding_agent", fn_name, "Onboarding LLM generated final response after processing tool result(s).")
+            # Check if the LAST action was setting status to active (optional, LLM should handle the final message)
+            if tool_calls and tool_calls[-1].function.name == "update_user_preferences":
                  try:
-                      # Ensure tool_args_str is valid JSON before parsing
-                      update_data = json.loads(tool_args_str) if tool_args_str and tool_args_str.strip() != '{}' else {}
-                      # Check if the 'updates' dictionary exists and contains 'status'
+                      last_tool_args_str = tool_calls[-1].function.arguments
+                      update_data = json.loads(last_tool_args_str) if last_tool_args_str and last_tool_args_str.strip() != '{}' else {}
                       if isinstance(update_data.get("updates"), dict) and update_data["updates"].get("status") == "active":
-                           log_info(fn_name, "status_check", f"Onboarding completed for user {user_id} (status set to active).") # Corrected log identifier
+                           log_info("onboarding_agent", fn_name, f"Onboarding likely completed for user {user_id} (status set to active).")
                  except Exception as parse_err:
-                      log_warning(fn_name, "status_check", f"Could not parse tool args to check for status update: {parse_err}") # Corrected log identifier
-
+                      log_warning("onboarding_agent", fn_name, f"Could not parse last tool args to check for status update: {parse_err}")
             return second_response_message.content
         else:
-            log_warning(fn_name, "LLM_call_2", "Onboarding LLM provided no content after processing tool result.") # Corrected log identifier
-            try: fallback_msg = json.loads(tool_result_content).get("message", GENERIC_ERROR_MSG)
+            log_warning("onboarding_agent", fn_name, "Onboarding LLM provided no content after processing tool result(s).")
+            # Try to construct a fallback from the first tool's message if possible
+            try: fallback_msg = json.loads(tool_results_messages[0]['content']).get("message", GENERIC_ERROR_MSG)
             except: fallback_msg = GENERIC_ERROR_MSG
             return fallback_msg
 
     # --- Outer Exception Handling ---
     except Exception as e:
-        tb_str = traceback.format_exc();
-        log_error(fn_name, "outer_exception", f"Core error in onboarding logic for {user_id}. Traceback:\n{tb_str}", e) # Corrected log identifier
+        tb_str = traceback.format_exc()
+        log_error("onboarding_agent", fn_name, f"Core error in onboarding LLM logic for {user_id}. Traceback:\n{tb_str}", e)
         return GENERIC_ERROR_MSG
-# --- END OF FILE agents/onboarding_agent.py ---
+# --- END OF FULL agents/onboarding_agent.py ---

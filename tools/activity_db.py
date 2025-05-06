@@ -9,8 +9,9 @@ from typing import Dict, List, Any, Tuple # <--- ADD Dict, List, Any, Tuple HERE
 from tools.logger import log_info, log_error, log_warning
 
 # --- Configuration ---
+DATA_SUFFIX = os.getenv("DATA_SUFFIX", "")
 DB_DIR = "data"
-DB_FILE = os.path.join(DB_DIR, "whatstasker_activity.db")
+DB_FILE = os.path.join(DB_DIR, f"whatstasker_activity{DATA_SUFFIX}.db") # Dynamic DB file name
 DB_LOCK = threading.Lock() # Lock for thread-safe writes if needed later
 
 # --- Initialization ---

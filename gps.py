@@ -1,141 +1,131 @@
-# --- START OF UPDATED DUMP SCRIPT ---
-
+# gps.py - Generate Project Snapshot
 import os
+import sys
 from datetime import datetime
+from pathlib import Path
 
-# List of project files for v0.8 Orchestrator structure + Scheduler/Notifications
-project_files = [
-    # ================== DOCUMENTATION & SETUP ==================
-    "README.md",                    # Should be updated for v0.8
-    "WhatsTasker_PRD_08.txt",       # v0.8 Product Requirements
-    "WhatsTasker_SRS_08.txt",       # v0.8 Software Requirements/Architecture
-    "requirements.txt",             # Includes APScheduler now
-    "wa_bridge.js",                  # js cript to work with the WAweb
-    "monitor_whatstasker.sh",       #activation script
-    # ================== CONFIGURATION ==================
-    "config/prompts.yaml",          # Includes Orchestrator, Onboarding, Scheduler prompts
-    "config/messages.yaml",         # Includes welcome message and others
-    "config/settings.yaml",         # General app settings (if used)
-    # ".env",                       # Secrets - DO NOT DUMP/COMMIT
-
-    # ================== API & ENTRY POINT ==================
-    "main.py",                      # Main entry point (imports & starts scheduler)
-
-    # ================== BRIDGE ==================
-    "bridge/request_router.py",     # Handles routing based on status
-    "bridge/cli_interface.py",      # FastAPI endpoints for CLI bridge
-    "bridge/whatsapp_interface.py",      # FastAPI endpoints for CLI bridge
-
-    # ================== AGENT LAYER (v0.8) ==================
-    "agents/orchestrator_agent.py", # Main agent logic (pure LLM flow)
-    "agents/onboarding_agent.py",   # Handles 'onboarding' status
-    "agents/tool_definitions.py",   # Pydantic models & tool functions
-
-    # ================== SERVICES (Business Logic) ==================
-    "services/task_manager.py",     # Core task CRUD, GCal interaction, timestamp logic
-    "services/task_query_service.py",# Listing, context snapshot (needs formatting update later)
-    "services/config_manager.py",   # Preference management, calendar auth start, status setting
-    "services/agent_state_manager.py",# Core in-memory state management (with notification tracking)
-    "services/cheats.py",           # Handles cheat code commands
-    "services/llm_interface.py",    # Initializes Instructor-patched OpenAI client
-    # --- NEW/Updated Services ---
-    "services/scheduler_service.py", # NEW: Initializes APScheduler and jobs
-    "services/sync_service.py",     # UPDATED: Contains get_synced_context_snapshot
-    "services/notification_service.py", # NEW: Contains check_event_notifications logic
-    "services/routine_service.py",  # NEW: Contains check_routine_triggers & summary generation
-
-    # ================== TOOLS (Utilities & API Wrappers) ==================
-    "tools/google_calendar_api.py", # Wrapper for GCal API (with is_active, updated parsing)
-    "tools/calendar_tool.py",       # OAuth callback endpoint, core auth check
-    "tools/token_store.py",         # Encrypted token storage
-    "tools/encryption.py",          # Encryption utilities
-    "tools/logger.py",              # Logging setup
-    "tools/activity_db.py",         #new db file
-    # ================== USERS (State & Preferences) ==================
-    "users/user_manager.py",        # Initializes agent states (with notification set)
-    "users/user_registry.py",       # Persistent user preferences store (JSON - updated defaults)
-
-    # ================== DATA (Example - DO NOT DUMP SENSITIVE DATA) ==================
-    # "data/users/registry.json",       # Example structure, maybe exclude content
-    # "data/events_metadata.csv",       # Example structure, maybe exclude content
-    # "data/tokens_..."               # Exclude token files!
-
-    # ================== TESTS ==================
-    "tests/mock_sender.py",         # Simulates user input
-    # Add new tests for Agents, Tools, Services
+# --- Configuration ---
+# Files/folders to include in the dump relative to the script's location (project root)
+FILES_TO_DUMP = [
+    "README.md",
+    "WhatsTasker_PRD_08.txt",
+    "WhatsTasker_SRS_08.txt",
+    "requirements.txt",
+    "package.json", # Include package.json for Node dependencies
+    ".env.example", # Include example environment file
+    ".gitignore",   # Include gitignore configuration
+    "wa_bridge.js",
+    "monitor_whatstasker.sh",
+    "config/prompts.yaml",
+    "config/messages.yaml",
+    "config/settings.yaml", # Include even if empty
+    "main.py",
+    "bridge/request_router.py",
+    "bridge/cli_interface.py",
+    "bridge/whatsapp_interface.py",
+    "agents/orchestrator_agent.py",
+    "agents/onboarding_agent.py",
+    "agents/tool_definitions.py",
+    "services/task_manager.py",
+    "services/task_query_service.py",
+    "services/config_manager.py",
+    "services/agent_state_manager.py",
+    "services/cheats.py",
+    "services/llm_interface.py",
+    "services/scheduler_service.py",
+    "services/sync_service.py",
+    "services/notification_service.py",
+    "services/routine_service.py",
+    "tools/google_calendar_api.py",
+    "tools/calendar_tool.py",
+    "tools/token_store.py",
+    "tools/encryption.py",
+    "tools/logger.py",
+    "tools/activity_db.py",
+    "users/user_manager.py",
+    "users/user_registry.py",
+    "tests/mock_browser_chat.py",         # New browser chat app
+    "tests/templates/browser_chat.html",  # New browser chat HTML
+    "tests/test_smtp.py",                 # SMTP Test script
+    # --- Obsolete/Replaced ---
+    # "tests/mock_sender.py",     # Replaced by mock_browser_chat for UI
+    # "tests/simple_viewer.py",   # Replaced by mock_browser_chat
+    # "tests/mock_chat.py",       # Replaced by mock_browser_chat
+    # "tools/metadata_store.py", # Obsolete based on SRS
 ]
 
-def write_full_code_dump(output_filename="project_v0.8_dump.txt"):
-    """Creates a single text file containing the content of specified project files."""
-    dump_count = 0
-    missing_files = []
-    processed_files = set() # Use a set for faster checking
+# Output filename pattern
+OUTPUT_FILENAME_PATTERN = "project_v0.8_dump_{timestamp}.txt"
 
-    print(f"Starting project dump to '{output_filename}'...")
+# Separator
+SEPARATOR = "=" * 80
+# --- End Configuration ---
+
+def generate_dump(output_filename: str, files_to_include: list):
+    """Generates the project dump file."""
+    project_root = Path(__file__).parent # Assumes gps.py is in the project root
+    dump_content = []
+    timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Header for the dump file
+    dump_content.append(f"# WhatsTasker Project Code Dump (v0.8 Target - Browser Chat)")
+    dump_content.append(f"# Generated: {timestamp_str}")
+    dump_content.append("\n")
+
+    processed_files = 0
+    missing_files = []
+
+    for relative_path_str in files_to_include:
+        relative_path = Path(relative_path_str)
+        full_path = project_root / relative_path
+
+        if full_path.is_file():
+            try:
+                content = full_path.read_text(encoding='utf-8', errors='replace')
+                dump_content.append(SEPARATOR)
+                # Use platform-independent path separator for header
+                header_path = relative_path.as_posix()
+                dump_content.append(f"📄 {header_path}")
+                dump_content.append(SEPARATOR)
+                dump_content.append(f"\n# --- START OF FILE {header_path} ---\n")
+                dump_content.append(content)
+                dump_content.append(f"\n# --- END OF FILE {header_path} ---")
+                dump_content.append("\n\n")
+                processed_files += 1
+                print(f"✅ Included: {header_path}")
+            except Exception as e:
+                print(f"❌ Error reading {relative_path_str}: {e}")
+                missing_files.append(f"{relative_path_str} (Read Error: {e})")
+        else:
+            print(f"⚠️ File not found: {relative_path_str}")
+            missing_files.append(f"{relative_path_str} (Not Found)")
+
+    # --- Add Note about package-lock.json and node_modules ---
+    dump_content.append(SEPARATOR)
+    dump_content.append("📦 Node.js Dependencies Note")
+    dump_content.append(SEPARATOR)
+    dump_content.append("\n# The 'package.json' file lists Node.js dependencies.")
+    dump_content.append("# The 'package-lock.json' file (not included) locks specific versions.")
+    dump_content.append("# Run 'npm install' in the project root to install these dependencies (including whatsapp-web.js, axios, qrcode-terminal, dotenv, nodemailer).")
+    dump_content.append("# The 'node_modules/' directory containing the installed packages is NOT included in this dump.\n\n")
+    # ----------------------------------------------------------
 
     try:
-        with open(output_filename, "w", encoding="utf-8") as f_out:
-            f_out.write(f"# WhatsTasker Project Code Dump (v0.8 Architecture Target + Scheduler)\n") # Updated header
-            f_out.write(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-
-            for item_path_str in project_files:
-                item_path_str = item_path_str.strip()
-                if item_path_str.startswith("#"):
-                    # Write section headers for better structure
-                    if item_path_str.startswith("# ===") or item_path_str.startswith("# ---"):
-                         f_out.write(f"\n{item_path_str}\n\n")
-                    continue # Skip other comment lines
-
-                item_path = os.path.normpath(item_path_str)
-
-                if item_path in processed_files:
-                    continue
-                processed_files.add(item_path)
-
-                f_out.write("=" * 80 + "\n")
-                f_out.write(f"📄 {item_path}\n")
-                f_out.write("=" * 80 + "\n\n")
-
-                if os.path.exists(item_path):
-                    try:
-                        with open(item_path, "r", encoding="utf-8") as f_in:
-                            content = f_in.read()
-                            f_out.write(f"# --- START OF FILE {item_path} ---\n")
-                            f_out.write(content)
-                            f_out.write(f"\n# --- END OF FILE {item_path} ---\n")
-                        dump_count += 1
-                        print(f"  ✅ Dumped: {item_path}")
-                    except Exception as e:
-                        f_out.write(f"# ⚠️ Error reading file: {e}\n")
-                        print(f"  ❌ Error reading: {item_path} - {e}")
-                        missing_files.append(f"{item_path} (Read Error)")
-                else:
-                    f_out.write("# ⚠️ File does not exist.\n")
-                    print(f"  ⚠️ Missing: {item_path}")
-                    missing_files.append(f"{item_path} (Not Found)")
-
-                f_out.write("\n\n")
-
-        print("-" * 80)
-        print(f"📦 Project dump complete.")
-        actual_file_count = len([p for p in project_files if not p.strip().startswith('#')])
-        print(f"   Total files listed for dump: {actual_file_count}")
-        print(f"   Files successfully dumped: {dump_count}")
+        output_path = project_root / output_filename
+        output_path.write_text("\n".join(dump_content), encoding='utf-8')
+        print("-" * 30)
+        print(f"✅ Dump generated successfully: {output_filename}")
+        print(f"   Files included: {processed_files}")
         if missing_files:
-            print(f"   ⚠️ Missing or unreadable files ({len(missing_files)}):")
+            print(f"   ⚠️ Files skipped/missing: {len(missing_files)}")
             for missing in missing_files:
                 print(f"      - {missing}")
-        print(f"   Output written to: {output_filename}")
-        print("-" * 80)
-
-    except IOError as e:
-        print(f"\n❌ ERROR: Could not write to output file '{output_filename}': {e}")
     except Exception as e:
-        print(f"\n❌ ERROR: An unexpected error occurred during dump: {e}")
-
+        print("-" * 30)
+        print(f"❌ Error writing dump file {output_filename}: {e}")
 
 if __name__ == "__main__":
-    # Update output filename if desired
-    write_full_code_dump(output_filename="project_v0.8_dump.txt")
-
-# --- END OF UPDATED DUMP SCRIPT ---
+    # Format the timestamp for the filename
+    timestamp_file_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = OUTPUT_FILENAME_PATTERN.format(timestamp=timestamp_file_str)
+    generate_dump(output_file, FILES_TO_DUMP)

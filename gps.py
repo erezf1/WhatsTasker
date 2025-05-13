@@ -16,6 +16,8 @@ FILES_TO_DUMP = [
     ".gitignore",   # Include gitignore configuration
     "wa_bridge.js",
     "monitor_whatstasker.sh",
+    "stop_whatstasker.sh",
+    "gps.py",
     "config/prompts.yaml",
     "config/messages.yaml",
     "config/settings.yaml", # Include even if empty

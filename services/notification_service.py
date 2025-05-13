@@ -23,7 +23,7 @@ except ImportError:
     log_error("notification_service", "import", "Failed to import activity_db.update_task_fields")
 # --- End Imports ---
 
-NOTIFICATION_CHECK_INTERVAL_MINUTES = 5
+NOTIFICATION_CHECK_INTERVAL_MINUTES = 60
 DEFAULT_NOTIFICATION_LEAD_TIME_MINUTES = 15
 
 def generate_event_notification_message(event_data, user_timezone_str="UTC"):
@@ -61,7 +61,7 @@ def check_event_notifications():
     Updates 'internal_reminder_sent' in the database for notified WT items.
     """
     fn_name = "check_event_notifications"
-    log_info("notification_service", fn_name, "Running scheduled check for event notifications...")
+    #log_info("notification_service", fn_name, "Running scheduled check for event notifications...")
     now_utc = datetime.now(timezone.utc)
 
     # --- Outermost Try ---
@@ -72,7 +72,7 @@ def check_event_notifications():
             return
 
         user_ids = list(registry.keys())
-        log_info("notification_service", fn_name, f"Checking notifications for {len(user_ids)} users.")
+        #log_info("notification_service", fn_name, f"Checking notifications for {len(user_ids)} users.")
 
         for user_id in user_ids:
             prefs = None

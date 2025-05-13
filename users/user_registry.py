@@ -16,10 +16,10 @@ DEFAULT_PREFERENCES = {
     "Work_Start_Time": None, # REQUIRED during onboarding (HH:MM)
     "Work_End_Time": None,   # REQUIRED during onboarding (HH:MM)
     "Work_Days": ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday"], # Default, modifiable
-    "Working_Session_Length": None, # REQUIRED during onboarding (e.g., "60m", "1.5h")
+    "Working_Session_Length": "60", # REQUIRED during onboarding (e.g., "60m", "1.5h")
     # Routine Preferences
-    "Morning_Summary_Time": None , # User local time (HH:MM), default None
-    "Evening_Summary_Time": None , # User local time (HH:MM), default None
+    "Morning_Summary_Time": "09:00" , # User local time (HH:MM), default None
+    "Evening_Summary_Time": "18:00" , # User local time (HH:MM), default None
     "Enable_Morning": True, # Default enabled if time is set
     "Enable_Evening": True, # Default enabled if time is set
     "Enable_Weekly_Reflection": False, # Future use

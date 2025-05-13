@@ -417,7 +417,7 @@ class GoogleCalendarAPI:
             # Use UTC 'Z' for timeMin/timeMax as recommended by Google API
             time_min = start_dt.isoformat() + "Z"
             time_max = end_dt_exclusive.isoformat() + "Z"
-            log_info("GoogleCalendarAPI", fn_name, f"Listing GCal events for user {self.user_id} from {time_min} to {time_max}")
+            #log_info("GoogleCalendarAPI", fn_name, f"Listing GCal events for user {self.user_id} from {time_min} to {time_max}")
         except ValueError as date_err:
             log_error("GoogleCalendarAPI", fn_name, f"Invalid date format for listing events: {start_date} / {end_date}", date_err)
             return [] # Return empty list on bad date format

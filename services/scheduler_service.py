@@ -13,8 +13,8 @@ from bridge.request_router import send_message
 # ... (Global scheduler instance, constants, _job_listener) ...
 scheduler = None
 DEFAULT_TIMEZONE = 'UTC'
-NOTIFICATION_CHECK_INTERVAL_MINUTES = 5
-ROUTINE_CHECK_INTERVAL_MINUTES = 15
+NOTIFICATION_CHECK_INTERVAL_MINUTES = 60
+ROUTINE_CHECK_INTERVAL_MINUTES = 60
 DAILY_CLEANUP_HOUR_UTC = 0
 DAILY_CLEANUP_MINUTE_UTC = 5
 
@@ -32,7 +32,7 @@ def _job_listener(event):
 def _run_routine_check_and_send():
     """Wrapper function called by scheduler to run checks and send messages."""
     fn_name = "_run_routine_check_and_send"
-    log_info("scheduler_service", fn_name, "Scheduler executing routine check job...")
+    #log_info("scheduler_service", fn_name, "Scheduler executing routine check job...")
     try:
         # Import the check function here if not already imported globally
         from services.routine_service import check_routine_triggers

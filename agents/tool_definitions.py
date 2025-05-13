@@ -188,12 +188,15 @@ class CreateToDoParams(BaseModel):
     description: str = Field(...)
     date: Optional[str] = Field(None, description="Optional: Due date for the ToDo.")
     project: Optional[str] = Field(None)
+    estimated_duration: Optional[str] = Field(None, description="Optional: Estimated duration for the ToDo (e.g., '1h', '30m'). For user reference only.") # <-- ADDED
     @field_validator('date')
     @classmethod
     def validate_date_format(cls, v: Optional[str]):
         if v is None: return None
         try: datetime.strptime(v, '%Y-%m-%d'); return v
         except (ValueError, TypeError): raise ValueError("Date must be in YYYY-MM-DD format")
+    # No specific validator needed for estimated_duration here, general string is fine.
+    # The LLM will be instructed to provide it in a parseable format if it gets one.
 # --- END NEW MODEL ---
 
 class ProposeTaskSlotsParams(BaseModel):

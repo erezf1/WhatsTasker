@@ -128,7 +128,7 @@ def send_message(user_id: str, message: str):
     # else: DB logging disabled or failed import
 
     # 3. Send via Bridge
-    log_info("request_router", fn_name, f"Queuing OUT message for {user_id}: '{message[:100]}...'")
+    log_info("request_router", fn_name, f"Queuing OUT message for {user_id}: '{message[:150]}...'")
     if current_bridge:
         try:
             # The bridge's send_message method handles formatting (like adding @c.us)

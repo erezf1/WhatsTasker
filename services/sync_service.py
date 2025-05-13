@@ -63,7 +63,7 @@ def get_synced_context_snapshot(user_id: str, start_date_str: str, end_date_str:
     Does not persist external events found only in GCal into the tasks table.
     """
     fn_name = "get_synced_context_snapshot"
-    log_info("sync_service", fn_name, f"Generating synced context for user {user_id}, range: {start_date_str} to {end_date_str}")
+    #log_info("sync_service", fn_name, f"Generating synced context for user {user_id}, range: {start_date_str} to {end_date_str}")
 
     if not DB_IMPORTED:
         log_error("sync_service", fn_name, "Database module not available.", user_id=user_id)
@@ -82,7 +82,7 @@ def get_synced_context_snapshot(user_id: str, start_date_str: str, end_date_str:
     gcal_events_list = []
     if calendar_api:
         try:
-            log_info("sync_service", fn_name, f"Fetching GCal events for {user_id}...")
+            #log_info("sync_service", fn_name, f"Fetching GCal events for {user_id}...")
             # list_events returns parsed dicts including 'event_id', 'gcal_start_datetime' etc.
             gcal_events_list = calendar_api.list_events(start_date_str, end_date_str)
             log_info("sync_service", fn_name, f"Fetched {len(gcal_events_list)} GCal events for {user_id}.")
@@ -95,7 +95,7 @@ def get_synced_context_snapshot(user_id: str, start_date_str: str, end_date_str:
     # 3. Fetch WT Tasks from Database within the same date range
     wt_tasks_list = []
     try:
-        log_info("sync_service", fn_name, f"Fetching WT tasks from DB for {user_id}...")
+        #log_info("sync_service", fn_name, f"Fetching WT tasks from DB for {user_id}...")
         # Fetch tasks based on the 'date' column matching the range
         # We don't filter by status here; we want all potentially relevant WT items
         wt_tasks_list = activity_db.list_tasks_for_user(
@@ -198,7 +198,7 @@ def get_synced_context_snapshot(user_id: str, start_date_str: str, end_date_str:
                  except: task_data["session_event_ids"] = []
             aggregated_context_list.append(task_data) # Add the DB data as is
 
-    log_info("sync_service", fn_name, f"Generated aggregated context with {len(aggregated_context_list)} items for {user_id}.")
+    #log_info("sync_service", fn_name, f"Generated aggregated context with {len(aggregated_context_list)} items for {user_id}.")
     # Sort the final aggregated list before returning? Good for routines.
     sorted_aggregated_context = _sort_tasks(aggregated_context_list) # Use the existing sort helper
     return sorted_aggregated_context

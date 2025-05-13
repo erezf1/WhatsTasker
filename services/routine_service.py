@@ -19,7 +19,21 @@ from services.agent_state_manager import clear_notified_event_ids, get_agent_sta
 # Define time window for fetching context for routines
 ROUTINE_CONTEXT_HISTORY_DAYS = 1
 ROUTINE_CONTEXT_FUTURE_DAYS = 14 # Check tasks/events up to 2 weeks ahead for context
-
+_ROUTINE_AGENT_STATE_IMPORTED = False
+_clear_notified_func = None
+_get_agent_state_func = None
+try:
+    from services.agent_state_manager import clear_notified_event_ids, get_agent_state
+    _clear_notified_func = clear_notified_event_ids
+    _get_agent_state_func = get_agent_state
+    _ROUTINE_AGENT_STATE_IMPORTED = True
+except ImportError:
+    log_error("routine_service", "import", "AgentStateManager not found. Daily cleanup of notified_event_ids will be skipped.")
+    # Define dummy functions to prevent crashes if called
+    def _dummy_clear_notified(*args, **kwargs): pass
+    def _dummy_get_agent_state(*args, **kwargs): return None
+    _clear_notified_func = _dummy_clear_notified
+    _get_agent_state_func = _dummy_get_agent_state
 # --- Time Formatting Helpers ---
 
 def _get_local_time(user_timezone_str: str) -> datetime:
@@ -322,7 +336,7 @@ def check_routine_triggers() -> List[Tuple[str, str]]:
     """
     # (No changes needed in this function's logic)
     fn_name = "check_routine_triggers"
-    log_info("routine_service", fn_name, "Running scheduled check for routine triggers...")
+    #log_info("routine_service", fn_name, "Running scheduled check for routine triggers...")
     messages_to_send: List[Tuple[str, str]] = []
 
     try:
@@ -408,7 +422,6 @@ def check_routine_triggers() -> List[Tuple[str, str]]:
 
 def daily_cleanup():
     """Scheduled job to perform daily cleanup tasks (e.g., reset notification tracker)."""
-    # (No changes needed)
     fn_name = "daily_cleanup"
     log_info("routine_service", fn_name, "Running daily cleanup job...")
 
@@ -423,10 +436,19 @@ def daily_cleanup():
         cleared_count = 0
         for user_id in user_ids:
             try:
-                if AGENT_STATE_IMPORTED:
+               
+                # Then in daily_cleanup:
+                if _ROUTINE_AGENT_STATE_IMPORTED: # Use the distinct name
                     if get_agent_state(user_id):
                        clear_notified_event_ids(user_id)
                        cleared_count += 1
+                else:
+                    # This branch means the import at the top of routine_service.py failed
+                    log_warning("routine_service", fn_name, f"AgentStateManager functions not available for user {user_id} during daily cleanup (import failed).")
+
+            except NameError as ne:
+                # This means _ROUTINE_AGENT_STATE_IMPORTED itself wasn't found, which is odd.
+                log_error("routine_service", fn_name, f"Critical NameError for _ROUTINE_AGENT_STATE_IMPORTED during daily cleanup for user {user_id}. This indicates a fundamental module loading issue.", ne)
             except Exception as e:
                  log_error("routine_service", fn_name, f"Error during daily cleanup for user {user_id}", e)
 

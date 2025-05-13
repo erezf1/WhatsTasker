@@ -8,6 +8,7 @@ Updates DB records for WT items if GCal data has changed for that item.
 import traceback
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any
+import json # Added for ensuring session_event_ids is list
 
 # Central logger
 from tools.logger import log_info, log_error, log_warning
@@ -19,13 +20,13 @@ try:
 except ImportError:
     log_error("sync_service", "import", "activity_db not found. Sync service disabled.", None)
     DB_IMPORTED = False
-    # Dummy DB functions
     class activity_db:
         @staticmethod
         def list_tasks_for_user(*args, **kwargs): return []
         @staticmethod
         def add_or_update_task(*args, **kwargs): return False
-# --- End DB Import ---
+        @staticmethod
+        def get_task(*args, **kwargs): return None # Added for retry logic
 
 # User Manager (to get agent state for Calendar API)
 try:
@@ -43,16 +44,89 @@ try:
 except ImportError:
     log_error("sync_service", "import", "Failed to import agent_state_manager functions.")
     AGENT_STATE_IMPORTED = False
-    def update_task_in_context(*args, **kwargs): pass # Dummy
+    def update_task_in_context(*args, **kwargs): pass
 
 # Google Calendar API (for type checking and fetching events)
 try:
-    from tools.google_calendar_api import GoogleCalendarAPI
+    from tools.google_calendar_api import GoogleCalendarAPI, HttpError # <-- Import HttpError
+    # Import other specific exceptions if needed, e.g., from httplib2 or ssl
+    # from httplib2 import ServerNotFoundError # Example
+    # import ssl # Example
     GCAL_API_IMPORTED = True
 except ImportError:
     log_warning("sync_service", "import", "GoogleCalendarAPI not found. Sync will only show DB tasks.")
     GoogleCalendarAPI = None
+    HttpError = Exception # Fallback
     GCAL_API_IMPORTED = False
+
+# --- Tenacity for Retries ---
+try:
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+    TENACITY_IMPORTED = True
+except ImportError:
+    log_warning("sync_service", "import", "Tenacity library not found. GCal fetch retries will be disabled.")
+    TENACITY_IMPORTED = False
+    # Dummy decorator if tenacity is not available
+    def retry(*args, **kwargs):
+        def decorator(func):
+            def wrapper(*f_args, **f_kwargs):
+                return func(*f_args, **f_kwargs)
+            return wrapper
+        return decorator
+    # Dummy exception types for the decorator
+    class ServerNotFoundError(Exception): pass # Dummy
+    class SSLError(Exception): pass # Dummy
+    # HttpError is already defined as Exception if google libs fail
+
+# --- Retryable Exceptions for GCal ---
+# Define a tuple of exceptions that should trigger a retry
+# This might need adjustment based on the exact exceptions seen from google-api-python-client
+# and its underlying httplib2 or requests library.
+GCAL_RETRYABLE_EXCEPTIONS = (
+    HttpError, # General Google API HTTP errors (check status codes if needed)
+    TimeoutError, # Standard Python Timeout
+    # ServerNotFoundError, # If using httplib2 directly and importing its specific error
+    # ssl.SSLError, # If SSL errors are common and potentially transient
+    ConnectionResetError, # Can be transient
+    ConnectionAbortedError, # Can be transient
+    # Add other transient network-related exceptions here
+)
+if 'RemoteDisconnected' in __builtins__: # http.client.RemoteDisconnected
+    GCAL_RETRYABLE_EXCEPTIONS += (getattr(__builtins__, 'RemoteDisconnected'),)
+elif 'http' in globals() and 'client' in dir(globals()['http']) and 'RemoteDisconnected' in dir(globals()['http'].client):
+    GCAL_RETRYABLE_EXCEPTIONS += (globals()['http'].client.RemoteDisconnected,)
+
+
+# --- Retry-enabled GCal Fetch ---
+if TENACITY_IMPORTED:
+    @retry(
+        stop=stop_after_attempt(3), # Try up to 3 times
+        wait=wait_exponential(multiplier=1, min=2, max=10), # Exponential backoff: 2s, 4s, 8s... max 10s
+        retry=retry_if_exception_type(GCAL_RETRYABLE_EXCEPTIONS),
+        reraise=False # If all retries fail, log error and return default (empty list)
+    )
+    def _fetch_gcal_events_with_retry(calendar_api_instance: GoogleCalendarAPI, start_date_str: str, end_date_str: str, user_id_for_log: str) -> List[Dict]:
+        fn_name = "_fetch_gcal_events_with_retry"
+        # Log attempt number if tenacity context is available (optional)
+        # current_attempt = getattr(retry_state, 'attempt_number', 1) if 'retry_state' in locals() else 1
+        # log_info("sync_service", fn_name, f"Attempting GCal event fetch (try if tenacity available) for user {user_id_for_log}")
+        if calendar_api_instance:
+            return calendar_api_instance.list_events(start_date_str, end_date_str)
+        return []
+else: # Fallback if tenacity is not installed
+    def _fetch_gcal_events_with_retry(calendar_api_instance: GoogleCalendarAPI, start_date_str: str, end_date_str: str, user_id_for_log: str) -> List[Dict]:
+        fn_name = "_fetch_gcal_events_with_retry_no_tenacity"
+        log_info("sync_service", fn_name, f"Attempting GCal event fetch (no tenacity retry) for user {user_id_for_log}")
+        if calendar_api_instance:
+            try:
+                return calendar_api_instance.list_events(start_date_str, end_date_str)
+            except GCAL_RETRYABLE_EXCEPTIONS as e: # Catch the same exceptions tenacity would
+                log_error("sync_service", fn_name, f"GCal fetch failed (no retry) for {user_id_for_log}", e, user_id=user_id_for_log)
+                return [] # Return empty on error
+            except Exception as e: # Catch any other unexpected error
+                log_error("sync_service", fn_name, f"Unexpected GCal fetch error (no retry) for {user_id_for_log}", e, user_id=user_id_for_log)
+                return []
+        return []
 
 
 def get_synced_context_snapshot(user_id: str, start_date_str: str, end_date_str: str) -> List[Dict]:
@@ -69,7 +143,6 @@ def get_synced_context_snapshot(user_id: str, start_date_str: str, end_date_str:
         log_error("sync_service", fn_name, "Database module not available.", user_id=user_id)
         return []
 
-    # 1. Get Calendar API instance
     calendar_api = None
     if USER_MANAGER_IMPORTED and GCAL_API_IMPORTED and GoogleCalendarAPI is not None:
         agent_state = get_agent(user_id)
@@ -78,153 +151,100 @@ def get_synced_context_snapshot(user_id: str, start_date_str: str, end_date_str:
             if isinstance(calendar_api_maybe, GoogleCalendarAPI) and calendar_api_maybe.is_active():
                 calendar_api = calendar_api_maybe
 
-    # 2. Fetch GCal Events if API is available
     gcal_events_list = []
     if calendar_api:
         try:
-            #log_info("sync_service", fn_name, f"Fetching GCal events for {user_id}...")
-            # list_events returns parsed dicts including 'event_id', 'gcal_start_datetime' etc.
-            gcal_events_list = calendar_api.list_events(start_date_str, end_date_str)
-            log_info("sync_service", fn_name, f"Fetched {len(gcal_events_list)} GCal events for {user_id}.")
-        except Exception as e:
-            log_error("sync_service", fn_name, f"Error fetching GCal events for {user_id}", e, user_id=user_id)
-            # Continue without GCal events
+            # --- USE THE RETRY-ENABLED FETCH FUNCTION ---
+            gcal_events_list = _fetch_gcal_events_with_retry(calendar_api, start_date_str, end_date_str, user_id)
+            # --------------------------------------------
+            log_info("sync_service", fn_name, f"Fetched {len(gcal_events_list)} GCal events for {user_id} (after retries if any).")
+        except Exception as e: # This catch is if _fetch_gcal_events_with_retry has reraise=True or unforeseen error
+            log_error("sync_service", fn_name, f"Final unhandled error fetching GCal events for {user_id}", e, user_id=user_id)
+            # Continue without GCal events if fetch ultimately fails
     else:
         log_info("sync_service", fn_name, f"GCal API not available or inactive for {user_id}, skipping GCal fetch.")
 
-    # 3. Fetch WT Tasks from Database within the same date range
     wt_tasks_list = []
     try:
-        #log_info("sync_service", fn_name, f"Fetching WT tasks from DB for {user_id}...")
-        # Fetch tasks based on the 'date' column matching the range
-        # We don't filter by status here; we want all potentially relevant WT items
         wt_tasks_list = activity_db.list_tasks_for_user(
             user_id=user_id,
             date_range=(start_date_str, end_date_str)
-            # status_filter=None # Get all statuses within the date range
         )
         log_info("sync_service", fn_name, f"Fetched {len(wt_tasks_list)} WT tasks from DB for {user_id} in range.")
     except Exception as e:
         log_error("sync_service", fn_name, f"Error fetching WT tasks from DB for {user_id}", e, user_id=user_id)
-        # If DB fails, should we proceed with only GCal events? Or return empty?
-        # Let's return only GCal events if DB fails, but log error clearly.
-        # Fall through, wt_tasks_list will be empty.
 
-    # 4. Create Maps for Efficient Lookup
     gcal_events_map = {e['event_id']: e for e in gcal_events_list if e.get('event_id')}
     wt_tasks_map = {t['event_id']: t for t in wt_tasks_list if t.get('event_id')}
 
-    # 5. Merge & Identify Types
     aggregated_context_list: List[Dict[str, Any]] = []
-    processed_wt_ids = set() # Keep track of WT items found in GCal map
+    processed_wt_ids = set()
 
-    # Iterate through GCal events first
     for event_id, gcal_data in gcal_events_map.items():
         if event_id in wt_tasks_map:
-            # --- WT Item Found in GCal ---
             processed_wt_ids.add(event_id)
-            task_data = wt_tasks_map[event_id] # The task data from our DB
-            merged_data = task_data.copy() # Start with DB data
+            task_data = wt_tasks_map[event_id]
+            merged_data = task_data.copy()
             needs_db_update = False
 
-            # Check for differences that require updating our DB record
             gcal_start = gcal_data.get("gcal_start_datetime")
             gcal_end = gcal_data.get("gcal_end_datetime")
             gcal_title = gcal_data.get("title")
             gcal_desc = gcal_data.get("description")
-            # Add GCal status if needed: gcal_status = gcal_data.get("status_gcal")
 
-            # Update stored GCal times if they differ
             if gcal_start != merged_data.get("gcal_start_datetime"):
                 merged_data["gcal_start_datetime"] = gcal_start
                 needs_db_update = True
             if gcal_end != merged_data.get("gcal_end_datetime"):
                 merged_data["gcal_end_datetime"] = gcal_end
                 needs_db_update = True
-
-            # Option 1: Always update title/desc from GCal if GCal link exists?
-            # Option 2: Only update if DB fields are empty/default? (Safer)
-            # Let's go with Option 2 for now to avoid overwriting user edits in WT potentially.
             if gcal_title and not merged_data.get("title", "").strip():
                  merged_data["title"] = gcal_title
                  needs_db_update = True
             if gcal_desc and not merged_data.get("description", "").strip():
                  merged_data["description"] = gcal_desc
                  needs_db_update = True
-            # Potentially sync status? If GCal event is 'cancelled', should WT task be? Complex rule. Skip for now.
 
-            # If the merged data differs from original DB data, update DB
             if needs_db_update:
                 log_info("sync_service", fn_name, f"GCal data changed for WT item {event_id}. Updating DB.")
                 try:
-                    # add_or_update_task expects list for session IDs
-                    if isinstance(merged_data.get("session_event_ids"), str): # Ensure it's list before saving
+                    if isinstance(merged_data.get("session_event_ids"), str):
                         try: merged_data["session_event_ids"] = json.loads(merged_data["session_event_ids"])
                         except: merged_data["session_event_ids"] = []
 
                     update_success = activity_db.add_or_update_task(merged_data)
                     if update_success and AGENT_STATE_IMPORTED:
-                        # Update in-memory context as well
-                        updated_data_from_db = activity_db.get_task(event_id) # Re-fetch to get latest state
+                        updated_data_from_db = activity_db.get_task(event_id)
                         if updated_data_from_db: update_task_in_context(user_id, event_id, updated_data_from_db)
                     elif not update_success:
                          log_error("sync_service", fn_name, f"Failed DB update for WT item {event_id} after GCal merge.", user_id=user_id)
-
                 except Exception as save_err:
-                     log_error("sync_service", fn_name, f"Unexpected error saving updated metadata for WT item {event_id} after GCal merge.", save_err, user_id=user_id)
-
-            # Add the (potentially updated) merged data to the context list
+                     log_error("sync_service", fn_name, f"Unexpected error saving updated metadata for WT item {event_id}", save_err, user_id=user_id)
             aggregated_context_list.append(merged_data)
-
         else:
-            # --- External GCal Event (Not in our DB) ---
-            external_event_data = gcal_data.copy() # Start with GCal data
-            external_event_data["type"] = "external_event" # Mark its type
-            external_event_data["user_id"] = user_id # Ensure user_id is present
-            # Ensure required fields for formatting have some value?
-            external_event_data.setdefault("status", None) # External events don't have WT status
+            external_event_data = gcal_data.copy()
+            external_event_data["type"] = "external_event"
+            external_event_data["user_id"] = user_id
+            external_event_data.setdefault("status", None)
             aggregated_context_list.append(external_event_data)
 
-    # 6. Add WT Tasks Not Found in GCal Fetch Window
     for event_id, task_data in wt_tasks_map.items():
         if event_id not in processed_wt_ids:
-            # This is a WT item (task/reminder) that wasn't in the GCal list for this window.
-            # Could be a local-only task, or GCal event outside window, or deleted from GCal.
-            # We still want it in the context if it's relevant (e.g., active status).
-            log_info("sync_service", fn_name, f"Including WT item {event_id} (status: {task_data.get('status')}) which was not found in GCal fetch window.")
-            # Make sure session IDs are list (should be from DB layer)
+            #log_info("sync_service", fn_name, f"Including WT item {event_id} (status: {task_data.get('status')}) not in GCal window.")
             if isinstance(task_data.get("session_event_ids"), str):
                  try: task_data["session_event_ids"] = json.loads(task_data["session_event_ids"])
                  except: task_data["session_event_ids"] = []
-            aggregated_context_list.append(task_data) # Add the DB data as is
+            aggregated_context_list.append(task_data)
 
-    #log_info("sync_service", fn_name, f"Generated aggregated context with {len(aggregated_context_list)} items for {user_id}.")
-    # Sort the final aggregated list before returning? Good for routines.
-    sorted_aggregated_context = _sort_tasks(aggregated_context_list) # Use the existing sort helper
+    sorted_aggregated_context = _sort_tasks(aggregated_context_list)
     return sorted_aggregated_context
 
-# --- Placeholder for future full sync ---
 def perform_full_sync(user_id: str):
-    """(NOT IMPLEMENTED) Placeholder for a more complex two-way sync."""
     log_warning("sync_service", "perform_full_sync", f"Full two-way sync not implemented. User: {user_id}")
-    # This would involve:
-    # 1. Fetching *all* relevant GCal events (wider date range? or use sync tokens?)
-    # 2. Fetching *all* non-cancelled WT tasks from DB.
-    # 3. Complex diffing logic to identify:
-    #    - New GCal events -> Create corresponding 'external_event' metadata in DB? (Optional)
-    #    - New WT tasks -> Create in GCal? (Maybe only if scheduled?)
-    #    - Updated GCal events -> Update corresponding WT task metadata in DB.
-    #    - Updated WT tasks -> Update corresponding GCal event? (Be careful!)
-    #    - Deleted GCal events -> Update status or delete WT task metadata?
-    #    - Deleted WT tasks (marked cancelled) -> Delete GCal event?
-    # 4. Handling conflicts gracefully.
-    # 5. Updating last_sync timestamp in user preferences.
     pass
 
-# Helper from task_query_service might be needed here if not importing that module
 def _sort_tasks(task_list: List[Dict]) -> List[Dict]:
-    """Sorts task list robustly by date/time."""
-    fn_name = "_sort_tasks_sync" # Different name to avoid potential conflicts if imported elsewhere
+    fn_name = "_sort_tasks_sync"
     def sort_key(item):
         gcal_start = item.get("gcal_start_datetime")
         if gcal_start and isinstance(gcal_start, str):
@@ -247,6 +267,4 @@ def _sort_tasks(task_list: List[Dict]) -> List[Dict]:
     except Exception as e:
         log_error("sync_service", fn_name, f"Error during task sorting: {e}", e)
         return task_list
-
-
 # --- END OF REFACTORED services/sync_service.py ---

@@ -101,3 +101,4 @@ mkdir: cannot create directory ‘/home/WhatsTasker’: Permission denied
 ./monitor_whatstasker.sh: line 22: /home/WhatsTasker/logs/monitor.log: No such file or directory
 ./monitor_whatstasker.sh: line 29: /home/WhatsTasker/venv/bin/activate: No such file or directory
 ./monitor_whatstasker.sh: line 22: /home/WhatsTasker/logs/monitor.log: No such file or directory
+Terminated

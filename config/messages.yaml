@@ -11,19 +11,81 @@ welcome_confirmation_message: |
   ⏱️ Schedule focused work sessions.
   ☀️ Get daily check-ins & reviews (soon!).
 
-  Unlock your productivity! Ready to start? (yes/no)
+  Unlock your productivity! Ready to start?
 
   ---
   שלום! 👋 ברוך הבא ל-WhatsTasker!
-  מוכן/ה לנהל את הזמן שלך כמו מקצוען/ית?
+  רוצה לנהל את הזמן שלך כמו מקצוען?
 
-  אני יכול/ה לעזור לך:
-  🧠 להוסיף משימות ותזכורות מיידית.
+  אני יכול לעזור לך:
+  🧠 לנהל רשימות של משימות ותזכורות.
   📅 להסתנכרן עם יומן גוגל שלך.
-  ⏱️ לקבוע זמני עבודה ביומן שלך כדי להבטיח שתשלים את המשימות שלך.
+  ⏱️ לקבוע זמני עבודה ביומן שלך כדי להבטיח שתשלים את המשימות שלך בזמן
   ☀️ לעזור לך לעקוב אחרי ביצוע המשימות.
 
-  שחרר/י את הפרודוקטיביות שלך! מוכן/ה להתחיל? (כן/לא)
+  רוצה להתחיל?
+
+# config/messages.yaml
+
+# ... (keep existing messages) ...
+
+onboarding_completion_message:
+  en: |
+    You're all set! 🎉
+
+    Welcome to WhatsTasker – your smart assistant for getting things done!
+
+    Here’s what I can help with:
+
+    ✍️ ToDos: Quick things to remember – just say “add todo buy milk”.
+
+    ⏰ Reminders: For specific times – like “remind me to call Alex tomorrow at 2 PM”.
+
+    📅 Tasks: Bigger things that need focus – if your calendar is connected, I’ll help you schedule time for them.
+
+    You can also ask me to:
+
+    Show or update your items
+
+    Mark things done
+
+    Reschedule tasks
+
+    Adjust your settings (like hours or language)
+
+    Just talk to me naturally – for example:
+    “schedule a task to write blog post for 2 hours next week”.
+
+    👉 Ready to start?
+
+
+  he: |
+   מעולה, סיימנו! 🎉
+
+    ברוך הבא ל-WhatsTasker – העוזר החכם שלך לניהול משימות וזמן!
+
+    הנה איך אני יכול לעזור לך:
+
+    📝 מטלות: דברים קטנים לזכור – למשל "הוסף מטלה לקנות חלב".
+
+    ⏰ תזכורות: לזמנים מדויקים – כמו "תזכיר לי להתקשר לאלכס מחר ב-14:00".
+
+    📅 משימות: דברים שדורשים זמן ומיקוד – אם חיברת יומן, אני אעזור לך לקבוע זמן לביצוע.
+
+    אתה גם יכול לבקש:
+
+    להציג או לעדכן פריטים
+
+    לסמן כהושלמו
+
+    לתזמן מחדש
+
+    לשנות הגדרות כמו שפה או שעות עבודה
+
+    פשוט דבר איתי טבעי – למשל:
+    "תקבע משימה לכתוב פוסט לבלוג לשעתיים בשבוע הבא".
+
+    👉 אז מה בא לך לעשות עכשיו?
 
 setup_starting_message: "Great! Let's set things up. I'll ask a few questions to configure your preferences."
 setup_declined_message: "Okay, no problem. Just message me again whenever you're ready to set things up!"

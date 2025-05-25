@@ -1,285 +1,334 @@
 # --- START OF FULL agents/tool_definitions.py ---
 
 from pydantic import BaseModel, Field, field_validator, ValidationError
-from typing import Dict, List, Any, Tuple, Optional # Keep Optional for Pydantic models
+from typing import Dict, List, Any, Tuple, TYPE_CHECKING
 import json
-from datetime import datetime, timedelta, timezone # Added timezone
+from datetime import datetime, timezone, timedelta # Added timedelta
 import re
-import uuid # Added uuid
 import traceback
+import os # For path joining for prompts
+import yaml # For loading prompts
+import pytz # For timezone handling
+
 # Import Service Layer functions & Helpers
 import services.task_manager as task_manager
 import services.config_manager as config_manager
 import services.task_query_service as task_query_service
-from services.agent_state_manager import get_agent_state, add_task_to_context, update_task_in_context # Assuming AGENT_STATE_MANAGER_IMPORTED is handled internally or true
-# Import the class itself for type checking if needed, handle import error
+from services.agent_state_manager import get_agent_state # For user preferences and GCal API object
+
+# --- GoogleCalendarAPI Import Handling ---
+GCAL_API_IMPORTED = False
+GoogleCalendarAPI_class_ref = None # Placeholder for the class itself
 try:
     from tools.google_calendar_api import GoogleCalendarAPI
-    GCAL_API_IMPORTED = True
+    if GoogleCalendarAPI: # Check if the imported name is not None
+        GoogleCalendarAPI_class_ref = GoogleCalendarAPI
+        GCAL_API_IMPORTED = True
 except ImportError:
-     GoogleCalendarAPI = None
-     GCAL_API_IMPORTED = False
+    pass # Error already logged by google_calendar_api.py if it fails
 
-# Import activity_db for type checking within tools
+# --- ActivityDB Import Handling ---
+DB_IMPORTED = False
+activity_db_module_ref = None # Placeholder for the module
 try:
-    import tools.activity_db as activity_db # Keep for direct access if needed (e.g., type check in cancel_sessions)
+    import tools.activity_db as activity_db
+    activity_db_module_ref = activity_db
     DB_IMPORTED = True
 except ImportError:
-    DB_IMPORTED = False
-    log_error("tool_definitions", "update_item_details_tool_import", "Failed to import real activity_db. Some checks may be skipped.", None)
-    # Define a dummy class with the necessary static method
+    # Define a dummy for type checking within tools if DB fails to import
     class activity_db_dummy:
         @staticmethod
-        def get_task(*a, **k):
-             log_warning("tool_definitions", "activity_db_dummy.get_task", "Using dummy get_task - DB not imported.")
-             return None
-    # Define activity_db to point to the dummy
-    activity_db = activity_db_dummy
+        def get_task(*args, **kwargs): return None
+    activity_db_module_ref = activity_db_dummy() # Instantiate dummy
 
-# LLM Interface (for scheduler sub-call)
+# LLM Interface (for scheduler sub-call in propose_task_slots)
 from services.llm_interface import get_instructor_client
-from openai import OpenAI
-from openai.types.chat import ChatCompletionMessage
+from openai import OpenAI # For type hinting if needed
+# Explicitly import ChatCompletionMessageParam for type hinting messages_for_llm
+from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
+
 
 # Utilities
-from tools.logger import log_info, log_error, log_warning # Ensure log_warning is used correctly
-import yaml
-import os
-import pydantic # Keep pydantic import
+from tools.logger import log_info, log_error, log_warning
+import pydantic # Keep pydantic import for ValidationError
 
-# --- Helper Functions --- (No changes needed in helpers _get_calendar_api_from_state, _parse_scheduler_llm_response, _load_scheduler_prompts)
+# --- Helper Functions ---
 
-# Returns GoogleCalendarAPI instance or None
-def _get_calendar_api_from_state(user_id) -> Optional[GoogleCalendarAPI]:
-    """Helper to retrieve the active calendar API instance from agent state."""
-    fn_name = "_get_calendar_api_from_state"
-    if not GCAL_API_IMPORTED or GoogleCalendarAPI is None:
-        # log_warning("tool_definitions", fn_name, "GoogleCalendarAPI class missing or not imported.") # Can be noisy
+def _get_calendar_api_from_state(user_id: str) -> Any: # Returns GoogleCalendarAPI instance or None
+    fn_name = "_get_calendar_api_from_state_tooldef"
+    if not GCAL_API_IMPORTED or GoogleCalendarAPI_class_ref is None:
+        # log_warning("tool_definitions", fn_name, f"GCal API library not imported or class not available for user {user_id}.")
         return None
     try:
-        state = get_agent_state(user_id)
+        state = get_agent_state(user_id) # From agent_state_manager
         if state is not None:
             api = state.get("calendar")
-            if isinstance(api, GoogleCalendarAPI) and api.is_active():
+            if isinstance(api, GoogleCalendarAPI_class_ref) and api.is_active():
                 return api
+            # Optional: More complex logic to re-initialize if status is 'connected' but API object is missing/inactive
+            # This might involve calling user_manager functions, which could create circular dependencies if not careful.
+            # For now, rely on agent state having the correct, active API object if GCal is connected.
+        # else: log_warning if state is None (agent_state_manager should handle this)
     except Exception as e:
-        log_error("tool_definitions", fn_name, f"Error getting calendar API instance for user {user_id}", e)
+        log_error("tool_definitions", fn_name, f"Error getting calendar API from state for {user_id}", e, user_id=user_id)
     return None
 
-# Returns dict or None
-def _parse_scheduler_llm_response(raw_text) -> Optional[Dict]:
-    """Parses the specific JSON output from the Session Scheduler LLM."""
-    fn_name = "_parse_scheduler_llm_response"
+
+def _parse_comprehensive_schedule_response(raw_text: str, user_id_for_log: str = "UnknownUser") -> Dict | None:
+    fn_name = "_parse_comprehensive_schedule_response"
     if not raw_text:
-        log_warning("tool_definitions", fn_name, "Scheduler response text is empty.")
+        log_warning("tool_definitions", fn_name, "Comprehensive scheduler LLM response text is empty.", user_id=user_id_for_log)
         return None
+    
     processed_text = None
     try:
-        # Try extracting JSON block first
         match = re.search(r"```json\s*({.*?})\s*```", raw_text, re.DOTALL | re.IGNORECASE)
-        if match:
-             processed_text = match.group(1).strip()
+        if match: processed_text = match.group(1).strip()
         else:
-             # Fallback: Assume the entire response is JSON or find first/last brace
-             processed_text = raw_text.strip()
-             if not processed_text.startswith("{") or not processed_text.endswith("}"):
-                  start_brace = raw_text.find('{'); end_brace = raw_text.rfind('}')
-                  if start_brace != -1 and end_brace > start_brace:
-                      processed_text = raw_text[start_brace : end_brace + 1].strip()
-                      log_warning("tool_definitions", fn_name, "Used find/rfind fallback for JSON extraction.")
-                  else:
-                      log_warning("tool_definitions", fn_name, "Could not extract JSON block from raw text.");
-                      return None
-        if not processed_text:
-            raise ValueError("Processed text is empty after extraction attempts.")
-
+            processed_text = raw_text.strip()
+            if not processed_text.startswith("{") or not processed_text.endswith("}"):
+                start_brace = raw_text.find('{'); end_brace = raw_text.rfind('}')
+                if start_brace != -1 and end_brace > start_brace:
+                    processed_text = raw_text[start_brace : end_brace + 1].strip()
+                else:
+                    log_error("tool_definitions", fn_name, f"Response not JSON and no ```json block. Raw: {raw_text[:200]}", user_id=user_id_for_log)
+                    return None
+        
+        if not processed_text: raise ValueError("Processed text for JSON parsing is empty.")
         data = json.loads(processed_text)
-        required_keys = ["proposed_sessions", "response_message"]
-        if not isinstance(data, dict) or not all(k in data for k in required_keys):
-            missing = [k for k in required_keys if k not in data]; raise ValueError(f"Parsed JSON missing required keys: {missing}")
-        if not isinstance(data["proposed_sessions"], list): raise ValueError("'proposed_sessions' key must contain a list.")
+
+        required_top_keys = ["proposed_sessions", "parsed_task_details_for_finalization", "response_message"]
+        if not isinstance(data, dict) or not all(k in data for k in required_top_keys):
+            log_error("tool_definitions", fn_name, f"Parsed JSON missing required top-level keys: {required_top_keys}. Found: {list(data.keys())}", user_id=user_id_for_log)
+            return None
+        
+        if not isinstance(data["proposed_sessions"], list):
+            log_warning("tool_definitions", fn_name, "'proposed_sessions' is not a list, returning empty.", user_id=user_id_for_log)
+            data["proposed_sessions"] = []
 
         valid_sessions = []
-        for i, session_dict in enumerate(data["proposed_sessions"]):
-            required_session_keys = ["date", "time", "end_time"]
-            if not isinstance(session_dict, dict) or not all(k in session_dict for k in required_session_keys):
-                log_warning("tool_definitions", fn_name, f"Skipping invalid session structure: {session_dict}")
+        for i, session_dict in enumerate(data.get("proposed_sessions", [])): # Use .get for safety
+            req_session_keys = ["date", "time", "end_time", "status"]
+            if not isinstance(session_dict, dict) or not all(k in session_dict for k in req_session_keys):
+                log_warning("tool_definitions", fn_name, f"Skipping invalid session structure: {session_dict}", user_id=user_id_for_log)
                 continue
             try:
-                 datetime.strptime(session_dict["date"], '%Y-%m-%d'); datetime.strptime(session_dict["time"], '%H:%M'); datetime.strptime(session_dict["end_time"], '%H:%M')
-                 ref = session_dict.get("slot_ref");
-                 session_dict["slot_ref"] = ref if isinstance(ref, int) and ref > 0 else i + 1
-                 valid_sessions.append(session_dict)
+                datetime.strptime(session_dict["date"], '%Y-%m-%d')
+                datetime.strptime(session_dict["time"], '%H:%M')
+                datetime.strptime(session_dict["end_time"], '%H:%M')
+                if session_dict["status"] not in ["new", "updated"]: raise ValueError("Invalid session status")
+                ref = session_dict.get("slot_ref")
+                session_dict["slot_ref"] = ref if isinstance(ref, int) and ref > 0 else i + 1
+                valid_sessions.append(session_dict)
             except (ValueError, TypeError) as fmt_err:
-                log_warning("tool_definitions", fn_name, f"Skipping session due to format error ({fmt_err}): {session_dict}")
+                log_warning("tool_definitions", fn_name, f"Skipping session due to format/value error ({fmt_err}): {session_dict}", user_id=user_id_for_log)
+        data["proposed_sessions"] = valid_sessions
 
-        data["proposed_sessions"] = valid_sessions # Replace with validated list
-        log_info("tool_definitions", fn_name, f"Successfully parsed {len(valid_sessions)} valid sessions.")
+        required_task_detail_keys = ["description", "estimated_total_duration"]
+        task_details = data.get("parsed_task_details_for_finalization")
+        if not isinstance(task_details, dict) or not all(k in task_details for k in required_task_detail_keys):
+            log_warning("tool_definitions", fn_name, f"'parsed_task_details_for_finalization' invalid. Using fallbacks. Found: {task_details}", user_id=user_id_for_log)
+            data["parsed_task_details_for_finalization"] = {
+                "description": str(task_details.get("description", "Task (details parsing failed)") if isinstance(task_details, dict) else "Task (details parsing failed)"),
+                "estimated_total_duration": str(task_details.get("estimated_total_duration", "1h") if isinstance(task_details, dict) else "1h"),
+                "project": str(task_details.get("project", "") if isinstance(task_details, dict) else ""),
+                "due_date": str(task_details.get("due_date", "") if isinstance(task_details, dict) else "")
+            }
+        data["parsed_task_details_for_finalization"].setdefault("project", "")
+        data["parsed_task_details_for_finalization"].setdefault("due_date", "")
+
+
+        if not isinstance(data.get("response_message"), str):
+            data["response_message"] = str(data.get("response_message","Scheduler message missing."))
+
         return data
-    except (json.JSONDecodeError, ValueError) as parse_err:
-        log_error("tool_definitions", fn_name, f"Scheduler JSON parsing failed. Error: {parse_err}. Extracted: '{processed_text or 'N/A'}' Raw: '{raw_text[:200]}'", parse_err);
+    except json.JSONDecodeError as parse_err:
+        log_error("tool_definitions", fn_name, f"Scheduler JSON parsing error. Error: {parse_err}. Extracted: '{processed_text or 'N/A'}'", parse_err, user_id=user_id_for_log)
+        return None
+    except ValueError as val_err:
+        log_error("tool_definitions", fn_name, f"Validation error in scheduler response: {val_err}", val_err, user_id=user_id_for_log)
         return None
     except Exception as e:
-        log_error("tool_definitions", fn_name, f"Unexpected error parsing scheduler response: {e}", e);
+        log_error("tool_definitions", fn_name, f"Unexpected error parsing scheduler response: {e}", e, user_id=user_id_for_log)
         return None
 
-_SCHEDULER_PROMPTS_CACHE: Dict[str, Optional[str]] = {}
-# Returns tuple (sys_prompt_str|None, human_prompt_str|None)
-def _load_scheduler_prompts() -> Tuple[Optional[str], Optional[str]]:
-    """Loads scheduler system and human prompts from config."""
+_SCHEDULER_PROMPTS_CACHE: Dict[str, Tuple[str, str]] = {}
+def _load_scheduler_prompts() -> Tuple[str, str]: # Kept original name, content is new
     fn_name = "_load_scheduler_prompts"
-    prompts_path = os.path.join("config", "prompts.yaml"); cache_key = prompts_path + "_scheduler"
-    if cache_key in _SCHEDULER_PROMPTS_CACHE: return _SCHEDULER_PROMPTS_CACHE[cache_key] # type: ignore
-    sys_prompt: Optional[str] = None
-    human_prompt: Optional[str] = None
+    system_prompt_key = "session_scheduler_system_prompt" # Assumes this key now points to the new comprehensive prompt
+    human_prompt_key = "session_scheduler_human_prompt"   # Assumes this key now points to the new comprehensive human prompt template
+    
+    prompts_path = os.path.join("config", "prompts.yaml")
+    cache_key = prompts_path + "_" + system_prompt_key + "_" + human_prompt_key
+    if cache_key in _SCHEDULER_PROMPTS_CACHE: return _SCHEDULER_PROMPTS_CACHE[cache_key]
+
+    sys_prompt_text: str = ""; human_prompt_template_text: str = ""
     try:
         if not os.path.exists(prompts_path): raise FileNotFoundError(f"{prompts_path} not found.")
         with open(prompts_path, "r", encoding="utf-8") as f: all_prompts = yaml.safe_load(f)
         if not all_prompts: raise ValueError("YAML prompts file loaded as empty.")
-        sys_prompt = all_prompts.get("session_scheduler_system_prompt")
-        human_prompt = all_prompts.get("session_scheduler_human_prompt")
-        if not sys_prompt or not human_prompt:
-            log_error("tool_definitions", fn_name, "One or both scheduler prompts (system/human) are missing in prompts.yaml.")
-            sys_prompt, human_prompt = None, None # Ensure both are None if one is missing
+        
+        sys_prompt_text_temp = all_prompts.get(system_prompt_key)
+        human_prompt_template_text_temp = all_prompts.get(human_prompt_key)
+
+        if not sys_prompt_text_temp or not sys_prompt_text_temp.strip():
+            log_error("tool_definitions", fn_name, f"System prompt '{system_prompt_key}' missing/empty.")
+        else: sys_prompt_text = sys_prompt_text_temp
+        if not human_prompt_template_text_temp or not human_prompt_template_text_temp.strip():
+            log_error("tool_definitions", fn_name, f"Human prompt template '{human_prompt_key}' missing/empty.")
+        else: human_prompt_template_text = human_prompt_template_text_temp
     except Exception as e:
-        log_error("tool_definitions", fn_name, f"Failed to load scheduler prompts from {prompts_path}: {e}", e)
-        sys_prompt, human_prompt = None, None # Ensure None on error
-    _SCHEDULER_PROMPTS_CACHE[cache_key] = (sys_prompt, human_prompt);
-    return sys_prompt, human_prompt
-
+        log_error("tool_definitions", fn_name, f"Failed to load scheduler prompts: {e}", e)
+    
+    _SCHEDULER_PROMPTS_CACHE[cache_key] = (sys_prompt_text, human_prompt_template_text)
+    return sys_prompt_text, human_prompt_template_text
 
 # =====================================================
-# == Pydantic Model Definitions (MUST COME BEFORE TOOLS) ==
+# == Pydantic Model Definitions ==
 # =====================================================
+class CreateToDoParams(BaseModel):
+    description: str = Field(..., description="The content or description of the ToDo item.")
+    date: str = Field("", description="Optional: Due date for the ToDo in YYYY-MM-DD format. Can be empty.")
+    project: str = Field("", description="Optional: Project tag for the ToDo. Can be empty.")
+    estimated_duration: str = Field("", description="Optional: Estimated duration (e.g., '1h', '30m'). Can be empty.")
+    @field_validator('date')
+    @classmethod
+    def validate_date_format(cls, v: str):
+        if v == "": return ""
+        try: datetime.strptime(v, '%Y-%m-%d'); return v
+        except (ValueError, TypeError): raise ValueError("Date must be in YYYY-MM-DD format or empty")
 
 class CreateReminderParams(BaseModel):
     description: str = Field(...)
     date: str = Field(...)
-    time: Optional[str] = Field(None)
-    project: Optional[str] = Field(None)
+    time: str = Field("", description="Optional: Time in HH:MM format. Empty for all-day.")
+    project: str = Field("", description="Optional: Project tag. Can be empty.")
     @field_validator('time')
     @classmethod
-    def validate_time_format(cls, v: Optional[str]):
-        if v is None or v == "": return None
+    def validate_time_format(cls, v: str):
+        if v == "": return ""
         try: hour, minute = map(int, v.split(':')); return f"{hour:02d}:{minute:02d}"
-        except (ValueError, TypeError): raise ValueError("Time must be in HH:MM format (e.g., '14:30') or null/empty")
+        except (ValueError, TypeError): raise ValueError("Time must be in HH:MM format or empty")
     @field_validator('date')
     @classmethod
     def validate_date_format(cls, v: str):
         try: datetime.strptime(v, '%Y-%m-%d'); return v
         except (ValueError, TypeError): raise ValueError("Date must be in YYYY-MM-DD format")
 
-# Note: This model is for creating the *initial metadata* for a schedulable Task.
-# The LLM might call this less often if the flow usually goes directly to propose_task_slots -> finalize_task_and_book_sessions.
-class CreateTaskParams(BaseModel):
-    description: str = Field(...)
-    date: Optional[str] = Field(None, description="Optional: Due date for the task.")
-    estimated_duration: Optional[str] = Field(None, description="Optional: Estimated total duration (e.g., '2h', '90m').")
-    project: Optional[str] = Field(None)
-    @field_validator('date')
-    @classmethod
-    def validate_date_format(cls, v: Optional[str]):
-        if v is None: return None
-        try: datetime.strptime(v, '%Y-%m-%d'); return v
-        except (ValueError, TypeError): raise ValueError("Date must be in YYYY-MM-DD format")
+class ProposeTaskSlotsParams(BaseModel): # Externally, params are simple
+    natural_language_scheduling_request: str = Field(...)
+    item_id_to_reschedule: str = Field("", description="Optional: Task ID if rescheduling.")
 
-# --- NEW MODEL for ToDos ---
-class CreateToDoParams(BaseModel):
-    description: str = Field(...)
-    date: Optional[str] = Field(None, description="Optional: Due date for the ToDo.")
-    project: Optional[str] = Field(None)
-    estimated_duration: Optional[str] = Field(None, description="Optional: Estimated duration for the ToDo (e.g., '1h', '30m'). For user reference only.") # <-- ADDED
-    @field_validator('date')
-    @classmethod
-    def validate_date_format(cls, v: Optional[str]):
-        if v is None: return None
-        try: datetime.strptime(v, '%Y-%m-%d'); return v
-        except (ValueError, TypeError): raise ValueError("Date must be in YYYY-MM-DD format")
-    # No specific validator needed for estimated_duration here, general string is fine.
-    # The LLM will be instructed to provide it in a parseable format if it gets one.
-# --- END NEW MODEL ---
+class FinalizeTaskAndBookSessionsParams(BaseModel): # MODIFIED to expect richer search_context
+    search_context: Dict = Field(..., description="Context from 'propose_task_slots', MUST include 'parsed_task_details_from_llm'.")
+    approved_slots: List[Dict] = Field(..., min_length=1, description="List of user-approved slot dicts. Each needs 'date', 'time', 'end_time', 'status'.")
+    task_description_override: str = Field("", description="Optional: Override for task description.")
+    estimated_total_duration_override: str = Field("", description="Optional: Override for task total duration.")
+    project_override: str = Field("", description="Optional: Override for project tag.")
 
-class ProposeTaskSlotsParams(BaseModel):
-    duration: str = Field(...)
-    timeframe: str = Field(...)
-    description: Optional[str] = Field(None)
-    scheduling_hints: Optional[str] = Field(None, description="User's specific scheduling preferences or constraints provided in natural language, e.g., 'in the afternoon', 'not on Monday', 'needs one continuous block', 'split into sessions'.")
-    num_options_to_propose: Optional[int] = Field(3)
-    @field_validator('num_options_to_propose')
+    @field_validator('search_context')
     @classmethod
-    def check_num_options(cls, v: Optional[int]):
-        if v is not None and v <= 0: raise ValueError("num_options_to_propose must be positive")
+    def validate_search_context_structure(cls, v: Dict):
+        if not isinstance(v, dict): raise ValueError("search_context must be a dictionary.")
+        details = v.get("parsed_task_details_from_llm")
+        if not isinstance(details, dict): raise ValueError("search_context missing valid 'parsed_task_details_from_llm' dictionary.")
+        if not isinstance(details.get("description"), str) or not details.get("description").strip():
+            raise ValueError("'parsed_task_details_from_llm.description' must be a non-empty string.")
+        if not isinstance(details.get("estimated_total_duration"), str): # Can be empty, but must be string
+             if details.get("estimated_total_duration") is None:
+                  raise ValueError("'parsed_task_details_from_llm.estimated_total_duration' cannot be null if key exists, use empty string or valid duration string.")
+        v["parsed_task_details_from_llm"].setdefault("project", "")
+        v["parsed_task_details_from_llm"].setdefault("due_date", "")
         return v
 
-class FinalizeTaskAndBookSessionsParams(BaseModel):
-    search_context: Dict = Field(...)
-    approved_slots: List[Dict] = Field(..., min_length=1)
-    project: Optional[str] = Field(None)
     @field_validator('approved_slots')
     @classmethod
-    def validate_slots_structure(cls, v):
-        if not isinstance(v, list) or not v: raise ValueError("approved_slots must be a non-empty list.")
-        for i, slot in enumerate(v):
-            if not isinstance(slot, dict): raise ValueError(f"Slot {i+1} is not a dict.")
-            req_keys = ["date", "time", "end_time"];
-            if not all(k in slot for k in req_keys): raise ValueError(f"Slot {i+1} missing required keys: {req_keys}")
+    def validate_slots_structure(cls, v_slots: List[Dict]):
+        if not isinstance(v_slots, list) or not v_slots: raise ValueError("approved_slots non-empty list.")
+        for i, slot in enumerate(v_slots):
+            if not isinstance(slot, dict): raise ValueError(f"Slot {i+1} not a dict.")
+            req_keys = ["date", "time", "end_time", "status"]
+            if not all(k in slot for k in req_keys): raise ValueError(f"Slot {i+1} missing keys: {req_keys}. Got: {list(slot.keys())}")
             try: datetime.strptime(slot["date"], '%Y-%m-%d')
-            except (ValueError, TypeError): raise ValueError(f"Slot {i+1} has invalid date format: {slot['date']}")
+            except: raise ValueError(f"Slot {i+1} invalid date: {slot['date']}")
             try: datetime.strptime(slot["time"], '%H:%M')
-            except (ValueError, TypeError): raise ValueError(f"Slot {i+1} has invalid time format: {slot['time']}")
+            except: raise ValueError(f"Slot {i+1} invalid time: {slot['time']}")
             try: datetime.strptime(slot["end_time"], '%H:%M')
-            except (ValueError, TypeError): raise ValueError(f"Slot {i+1} has invalid end_time format: {slot['end_time']}")
-        return v
+            except: raise ValueError(f"Slot {i+1} invalid end_time: {slot['end_time']}")
+            if slot["status"] not in ["new", "updated"]: raise ValueError(f"Slot {i+1} invalid status: {slot['status']}")
+        return v_slots
 
 class UpdateItemDetailsParams(BaseModel):
     item_id: str = Field(...)
-    updates: dict = Field(...)
-    @field_validator('updates')
+    updates: dict = Field(..., description="Dict of fields to update, e.g. {'description': 'new', 'status': 'completed'}.")
+    @field_validator('updates') # Validation for date/time/status formats within updates
     @classmethod
     def check_allowed_keys_and_formats(cls, v: dict):
-        allowed_keys = {"description", "date", "time", "estimated_duration", "project"}
+        allowed_keys = {"description", "date", "time", "estimated_duration", "project", "status"} 
         if not v: raise ValueError("Updates dictionary cannot be empty.")
         validated_updates = {}
         for key, value in v.items():
             if key not in allowed_keys: raise ValueError(f"Invalid key '{key}'. Allowed: {', '.join(allowed_keys)}")
             if key == 'date':
-                if value is None: validated_updates[key] = None
+                if value == "" or value is None: validated_updates[key] = "" # Allow clearing date
                 else:
-                    try: validated_updates[key] = cls.validate_date_format_static(str(value))
+                    try: validated_updates[key] = cls._validate_date_format_static(str(value))
                     except ValueError as e: raise ValueError(f"Invalid format for date '{value}': {e}")
             elif key == 'time':
-                if value is None: validated_updates[key] = None
+                if value == "" or value is None: validated_updates[key] = "" # Allow clearing time
                 else:
-                     try: validated_updates[key] = cls.validate_time_format_static(str(value))
+                     try: validated_updates[key] = cls._validate_time_format_static(str(value))
                      except ValueError as e: raise ValueError(f"Invalid format for time '{value}': {e}")
-            elif key == 'estimated_duration':
-                if value is None or (isinstance(value, str) and value.strip() == ""): validated_updates[key] = None
-                elif not isinstance(value, str): raise ValueError("Estimated duration must be a string or null/empty")
-                else: validated_updates[key] = value
-            else: validated_updates[key] = value # description, project
-        if not validated_updates: raise ValueError("Updates dictionary resulted in no valid fields.")
+            elif key == 'status':
+                if value is None: raise ValueError("Status cannot be null.")
+                validated_updates[key] = cls._validate_status_format_static(str(value))
+            else: # description, estimated_duration, project
+                validated_updates[key] = value if value is not None else "" # Ensure string or empty string
+        if not validated_updates: raise ValueError("Updates dictionary resulted in no valid fields after validation.")
         return validated_updates
     @staticmethod
-    def validate_date_format_static(v: str):
-        try: datetime.strptime(v, '%Y-%m-%d'); return v
-        except (ValueError, TypeError): raise ValueError("Date must be in YYYY-MM-DD format")
+    def _validate_date_format_static(v_date: str):
+        if v_date == "": return ""
+        try: datetime.strptime(v_date, '%Y-%m-%d'); return v_date
+        except: raise ValueError("Date must be YYYY-MM-DD or empty")
     @staticmethod
-    def validate_time_format_static(v: Optional[str]):
-        if v is None: return None
-        if v == "": return None
-        try: hour, minute = map(int, v.split(':')); return f"{hour:02d}:{minute:02d}"
-        except (ValueError, TypeError): raise ValueError("Time must be in HH:MM format (e.g., '14:30') or empty string or null")
-
-class UpdateItemStatusParams(BaseModel):
-    item_id: str = Field(...)
-    new_status: str = Field(...)
-    @field_validator('new_status')
-    @classmethod
-    def check_item_status(cls, v: str):
+    def _validate_time_format_static(v_time: str):
+        if v_time == "": return ""
+        try: h, m = map(int, v_time.split(':')); return f"{h:02d}:{m:02d}"
+        except: raise ValueError("Time must be HH:MM or empty")
+    @staticmethod
+    def _validate_status_format_static(v_status: str):
         allowed = {"pending", "in_progress", "completed", "cancelled"}
-        v_lower = v.lower().replace(" ", "_") # Standardize to snake_case
+        v_lower = v_status.lower().strip().replace(" ", "_")
         if v_lower not in allowed: raise ValueError(f"Status must be one of: {', '.join(allowed)}")
         return v_lower
+
+class FormatListForDisplayParams(BaseModel):
+    date_range: List[str] = Field([], description="Optional. [YYYY-MM-DD, YYYY-MM-DD] or [YYYY-MM-DD].")
+    status_filter: str = Field("active", description="Optional. 'active', 'pending', 'in_progress', 'completed', 'all'. Default 'active'.")
+    project_filter: str = Field("", description="Optional. Filter by project tag.")
+    @field_validator('date_range')
+    @classmethod
+    def validate_and_normalize_date_range(cls, v: List[str]):
+        if not v: return []
+        if not isinstance(v, list): raise ValueError("date_range must be a list.")
+        if len(v) == 1:
+            try: datetime.strptime(v[0], '%Y-%m-%d').date(); return [v[0], v[0]]
+            except: raise ValueError("Single date invalid YYYY-MM-DD.")
+        elif len(v) == 2:
+            try:
+                s, e = datetime.strptime(v[0], '%Y-%m-%d').date(), datetime.strptime(v[1], '%Y-%m-%d').date()
+                if s > e: raise ValueError("Start date after end date.")
+                return v
+            except: raise ValueError("Dates must be valid YYYY-MM-DD.")
+        else: raise ValueError("date_range must be 0, 1, or 2 date strings.")
+    @field_validator('status_filter')
+    @classmethod
+    def check_status_filter(cls, v: str):
+        if v is None or v == "": return 'active'
+        allowed = {'active', 'pending', 'in_progress', 'completed', 'all'}
+        v_lower = v.lower().strip().replace(" ", "_")
+        return v_lower if v_lower in allowed else 'active'
 
 class UpdateUserPreferencesParams(BaseModel):
     updates: dict = Field(...)
@@ -289,564 +338,318 @@ class UpdateUserPreferencesParams(BaseModel):
         if not v: raise ValueError("Updates dictionary cannot be empty.")
         return v
 
-class InitiateCalendarConnectionParams(BaseModel):
-    pass
-
-class CancelTaskSessionsParams(BaseModel):
-    task_id: str = Field(...)
-    session_ids_to_cancel: list[str] = Field(..., min_length=1)
-
-class InterpretListReplyParams(BaseModel):
+class InitiateCalendarConnectionParams(BaseModel): pass
+class InterpretListReplyParams(BaseModel): # This tool may become obsolete
     user_reply: str = Field(...)
     list_mapping: dict = Field(...)
 
-class GetFormattedTaskListParams(BaseModel):
-    date_range: Optional[list[str]] = Field(None)
-    status_filter: Optional[str] = Field('active')
-    project_filter: Optional[str] = Field(None)
-    @field_validator('date_range')
-    @classmethod
-    def validate_and_normalize_date_range(cls, v: Optional[list[str]]):
-        if v is None: return v
-        if not isinstance(v, list): raise ValueError("date_range must be a list of date strings.")
-        if len(v) == 1:
-            try:
-                the_date = datetime.strptime(v[0], '%Y-%m-%d').date()
-                log_warning("tool_definitions", "validate_date_range", f"Received single date {v[0]}, assuming start/end.")
-                return [v[0], v[0]]
-            except (ValueError, TypeError):
-                raise ValueError("Single date provided is not a valid YYYY-MM-DD string.")
-        elif len(v) == 2:
-            try:
-                start_date = datetime.strptime(v[0], '%Y-%m-%d').date()
-                end_date = datetime.strptime(v[1], '%Y-%m-%d').date()
-                if start_date > end_date: raise ValueError("Start date cannot be after end date.")
-                return v
-            except (ValueError, TypeError):
-                raise ValueError("Dates must be valid YYYY-MM-DD strings.")
-        else:
-            raise ValueError("date_range must be a list of one or two date strings.")
-    @field_validator('status_filter')
-    @classmethod
-    def check_status_filter(cls, v: Optional[str]):
-        if v is None: return 'active'
-        allowed = {'active', 'pending', 'in_progress', 'completed', 'all'}
-        v_lower = v.lower().replace(" ", "_")
-        if v_lower not in allowed:
-            log_warning("tool_definitions", "check_status_filter", f"Invalid status_filter '{v}'. Defaulting 'active'.")
-            return 'active'
-        return v_lower
-
-
 # =====================================================
-# == Tool Function Definitions (MUST COME AFTER MODELS) ==
+# == Tool Function Definitions ==
 # =====================================================
 
-# --- Returns dict ---
-def create_reminder_tool(user_id, params: CreateReminderParams) -> Dict:
-    """Creates a simple reminder, potentially adding it to Google Calendar if time is specified. Sets type='reminder'."""
-    fn_name = "create_reminder_tool"
-    try:
-        log_info("tool_definitions", fn_name, f"Executing for user {user_id}, desc: '{params.description[:30]}...'")
-        data_dict = params.model_dump(exclude_none=True)
-        data_dict["type"] = "reminder" # Explicitly set type
-        saved_item = task_manager.create_task(user_id, data_dict)
-        if saved_item and saved_item.get("event_id"):
-            return {"success": True, "item_id": saved_item.get("event_id"), "item_type": "reminder", "message": f"Reminder '{params.description[:30]}...' created."}
-        else:
-             log_error("tool_definitions", fn_name, f"Task manager failed create reminder")
-             return {"success": False, "item_id": None, "message": "Failed to save reminder."}
-    except pydantic.ValidationError as e:
-         log_error("tool_definitions", fn_name, f"Validation Error: {e}");
-         return {"success": False, "item_id": None, "message": f"Invalid parameters: {e}"}
-    except Exception as e:
-         log_error("tool_definitions", fn_name, f"Unexpected error: {e}", e)
-         return {"success": False, "item_id": None, "message": f"Error: {e}"}
-
-# --- Returns dict ---
-def create_task_tool(user_id, params: CreateTaskParams) -> Dict:
-    """Creates metadata for a schedulable Task (type='task'). Does not schedule sessions or interact with calendar directly here."""
-    fn_name = "create_task_tool"
-    try:
-        log_info("tool_definitions", fn_name, f"Executing for user {user_id}, desc: '{params.description[:30]}...'")
-        data_dict = params.model_dump(exclude_none=True)
-        data_dict["type"] = "task" # Explicitly set type
-        if "time" in data_dict: del data_dict["time"] # Tasks don't have specific start time in metadata
-        # Note: 'date' might be due date, 'estimated_duration' stored for later scheduling.
-        saved_item = task_manager.create_task(user_id, data_dict)
-        if saved_item and saved_item.get("event_id"):
-            return {"success": True, "item_id": saved_item.get("event_id"), "item_type": "task", "estimated_duration": saved_item.get("estimated_duration"), "message": f"Task '{params.description[:30]}...' metadata created."}
-        else:
-             log_error("tool_definitions", fn_name, f"Task manager failed create task metadata")
-             return {"success": False, "item_id": None, "message": "Failed to save task metadata."}
-    except pydantic.ValidationError as e:
-         log_error("tool_definitions", fn_name, f"Validation Error: {e}");
-         return {"success": False, "item_id": None, "message": f"Invalid parameters: {e}"}
-    except Exception as e:
-         log_error("tool_definitions", fn_name, f"Unexpected error: {e}", e)
-         return {"success": False, "item_id": None, "message": f"Error: {e}"}
-
-# --- NEW TOOL FUNCTION ---
-# --- Returns dict ---
-def create_todo_tool(user_id, params: CreateToDoParams) -> Dict:
-    """Creates a simple ToDo item (type='todo') for tracking, without calendar scheduling."""
+# --- Item Creation Tools ---
+def create_todo_tool(user_id: str, params: CreateToDoParams) -> Dict:
     fn_name = "create_todo_tool"
     try:
-        log_info("tool_definitions", fn_name, f"Executing for user {user_id}, desc: '{params.description[:30]}...'")
-        data_dict = params.model_dump(exclude_none=True)
-        data_dict["type"] = "todo" # Explicitly set type
-        # Fields like time, duration are not relevant for ToDo creation
-        saved_item = task_manager.create_task(user_id, data_dict) # Use the same underlying service function
+        # log_info("tool_definitions", fn_name, f"User {user_id} creating ToDo: '{params.description[:30]}...'") # Verbose
+        data_dict = params.model_dump(exclude_none=False)
+        data_dict["type"] = "todo"
+        for key in ["date", "project", "estimated_duration"]: # Convert empty strings to None for DB
+            if data_dict.get(key) == "": data_dict[key] = None
+        
+        saved_item = task_manager.create_item(user_id, data_dict)
         if saved_item and saved_item.get("event_id"):
-            return {"success": True, "item_id": saved_item.get("event_id"), "item_type": "todo", "message": f"ToDo '{params.description[:30]}...' added to your list."}
+            return {"success": True, "item_id": saved_item.get("event_id"), "item_type": "todo", "message": f"ToDo '{str(params.description)[:30]}...' added."}
         else:
-             log_error("tool_definitions", fn_name, f"Task manager failed create ToDo")
+             log_error("tool_definitions", fn_name, f"task_manager.create_item failed for ToDo for user {user_id}")
              return {"success": False, "item_id": None, "message": "Failed to save ToDo."}
-    except pydantic.ValidationError as e:
-         log_error("tool_definitions", fn_name, f"Validation Error: {e}");
-         return {"success": False, "item_id": None, "message": f"Invalid parameters: {e}"}
-    except Exception as e:
-         log_error("tool_definitions", fn_name, f"Unexpected error: {e}", e)
-         return {"success": False, "item_id": None, "message": f"Error: {e}"}
-# --- END NEW TOOL FUNCTION ---
+    except pydantic.ValidationError as e: return {"success": False, "item_id": None, "message": f"Invalid ToDo params: {e.errors()}"}
+    except Exception as e: log_error("tool_definitions", fn_name, f"Error: {e}", e); return {"success": False, "item_id": None, "message": f"Error creating ToDo: {e}"}
 
-# --- Returns dict ---
-def propose_task_slots_tool(user_id, params: ProposeTaskSlotsParams) -> Dict:
-    """
-    Finds available work session slots for a Task based on duration/timeframe and hints.
-    Uses an LLM sub-call for intelligent slot finding, considering calendar events.
-    Returns proposed slots and the search context used.
-    """
-    # --- Function body remains the same ---
-    fn_name = "propose_task_slots_tool"
-    fail_result = {"success": False, "proposed_slots": None, "message": "Sorry, I encountered an issue trying to propose schedule slots.", "search_context": None}
+def create_reminder_tool(user_id: str, params: CreateReminderParams) -> Dict:
+    fn_name = "create_reminder_tool"
     try:
-        log_info("tool_definitions", fn_name, f"Executing user={user_id}. Search: duration='{params.duration}', timeframe='{params.timeframe}', hints='{params.scheduling_hints}'")
-        search_context_to_return = params.model_dump() # Store validated input as basis for context
+        # log_info("tool_definitions", fn_name, f"User {user_id} creating Reminder: '{params.description[:30]}...'") # Verbose
+        data_dict = params.model_dump(exclude_none=False)
+        data_dict["type"] = "reminder"
+        for key in ["time", "project"]: # Convert empty strings to None
+            if data_dict.get(key) == "": data_dict[key] = None
+        
+        saved_item = task_manager.create_item(user_id, data_dict)
+        if saved_item and saved_item.get("event_id"):
+            return {"success": True, "item_id": saved_item.get("event_id"), "item_type": "reminder", "message": f"Reminder '{str(params.description)[:30]}...' created."}
+        else:
+             log_error("tool_definitions", fn_name, f"task_manager.create_item failed for Reminder for user {user_id}")
+             return {"success": False, "item_id": None, "message": "Failed to save reminder."}
+    except pydantic.ValidationError as e: return {"success": False, "item_id": None, "message": f"Invalid Reminder params: {e.errors()}"}
+    except Exception as e: log_error("tool_definitions", fn_name, f"Error: {e}", e); return {"success": False, "item_id": None, "message": f"Error creating Reminder: {e}"}
 
-        llm_client = get_instructor_client()
-        if not llm_client:
-             log_error("tool_definitions", fn_name, "LLM client unavailable.")
-             return {**fail_result, "message": "Scheduler resources unavailable (LLM Client)."}
+# --- Task Scheduling Tools (Revised) ---
+def propose_task_slots_tool(user_id: str, params: ProposeTaskSlotsParams) -> Dict:
+    fn_name = "propose_task_slots_tool"
+    log_info("tool_definitions", fn_name, f"User {user_id}, NLP Req: '{params.natural_language_scheduling_request[:60]}...', ReschedID: {params.item_id_to_reschedule or 'N/A'}")
 
-        sys_prompt, human_prompt = _load_scheduler_prompts()
-        if not sys_prompt or not human_prompt:
-             log_error("tool_definitions", fn_name, "Scheduler prompts failed load.")
-             return {**fail_result, "message": "Scheduler resources unavailable (Prompts)."}
+    fail_result = {
+        "success": False, "proposed_slots": [],
+        "message": "Sorry, I encountered an issue trying to propose schedule slots.",
+        "search_context": {
+            "original_request": params.natural_language_scheduling_request,
+            "item_id_to_reschedule": params.item_id_to_reschedule,
+            "parsed_task_details_from_llm": None
+        }
+    }
+    system_prompt, human_prompt_template = _load_scheduler_prompts()
+    if not system_prompt or not human_prompt_template:
+        log_error("tool_definitions", fn_name, "Scheduler prompts not loaded.", user_id=user_id)
+        fail_result["message"] = "Internal error: Scheduler configuration missing."
+        return fail_result
 
-        agent_state = get_agent_state(user_id);
-        prefs = agent_state.get("preferences", {}) if agent_state else {}
+    agent_state = get_agent_state(user_id)
+    if not agent_state:
+        log_error("tool_definitions", fn_name, f"Agent state not found for {user_id}.", user_id=user_id)
+        fail_result["message"] = "Internal error: User context unavailable."
+        return fail_result
+
+    preferences = agent_state.get("preferences", {})
+    user_tz_str = preferences.get("TimeZone", "UTC")
+    try: user_timezone = pytz.timezone(user_tz_str)
+    except pytz.UnknownTimeZoneError: user_timezone = pytz.utc; user_tz_str = "UTC"
+    now_user_tz = datetime.now(user_timezone)
+    search_start_user_tz = now_user_tz.date()
+    search_end_user_tz = search_start_user_tz + timedelta(weeks=4) # Default search window
+
+    live_gcal_events = []
+    if preferences.get("gcal_integration_status") == "connected":
         calendar_api = _get_calendar_api_from_state(user_id)
-        preferred_session_str = prefs.get("Preferred_Session_Length", "60m")
+        if calendar_api:
+            try:
+                live_gcal_events = calendar_api.list_events(
+                    search_start_user_tz.strftime("%Y-%m-%d"),
+                    search_end_user_tz.strftime("%Y-%m-%d")
+                )
+            except Exception as e_cal: log_error("tool_definitions", fn_name, f"Error fetching GCal events for {user_id}", e_cal, user_id=user_id)
+        else: log_warning("tool_definitions", fn_name, f"GCal API not init for {user_id} despite 'connected' status.", user_id=user_id)
 
-        task_estimated_duration_str = params.duration;
-        total_minutes = task_manager._parse_duration_to_minutes(task_estimated_duration_str)
-        if total_minutes is None:
-             log_error("tool_definitions", fn_name, f"Invalid duration '{task_estimated_duration_str}'")
-             return {**fail_result, "message": f"Invalid duration format: '{task_estimated_duration_str}'. Use 'Xh' or 'Ym'."}
+    existing_task_details_json = "{}"
+    if params.item_id_to_reschedule and DB_IMPORTED and activity_db_module_ref:
+        existing_task_data = activity_db_module_ref.get_task(params.item_id_to_reschedule)
+        if existing_task_data:
+            relevant_details = {k: existing_task_data.get(k) for k in ["title", "description", "estimated_duration", "date", "project", "status", "session_event_ids"]}
+            existing_task_details_json = json.dumps(relevant_details, default=str)
+    
+    human_prompt_filled = human_prompt_template.format(
+        natural_language_scheduling_request=params.natural_language_scheduling_request,
+        existing_task_id=params.item_id_to_reschedule or "N/A",
+        existing_task_details_json=existing_task_details_json,
+        user_id=user_id,
+        user_preferred_session_length=preferences.get("Preferred_Session_Length", "1h"),
+        user_working_days=json.dumps(preferences.get("Work_Days", ["Mon", "Tue", "Wed", "Thu", "Fri"])),
+        user_work_start_time=preferences.get("Work_Start_Time", "09:00"),
+        user_work_end_time=preferences.get("Work_End_Time", "17:00"),
+        user_timezone=user_tz_str,
+        current_date_user_tz=now_user_tz.strftime("%Y-%m-%d"),
+        search_start_date_user_tz=search_start_user_tz.strftime("%Y-%m-%d"),
+        search_end_date_user_tz=search_end_user_tz.strftime("%Y-%m-%d"),
+        live_calendar_events_json=json.dumps(live_gcal_events, default=str)
+    )
+    messages_for_llm: List[ChatCompletionMessageParam] = [ # type: ignore
+        {"role": "system", "content": system_prompt}, {"role": "user", "content": human_prompt_filled}
+    ]
+    client = get_instructor_client()
+    if not client:
+        log_error("tool_definitions", fn_name, "LLM client unavailable.", user_id=user_id)
+        fail_result["message"] = "Internal error: AI scheduling service unavailable."
+        return fail_result
+    try:
+        # log_info("tool_definitions", fn_name, f"Invoking Scheduling LLM for {user_id}...") # Verbose
+        response = client.chat.completions.create(
+            model="gpt-4o", messages=messages_for_llm,
+            response_format={"type": "json_object"}, temperature=0.2,
+        )
+        llm_raw_output = response.choices[0].message.content
+        if not llm_raw_output: raise ValueError("LLM returned empty content.")
+    except Exception as e_llm:
+        log_error("tool_definitions", fn_name, f"Error invoking Scheduling LLM for {user_id}", e_llm, user_id=user_id)
+        fail_result["message"] = "AI scheduler encountered an issue. Please try again."
+        return fail_result
 
-        session_minutes = task_manager._parse_duration_to_minutes(preferred_session_str) or 60
-        num_slots_to_find = 1
-        slot_duration_str = task_estimated_duration_str
-        hints_lower = (params.scheduling_hints or "").lower()
+    parsed_llm_data = _parse_comprehensive_schedule_response(llm_raw_output, user_id)
+    if not parsed_llm_data:
+        fail_result["message"] = "AI scheduler returned an unexpected format. Please rephrase."
+        return fail_result
 
-        needs_split = False
-        if "continuous" in hints_lower or "one block" in hints_lower or "one slot" in hints_lower:
-             needs_split = False
-             log_info("tool_definitions", fn_name, "Hint indicates continuous block required.")
-        elif "split" in hints_lower or "separate" in hints_lower or "multiple sessions" in hints_lower:
-             needs_split = True
-             log_info("tool_definitions", fn_name, "Hint indicates split sessions required.")
-        elif session_minutes > 0 and total_minutes > session_minutes:
-             needs_split = True
-             log_info("tool_definitions", fn_name, "Defaulting to split sessions (total > preferred, no specific hint).")
+    return {
+        "success": True,
+        "proposed_slots": parsed_llm_data.get("proposed_sessions", []),
+        "message": parsed_llm_data.get("response_message", "Slots proposed."),
+        "search_context": {
+            "original_request": params.natural_language_scheduling_request,
+            "item_id_to_reschedule": params.item_id_to_reschedule,
+            "parsed_task_details_from_llm": parsed_llm_data.get("parsed_task_details_for_finalization")
+        }
+    }
 
-        if needs_split and session_minutes > 0:
-             num_slots_to_find = (total_minutes + session_minutes - 1) // session_minutes
-             if num_slots_to_find <= 0 : num_slots_to_find = 1
-             slot_duration_str = preferred_session_str
-             log_info("tool_definitions", fn_name, f"Calculated need for {num_slots_to_find} split sessions of duration: {slot_duration_str}")
-        else:
-            log_info("tool_definitions", fn_name, f"Calculated need for 1 continuous block of duration: {slot_duration_str}")
-
-        today = datetime.now().date(); start_date = today + timedelta(days=1); due_date_for_search = None
-        tf = params.timeframe.lower()
-        iso_interval_match = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]\d{2}:\d{2}|Z))/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]\d{2}:\d{2}|Z))", params.timeframe)
-        if iso_interval_match:
-             try:
-                  start_iso, end_iso = iso_interval_match.groups()
-                  start_dt_aware = datetime.fromisoformat(start_iso.replace('Z', '+00:00'))
-                  end_dt_aware = datetime.fromisoformat(end_iso.replace('Z', '+00:00'))
-                  start_date = start_dt_aware.date()
-                  start_date = max(start_date, today + timedelta(days=1))
-                  due_date_for_search = end_dt_aware.date()
-                  log_info("tool_definitions", fn_name, f"Parsed ISO Interval: Start={start_date}, EffectiveDue={due_date_for_search}")
-             except ValueError as iso_parse_err:
-                  log_warning("tool_definitions", fn_name, f"Failed to parse ISO interval timeframe '{params.timeframe}': {iso_parse_err}")
-        elif "tomorrow" in tf: start_date = today + timedelta(days=1); due_date_for_search = start_date
-        elif "next week" in tf:
-             start_of_next_week = today + timedelta(days=(7 - today.weekday()))
-             start_date = start_of_next_week
-             due_date_for_search = start_of_next_week + timedelta(days=6)
-             log_info("tool_definitions", fn_name, f"Parsed 'next week': Start={start_date}, EffectiveDue={due_date_for_search}")
-        elif "on " in tf:
-            try: date_part = tf.split("on ")[1].strip(); parsed_date = datetime.strptime(date_part, "%Y-%m-%d").date(); start_date = max(parsed_date, today + timedelta(days=1)); due_date_for_search = start_date
-            except Exception: log_warning("tool_definitions", fn_name, f"Parsing timeframe date failed: '{params.timeframe}'")
-        elif "by " in tf:
-            try: date_part = tf.split("by ")[1].strip(); parsed_date = datetime.strptime(date_part, "%Y-%m-%d").date(); due_date_for_search = parsed_date; start_date = max(today + timedelta(days=1), parsed_date - timedelta(days=14))
-            except Exception: log_warning("tool_definitions", fn_name, f"Parsing timeframe 'by' date failed: '{params.timeframe}'")
-        elif "later today" in tf or "tonight" in tf or "this afternoon" in tf:
-             start_date = today
-             due_date_for_search = today
-             log_info("tool_definitions", fn_name, f"Parsed relative timeframe '{tf}': Start={start_date}, EffectiveDue={due_date_for_search}")
-        else: log_warning("tool_definitions", fn_name, f"Unclear timeframe '{params.timeframe}', using default window.")
-
-        default_horizon_days = 56; end_date_limit = start_date + timedelta(days=default_horizon_days - 1)
-        end_date = end_date_limit
-        if due_date_for_search and due_date_for_search >= start_date:
-             buffer_days = 0 if start_date == due_date_for_search else 1
-             end_date = min(end_date_limit, due_date_for_search - timedelta(days=buffer_days))
-        end_date = max(end_date, start_date);
-        start_date_str, end_date_str = start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
-        log_info("tool_definitions", fn_name, f"Derived Search Range: {start_date_str} to {end_date_str}")
-        search_context_to_return["effective_due_date"] = due_date_for_search.strftime("%Y-%m-%d") if due_date_for_search else None
-        search_context_to_return["search_start_date"] = start_date_str
-        search_context_to_return["search_end_date"] = end_date_str
-        search_context_to_return["original_timeframe"] = params.timeframe
-
-        existing_events = [];
-        if calendar_api is not None:
-            log_info("tool_definitions", fn_name, f"Fetching GCal events from {start_date_str} to {end_date_str}")
-            if start_date <= end_date:
-                try:
-                    events_raw = calendar_api.list_events(start_date_str, end_date_str)
-                    existing_events = [
-                         {"start_datetime": ev.get("gcal_start_datetime"), "end_datetime": ev.get("gcal_end_datetime"), "summary": ev.get("title")}
-                         for ev in events_raw if ev.get("gcal_start_datetime") and ev.get("gcal_end_datetime")
-                    ]
-                    log_info("tool_definitions", fn_name, f"Fetched {len(existing_events)} valid GCal events.")
-                except Exception as e:
-                     log_error("tool_definitions", fn_name, f"Fetch GCal events failed: {e}", e)
-            else:
-                 log_warning("tool_definitions", fn_name, f"Invalid search range ({start_date_str} > {end_date_str}). Skipping GCal fetch.")
-        else:
-            log_warning("tool_definitions", fn_name, "GCal API inactive or unavailable. Proposing slots without checking calendar conflicts.")
-
-        try:
-            slots_to_request_from_llm = num_slots_to_find
-            prompt_data = {
-                "task_description": params.description or "(No description)",
-                "task_due_date": search_context_to_return["effective_due_date"] or "(No specific due date)",
-                "task_estimated_duration": task_estimated_duration_str,
-                "user_working_days": prefs.get("Work_Days", ["Mon", "Tue", "Wed", "Thu", "Fri"]),
-                "user_work_start_time": prefs.get("Work_Start_Time", "09:00"),
-                "user_work_end_time": prefs.get("Work_End_Time", "17:00"),
-                "user_session_length": slot_duration_str,
-                "existing_events_json": json.dumps(existing_events),
-                "current_date": today.strftime("%Y-%m-%d"),
-                "num_slots_requested": slots_to_request_from_llm,
-                "search_start_date": start_date_str,
-                "search_end_date": end_date_str,
-                "scheduling_hints": params.scheduling_hints or "None"
-            }
-            log_info("tool_definitions", fn_name, f"Scheduler prompt data prepared (requesting {slots_to_request_from_llm} slots, event count: {len(existing_events)}).")
-        except Exception as e:
-             log_error("tool_definitions", fn_name, f"Failed prepare prompt data for scheduler: {e}", e)
-             return {**fail_result, "message": "Failed prepare data for scheduler."}
-
-        raw_llm_output = None; parsed_data = None
-        try:
-            fmt_human = human_prompt.format(**prompt_data)
-            messages = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": fmt_human}]
-            log_info("tool_definitions", fn_name, ">>> Invoking Session Scheduler LLM...")
-            sched_resp = llm_client.chat.completions.create(model="gpt-4o", messages=messages, temperature=0.2, response_format={"type": "json_object"}) # type: ignore
-            raw_llm_output = sched_resp.choices[0].message.content
-            parsed_data = _parse_scheduler_llm_response(raw_llm_output)
-            if parsed_data is None:
-                log_error("tool_definitions", fn_name, "Scheduler response parse failed or returned invalid structure.")
-                return {**fail_result, "message": "Received invalid proposals format from scheduler."}
-
-            log_info("tool_definitions", f"{fn_name}_DEBUG", f"Parsed Scheduler LLM Resp: {json.dumps(parsed_data, indent=2)}")
-            num_returned = len(parsed_data.get("proposed_sessions", []))
-            if num_returned < num_slots_to_find:
-                 log_warning("tool_definitions", fn_name, f"Sub-LLM returned only {num_returned} slots, but {num_slots_to_find} were needed.")
-                 parsed_data["response_message"] += f" (Note: Only found {num_returned} of the {num_slots_to_find} required slots)."
-            log_info("tool_definitions", fn_name, f"Scheduler LLM processing successful.")
-            return {"success": True, "proposed_slots": parsed_data.get("proposed_sessions"), "message": parsed_data.get("response_message", "..."), "search_context": search_context_to_return}
-        except Exception as e:
-            tb_str = traceback.format_exc()
-            log_error("tool_definitions", fn_name, f"Scheduler LLM invoke/process error: {e}. Raw: '{raw_llm_output}'. Parsed: {parsed_data}\nTraceback:\n{tb_str}", e)
-            return {**fail_result, "message": "Error during slot finding process."}
-
-    except pydantic.ValidationError as e:
-        log_error("tool_definitions", fn_name, f"Validation Error: {e}");
-        return {"success": False, "proposed_slots": None, "message": f"Invalid parameters: {e}", "search_context": None}
-    except Exception as e:
-         log_error("tool_definitions", fn_name, f"Unexpected error in propose_task_slots: {e}", e)
-         return fail_result
-
-# --- Returns dict ---
-def finalize_task_and_book_sessions_tool(user_id, params: FinalizeTaskAndBookSessionsParams) -> Dict:
-    """Creates task metadata (type='task') AND books the approved work sessions in GCal."""
-    # --- Function body remains the same ---
+def finalize_task_and_book_sessions_tool(user_id: str, params: FinalizeTaskAndBookSessionsParams) -> Dict:
     fn_name = "finalize_task_and_book_sessions_tool"
-    item_id: Optional[str] = None # Initialize item_id
-    task_title = "(Error getting title)" # Initialize task_title
+    item_id_final: str | None = None
     try:
         search_context = params.search_context; approved_slots = params.approved_slots
-        log_info("tool_definitions", fn_name, f"Executing finalize+book user={user_id}, desc='{search_context.get('description')}', slots={len(approved_slots)}")
-        if not search_context or not approved_slots:
-            log_error("tool_definitions", fn_name, "Missing search_context or approved_slots.")
-            return {"success": False, "item_id": None, "booked_count": 0, "message": "Internal error: Missing context or slots to book."}
+        parsed_details = search_context.get("parsed_task_details_from_llm", {})
+        original_request_nlp = search_context.get("original_request", "N/A")
+        item_id_to_reschedule = search_context.get("item_id_to_reschedule")
 
-        try:
-            task_metadata_payload = {
-                 "description": search_context.get("description", "Untitled Task"),
-                 "estimated_duration": search_context.get("duration"),
-                 "type": "task", # Explicitly set type for Task
-                 "project": params.project,
-                 "date": approved_slots[0].get("date"),
-                 "time": approved_slots[0].get("time"),
-                 # Include effective due date if available in context
-                 "original_date": search_context.get("effective_due_date"),
-            }
-            task_title = task_metadata_payload["description"]
+        # log_info("tool_definitions", fn_name, f"User {user_id} finalizing task. LLM desc: '{parsed_details.get('description', 'N/A')[:30]}...'") # Verbose
 
-            # Use task_manager.create_task which handles DB insertion
-            created_meta = task_manager.create_task(user_id, task_metadata_payload)
+        if not approved_slots: return {"success": False, "item_id": None, "booked_count": 0, "message": "No approved slots."}
 
-            if created_meta and created_meta.get("event_id"):
-                item_id = created_meta["event_id"]
-                log_info("tool_definitions", fn_name, f"Task metadata created successfully via task_manager: {item_id}");
-            else:
-                 raise ValueError("Failed to create task metadata via task_manager.")
+        task_metadata_payload = {
+            "type": "task", "status": "pending",
+            "description": params.task_description_override or parsed_details.get("description", f"Task from: {original_request_nlp[:50]}"),
+            "title": params.task_description_override or parsed_details.get("description", f"Task from: {original_request_nlp[:50]}"),
+            "estimated_duration": params.estimated_total_duration_override or parsed_details.get("estimated_total_duration"),
+            "project": params.project_override or parsed_details.get("project"),
+            "date": parsed_details.get("due_date") # Due date from LLM
+        }
+        for key in ["project", "date", "estimated_duration"]: # Ensure None if empty
+            if not task_metadata_payload[key]: task_metadata_payload[key] = None
+        task_title_for_user_message = task_metadata_payload["description"]
 
-        except Exception as create_err:
-            log_error("tool_definitions", fn_name, f"Metadata creation failed: {create_err}", create_err)
-            return {"success": False, "item_id": None, "booked_count": 0, "message": "Failed to save the task details before scheduling."}
+        if item_id_to_reschedule:
+            updated_item_obj = task_manager.update_item_details(user_id, item_id_to_reschedule, task_metadata_payload)
+            if updated_item_obj and updated_item_obj.get("event_id"): item_id_final = updated_item_obj["event_id"]
+            else: return {"success": False, "item_id": item_id_to_reschedule, "booked_count": 0, "message": f"Failed to update task '{task_title_for_user_message[:30]}'."}
+        else:
+            created_meta_item = task_manager.create_item(user_id, task_metadata_payload)
+            if created_meta_item and created_meta_item.get("event_id"): item_id_final = created_meta_item["event_id"]
+            else: return {"success": False, "item_id": None, "booked_count": 0, "message": "Failed to save new task."}
 
-        # Proceed to booking only if metadata creation succeeded
-        booking_result = task_manager.schedule_work_sessions(user_id, item_id, approved_slots)
+        if not item_id_final: return {"success": False, "item_id": None, "booked_count": 0, "message": "Internal error preparing task ID."}
+
+        if item_id_to_reschedule and DB_IMPORTED and activity_db_module_ref: # Clear old sessions if rescheduling
+            original_task_data = activity_db_module_ref.get_task(item_id_to_reschedule)
+            if original_task_data:
+                old_session_ids = original_task_data.get("session_event_ids", [])
+                if isinstance(old_session_ids, list) and old_session_ids:
+                    task_manager.cancel_sessions(user_id, item_id_to_reschedule, old_session_ids)
+        
+        booking_result = task_manager.schedule_work_sessions(user_id, item_id_final, approved_slots)
         if booking_result.get("success"):
-            log_info("tool_definitions", fn_name, f"Booked {booking_result.get('booked_count', 0)} sessions for {item_id}")
-            return {
-                "success": True,
-                "item_id": item_id,
-                "booked_count": booking_result.get("booked_count", 0),
-                "message": booking_result.get("message", f"Task '{task_title[:30]}...' created & sessions booked.")
-            }
+            return {"success": True, "item_id": item_id_final, "booked_count": booking_result.get("booked_count", 0), "message": booking_result.get("message")}
         else:
-            log_error("tool_definitions", fn_name, f"Metadata created ({item_id}), but booking sessions failed: {booking_result.get('message')}")
-            return {
-                "success": False,
-                "item_id": item_id,
-                "booked_count": 0,
-                "message": f"Task '{task_title[:30]}...' was created, but scheduling sessions failed: {booking_result.get('message')}"
-            }
-    except pydantic.ValidationError as e:
-         log_error("tool_definitions", fn_name, f"Validation Error: {e}");
-         return {"success": False, "item_id": None, "booked_count": 0, "message": f"Invalid parameters: {e}"}
-    except Exception as e:
-         log_error("tool_definitions", fn_name, f"Unexpected error: {e}", e)
-         return {"success": False, "item_id": item_id, "booked_count": 0, "message": f"Error: {e}"}
+            return {"success": False, "item_id": item_id_final, "booked_count": 0, "message": f"Task '{task_title_for_user_message[:30]}' saved, but scheduling failed: {booking_result.get('message')}"}
+    except pydantic.ValidationError as e: return {"success": False, "item_id": None, "booked_count": 0, "message": f"Invalid params: {e.errors()}"}
+    except Exception as e: log_error("tool_definitions", fn_name, f"Error: {e}", e); return {"success": False, "item_id": item_id_final, "booked_count": 0, "message": f"Error: {e}."}
 
-
-# --- Returns dict ---
-def update_item_details_tool(user_id, params: UpdateItemDetailsParams) -> Dict:
-    """Updates core details (desc, date, time, estimate, project) of ANY item type (Task, Reminder, ToDo)."""
-    # --- Function body remains the same ---
-    fn_name = "update_item_details_tool";
+# --- Item Modification & Listing Tools (Largely Unchanged) ---
+def update_item_details_tool(user_id: str, params: UpdateItemDetailsParams) -> Dict:
+    fn_name = "update_item_details_tool"
     try:
-        log_info("tool_definitions", fn_name, f"Executing user={user_id}, item={params.item_id}, updates={list(params.updates.keys())}")
-        updated_item = task_manager.update_task(user_id, params.item_id, params.updates)
+        # log_info("tool_definitions", fn_name, f"User {user_id} updating item {params.item_id}, updates: {list(params.updates.keys())}") # Verbose
+        updates_for_details = params.updates.copy()
+        status_to_set = updates_for_details.pop("status", None)
+        message_parts = []; overall_success = True
 
-        if updated_item:
-             return {"success": True, "message": f"Item '{params.item_id[:8]}...' updated successfully."}
-        else:
-             log_warning("tool_definitions", fn_name, f"Update failed for item {params.item_id} (not found or no change?).")
-             item_exists = False
-             if DB_IMPORTED: item_exists = activity_db.get_task(params.item_id) is not None
-             if item_exists:
-                  return {"success": False, "message": f"Failed to apply updates to item {params.item_id[:8]}... (perhaps no change or internal error)."}
-             else:
-                  return {"success": False, "message": f"Item {params.item_id[:8]}... not found."}
-    except pydantic.ValidationError as e:
-         log_error("tool_definitions", fn_name, f"Validation Error: {e}", e, user_id=user_id)
-         return {"success": False, "message": f"Invalid parameters: {e}"}
-    except Exception as e:
-         log_error("tool_definitions", fn_name, f"Unexpected error: {e}", e, user_id=user_id)
-         return {"success": False, "message": f"Error during update: {e}."}
+        if status_to_set:
+            status_update_success = False; status_update_message = ""
+            if status_to_set.lower() == "cancelled":
+                status_update_success = task_manager.cancel_item(user_id, params.item_id)
+                status_update_message = f"Item cancellation {'succeeded' if status_update_success else 'failed'}"
+            else:
+                updated_item_status_obj = task_manager.update_item_status(user_id, params.item_id, status_to_set)
+                status_update_success = updated_item_status_obj is not None
+                status_update_message = f"Status update to '{status_to_set}' {'succeeded' if status_update_success else 'failed'}"
+            message_parts.append(status_update_message)
+            if not status_update_success: overall_success = False
+        
+        if updates_for_details and overall_success:
+            updated_item_obj = task_manager.update_item_details(user_id, params.item_id, updates_for_details)
+            if updated_item_obj: message_parts.append("Other details updated.")
+            else: message_parts.append("Failed to update other details."); overall_success = False
+        elif not updates_for_details and not status_to_set:
+             return {"success": False, "message": "No updates provided."}
 
-# --- Returns dict ---
-def update_item_status_tool(user_id, params: UpdateItemStatusParams) -> Dict:
-    """Changes status OR cancels/deletes ANY item type. Requires existing item_id."""
-    # --- Function body remains the same ---
-    fn_name = "update_item_status_tool"
+        final_message = "Item update: " + "; ".join(message_parts) if message_parts else "No specific updates."
+        if not overall_success and not message_parts: final_message = "Failed to update item status."
+        return {"success": overall_success, "message": final_message}
+    except pydantic.ValidationError as e: return {"success": False, "message": f"Invalid update params: {e.errors()}"}
+    except Exception as e: log_error("tool_definitions", fn_name, f"Error: {e}", e); return {"success": False, "message": f"Error updating: {e}."}
+
+def format_list_for_display_tool(user_id: str, params: FormatListForDisplayParams) -> Dict:
+    fn_name = "format_list_for_display_tool"
     try:
-        log_info("tool_definitions", fn_name, f"Executing user={user_id}, item={params.item_id}, status={params.new_status}")
-        success = False; message = ""
-        if params.new_status == "cancelled":
-            success = task_manager.cancel_item(user_id, params.item_id)
-            message = f"Item '{params.item_id[:8]}...' cancel processed. Result: {'Success' if success else 'Failed/Not Found'}."
-        else:
-            updated_item = task_manager.update_task_status(user_id, params.item_id, params.new_status)
-            success = updated_item is not None
-            message = f"Status update to '{params.new_status}' for item '{params.item_id[:8]}...' {'succeeded' if success else 'failed/not found'}."
-        return {"success": success, "message": message}
-    except pydantic.ValidationError as e:
-         log_error("tool_definitions", fn_name, f"Validation Error: {e}");
-         return {"success": False, "message": f"Invalid parameters: {e}"}
-    except Exception as e:
-         log_error("tool_definitions", fn_name, f"Unexpected error: {e}", e)
-         return {"success": False, "message": f"Error updating status: {e}."}
+        status_filter = params.status_filter if params.status_filter else 'active'
+        date_range_tuple = tuple(params.date_range) if params.date_range else None
+        # log_info("tool_definitions", fn_name, f"User {user_id} formatting list. Status={status_filter}, Proj={params.project_filter}, Range={date_range_tuple}") # Verbose
+        list_body, list_mapping = task_query_service.get_formatted_list(
+             user_id=user_id, date_range=date_range_tuple,
+             status_filter=status_filter, project_filter=params.project_filter if params.project_filter else None
+        )
+        item_count = len(list_mapping)
+        message = f"Found {item_count} item(s)." if item_count > 0 else "No items found matching your criteria."
+        if item_count > 0 and not list_body: message = f"Found {item_count} items, but error formatting list."
+        return {"success": True, "formatted_list_string": list_body or "", "list_mapping": list_mapping or {}, "count": item_count, "message": message}
+    except pydantic.ValidationError as e: return {"success": False, "formatted_list_string": "", "list_mapping": {}, "count": 0, "message": f"Invalid list params: {e.errors()}"}
+    except Exception as e: log_error("tool_definitions", fn_name, f"Error: {e}", e); return {"success": False, "formatted_list_string": "", "list_mapping": {}, "count": 0, "message": f"Error listing: {e}."}
 
-# --- Returns dict ---
-def update_user_preferences_tool(user_id, params: UpdateUserPreferencesParams) -> Dict:
-    # --- Function body remains the same ---
+# --- Preference & Auth Tools (Unchanged) ---
+def update_user_preferences_tool(user_id: str, params: UpdateUserPreferencesParams) -> Dict:
     fn_name = "update_user_preferences_tool"
     try:
-        update_keys = list(params.updates.keys()) if params.updates else []
-        log_info("tool_definitions", fn_name, f"Executing user={user_id}, updates={update_keys}")
+        # log_info("tool_definitions", fn_name, f"User {user_id} updating preferences: {list(params.updates.keys())}") # Verbose
         success = config_manager.update_preferences(user_id, params.updates)
         return {"success": success, "message": f"Preferences update {'succeeded' if success else 'failed'}."}
-    except pydantic.ValidationError as e:
-         log_error("tool_definitions", fn_name, f"Validation Error: {e}");
-         return {"success": False, "message": f"Invalid parameters: {e}"}
-    except Exception as e:
-         log_error("tool_definitions", fn_name, f"Unexpected error: {e}", e)
-         return {"success": False, "message": f"Error: {e}."}
+    except pydantic.ValidationError as e: return {"success": False, "message": f"Invalid preference params: {e.errors()}"}
+    except Exception as e: log_error("tool_definitions", fn_name, f"Error: {e}", e); return {"success": False, "message": f"Error: {e}."}
 
-# --- Returns dict ---
-def initiate_calendar_connection_tool(user_id, params: InitiateCalendarConnectionParams) -> Dict:
-    # --- Function body remains the same ---
+def initiate_calendar_connection_tool(user_id: str, params: InitiateCalendarConnectionParams) -> Dict:
     fn_name = "initiate_calendar_connection_tool"
     try:
-        log_info("tool_definitions", fn_name, f"Executing for user {user_id}")
+        # log_info("tool_definitions", fn_name, f"User {user_id} initiating GCal connection.") # Verbose
         result_dict = config_manager.initiate_calendar_auth(user_id)
+        # 'success' flag based on whether an auth URL was generated or token already exists
         result_dict["success"] = result_dict.get("status") in ["pending", "token_exists"]
         return result_dict
-    except pydantic.ValidationError as e:
-         log_error("tool_definitions", fn_name, f"Validation Error: {e}");
-         return {"success": False, "message": f"Invalid parameters: {e}"}
-    except Exception as e:
-         log_error("tool_definitions", fn_name, f"Unexpected error: {e}", e)
-         return {"success": False, "status": "fails", "message": f"Error: {e}."}
+    except Exception as e: log_error("tool_definitions", fn_name, f"Error: {e}", e); return {"success": False, "status": "error", "message": f"Error initiating GCal: {e}."}
 
-# --- Returns dict ---
-def cancel_task_sessions_tool(user_id, params: CancelTaskSessionsParams) -> Dict:
-    """Removes specific scheduled GCal sessions linked explicitly to a Task and updates Task metadata."""
-    fn_name = "cancel_task_sessions_tool"
-    try:
-        log_info("tool_definitions", fn_name, f"Executing user={user_id}, Task={params.task_id}, SessionIDs={params.session_ids_to_cancel}")
-
-        # --- ADDED TYPE CHECK ---
-        item_metadata = None
-        if DB_IMPORTED:
-            item_metadata = activity_db.get_task(params.task_id)
-
-        if item_metadata is None:
-            return {"success": False, "cancelled_count": 0, "message": f"Task {params.task_id[:8]}... not found."}
-        if item_metadata.get("type") != "task":
-            log_warning("tool_definitions", fn_name, f"Attempted to cancel sessions for non-task item {params.task_id} (type: {item_metadata.get('type')}).")
-            return {"success": False, "cancelled_count": 0, "message": "Cannot cancel sessions for items that are not Tasks."}
-        # --- END ADDED TYPE CHECK ---
-
-        result = task_manager.cancel_sessions(user_id, params.task_id, params.session_ids_to_cancel)
-        return result
-    except pydantic.ValidationError as e:
-         log_error("tool_definitions", fn_name, f"Validation Error: {e}");
-         return {"success": False, "cancelled_count": 0, "message": f"Invalid parameters: {e}"}
-    except Exception as e:
-         log_error("tool_definitions", fn_name, f"Unexpected error: {e}", e)
-         return {"success": False, "cancelled_count": 0, "message": f"Error: {e}."}
-
-# --- Returns dict ---
-def interpret_list_reply_tool(user_id, params: InterpretListReplyParams) -> Dict:
-    """Placeholder tool to interpret replies to numbered lists."""
-    # --- Function body remains the same ---
+def interpret_list_reply_tool(user_id: str, params: InterpretListReplyParams) -> Dict: # Potentially obsolete
     fn_name = "interpret_list_reply_tool"
     try:
-        log_warning("tool_definitions", fn_name, f"Tool executed for user {user_id} - Implementation is basic.")
+        # log_info("tool_definitions", fn_name, f"User {user_id} interpreting list reply: '{params.user_reply[:30]}...'") # Verbose
         extracted_numbers = [int(s) for s in re.findall(r'\b\d+\b', params.user_reply)]
         identified_item_ids = []
         if params.list_mapping:
              identified_item_ids = [params.list_mapping.get(str(num)) for num in extracted_numbers if str(num) in params.list_mapping]
              identified_item_ids = [item_id for item_id in identified_item_ids if item_id is not None]
-
         if identified_item_ids:
-             log_info("tool_definitions", fn_name, f"Identified numbers {extracted_numbers} mapping to IDs: {identified_item_ids}")
-             return { "success": True, "action": "process", "item_ids": identified_item_ids, "message": f"Identified item number(s): {', '.join(map(str, extracted_numbers))}." }
+             return { "success": True, "item_ids": identified_item_ids, "message": f"Interpreted item(s): {', '.join(map(str, extracted_numbers))}." }
         else:
-             log_info("tool_definitions", fn_name, f"No valid item numbers found in reply: '{params.user_reply}'")
-             return {"success": False, "item_ids": [], "message": "Couldn't find any valid item numbers in your reply."}
-    except pydantic.ValidationError as e:
-         log_error("tool_definitions", fn_name, f"Validation Error: {e}");
-         return {"success": False, "item_ids": [], "message": f"Invalid parameters: {e}"}
-    except Exception as e:
-         log_error("tool_definitions", fn_name, f"Error parsing list reply: {e}", e)
-         return {"success": False, "item_ids": [], "message": "Sorry, I had trouble interpreting your reply."}
-
-# --- Returns dict ---
-def get_formatted_task_list_tool(user_id, params: GetFormattedTaskListParams) -> Dict:
-    """Retrieves and formats a list of items (any type) based on filters."""
-    # --- Function body remains the same ---
-    fn_name = "get_formatted_task_list_tool"
-    try:
-        status_filter = params.status_filter or 'active'
-        log_info("tool_definitions", fn_name, f"Executing user={user_id}, Filter={status_filter}, Proj={params.project_filter}, Range={params.date_range}")
-        date_range_tuple = tuple(params.date_range) if params.date_range else None
-        list_body, list_mapping = task_query_service.get_formatted_list(
-             user_id=user_id,
-             date_range=date_range_tuple,
-             status_filter=status_filter,
-             project_filter=params.project_filter
-        )
-        item_count = len(list_mapping);
-        message = f"Found {item_count} item(s)." if item_count > 0 else "No items found matching your criteria."
-        if item_count > 0 and not list_body:
-             log_warning("tool_definitions", fn_name, f"Found {item_count} items but list body is empty.")
-             message = f"Found {item_count}, but there was an error formatting the list."
-        return {"success": True, "list_body": list_body or "", "list_mapping": list_mapping or {}, "count": item_count, "message": message}
-    except pydantic.ValidationError as e:
-         log_error("tool_definitions", fn_name, f"Validation Error: {e}");
-         return {"success": False, "list_body": "", "list_mapping": {}, "count": 0, "message": f"Invalid parameters: {e}"}
-    except Exception as e:
-         log_error("tool_definitions", fn_name, f"Unexpected error: {e}", e)
-         return {"success": False, "list_body": "", "list_mapping": {}, "count": 0, "message": f"Sorry, an error occurred while retrieving the list: {e}."}
-
+             return {"success": False, "item_ids": [], "message": "Couldn't find valid item numbers in reply."}
+    except pydantic.ValidationError as e: return {"success": False, "item_ids": [], "message": f"Invalid params: {e.errors()}"}
+    except Exception as e: log_error("tool_definitions", fn_name, f"Error: {e}", e); return {"success": False, "item_ids": [], "message": "Error interpreting reply."}
 
 # =====================================================
-# == Tool Dictionaries (MUST COME AFTER MODELS & FUNCS) ==
+# == Tool Dictionaries ==
 # =====================================================
-
 AVAILABLE_TOOLS = {
+    "create_todo": create_todo_tool,
     "create_reminder": create_reminder_tool,
-    "create_task": create_task_tool, # For schedulable Tasks
-    "create_todo": create_todo_tool,   # <-- NEW
-    "propose_task_slots": propose_task_slots_tool,
-    "finalize_task_and_book_sessions": finalize_task_and_book_sessions_tool,
+    "propose_task_slots": propose_task_slots_tool, # Uses revised logic
+    "finalize_task_and_book_sessions": finalize_task_and_book_sessions_tool, # Uses revised logic
     "update_item_details": update_item_details_tool,
-    "update_item_status": update_item_status_tool,
+    "format_list_for_display": format_list_for_display_tool,
     "update_user_preferences": update_user_preferences_tool,
     "initiate_calendar_connection": initiate_calendar_connection_tool,
-    "cancel_task_sessions": cancel_task_sessions_tool, # Only for Tasks
-    "interpret_list_reply": interpret_list_reply_tool,
-    "get_formatted_task_list": get_formatted_task_list_tool
+    "interpret_list_reply": interpret_list_reply_tool, # Kept for now, but Orchestrator aims to supersede
 }
-
 TOOL_PARAM_MODELS = {
+    "create_todo": CreateToDoParams,
     "create_reminder": CreateReminderParams,
-    "create_task": CreateTaskParams, # For schedulable Tasks
-    "create_todo": CreateToDoParams,   # <-- NEW
-    "propose_task_slots": ProposeTaskSlotsParams,
-    "finalize_task_and_book_sessions": FinalizeTaskAndBookSessionsParams,
+    "propose_task_slots": ProposeTaskSlotsParams, # Pydantic model itself doesn't change much externally
+    "finalize_task_and_book_sessions": FinalizeTaskAndBookSessionsParams, # Pydantic model updated
     "update_item_details": UpdateItemDetailsParams,
-    "update_item_status": UpdateItemStatusParams,
+    "format_list_for_display": FormatListForDisplayParams,
     "update_user_preferences": UpdateUserPreferencesParams,
     "initiate_calendar_connection": InitiateCalendarConnectionParams,
-    "cancel_task_sessions": CancelTaskSessionsParams, # Only for Tasks
     "interpret_list_reply": InterpretListReplyParams,
-    "get_formatted_task_list": GetFormattedTaskListParams
 }
-
 # --- END OF FULL agents/tool_definitions.py ---

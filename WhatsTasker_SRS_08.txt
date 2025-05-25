@@ -1,100 +1,227 @@
-﻿WhatsTasker: SRS (v0.8k - WhatsApp Bridge & Active Scheduler)
+﻿# WhatsTasker: System Requirements Specification (SRS)
 
-**1. Goals & Principles**
+**Version:** 0.9.1\_twilio\_gcal\_status
+**Document Version:** 1.0
+**Date:** 2025-05-18
 
-*   **Primary Goal:** Create a WhatsApp-based personal productivity assistant that acts as an intelligent Time Management Expert. It should understand user context, facilitate management of **Reminders, Tasks, and ToDos** via natural language, and integrate seamlessly with the user's primary calendar (Google Calendar initially for scheduled Tasks and timed Reminders).
-*   **Core Architecture:**
-    *   **Interface Layer:** User interaction occurs via WhatsApp. An external **Node.js bridge (`wa_bridge.js`)** utilizes `whatsapp-web.js` to connect to WhatsApp, receive messages, and send messages. This bridge communicates with the Python backend via a dedicated FastAPI interface (`bridge/whatsapp_interface.py`). An alternative CLI interface (`bridge/cli_interface.py`) exists for debugging/testing. The active interface is selected at runtime.
-    *   **Backend Entry Point:** The selected FastAPI interface (`whatsapp_interface.py` or `cli_interface.py`) receives incoming messages.
-    *   **Routing Layer (`request_router.py`):** Receives messages from the active bridge API, normalizes user ID, determines user status (`new`, `onboarding`, `active`), and routes requests to the appropriate Agent or Cheat command handler.
-    *   **Agent Layer (`OnboardingAgent`, `OrchestratorAgent`):** Central reasoning hubs using a **Pure LLM Control Flow**. Process user input within context, leverage Structured Tool Use (Instructor/Pydantic) to delegate actions to Tools. Manage conversational state and response generation based on LLM decisions and tool results.
-    *   **Tool Layer (`tool_definitions.py`):** Defines Pydantic models for tool parameters and Python functions that act as validated interfaces to the Service Layer. Tools are designed to create/manage distinct item types: **Reminders, Tasks, and ToDos.**
-    *   **Service Layer (`TaskManager`, `TaskQueryService`, `ConfigManager`, `RoutineService`, `NotificationService`, `SyncService`, `Cheats`):** Encapsulates business logic, data manipulation, and interactions with persistent stores (SQLite via `activity_db.py`) and external APIs (GCal). Invoked by Tools or scheduled jobs. `SyncService` provides context merging and updates WhatsTasker item metadata if corresponding GCal data has changed.
-    *   **Scheduler (`scheduler_service.py`):** An APScheduler instance runs background jobs (`RoutineService` checks, `NotificationService` checks, daily cleanup) at configured intervals.
-    *   **Pure LLM Control Flow:** Agents rely **entirely on the LLM** (guided by specific system prompts) to manage conversational state, ask clarifying questions, interpret user replies, decide which tool to call (if any), and formulate responses based on history and tool results. Python code primarily executes validated tool calls requested by the LLM.
-    *   **Two-Step LLM Interaction (with Tools):** Standard pattern used by Agents when a tool is invoked (LLM plans -> Tool executes -> LLM responds based on result).
-*   **Modularity & Reusability:** Components are clearly separated. Services contain reusable business logic. Tools provide reliable interfaces.
-*   **Reliability & Maintainability:** Prioritize reliable execution via structured Tool Use and Pydantic validation. Code includes type hinting and clear documentation. Conversational logic resides primarily within the LLM prompts. `whatsapp-web.js` dependency introduces external volatility.
-*   **LLM Interaction:** Utilizes OpenAI's Tool Use capabilities via Instructor/Pydantic. `propose_task_slots` tool uses a focused LLM sub-call.
-*   **Item Types & Definitions:**
-    *   **Reminder:** An alert for a specific date and optional time. Timed Reminders are synchronized with the user's primary calendar as short events. Untimed Reminders default to the user's work start time for listing purposes within WhatsTasker and do not create calendar events. Created via a dedicated tool or flow.
-    *   **Task:** An actionable item requiring dedicated effort and time, for which the system helps schedule work sessions in the user's primary calendar. Tasks have a description, due date/timeframe, and estimated total duration. Work sessions are booked as calendar events. Created via a dedicated tool or flow.
-    *   **ToDo:** A simple actionable item for tracking, which may or may not have a due date and does not have system-scheduled calendar time. ToDos are managed within WhatsTasker's internal store and do not create calendar events. Created via a dedicated tool or flow (e.g., when scheduling help for a task is declined).
-*   **Data Handling & State:**
-    *   Persistence: **Primary Item Store (SQLite via `activity_db.py`)** for Reminders, Tasks, ToDos, messages, and system logs. User Registry (JSON via `user_registry.py`), Encrypted Token Store (`token_store.py`).
-    *   User Status: Tracked via `status` in preferences (`new`, `onboarding`, `active`), managed by `user_registry.py` and `config_manager.py`. Dictates routing in `request_router.py`.
-    *   Runtime State: Central, thread-safe `AgentStateManager` manages in-memory state (preferences, history, item context snapshot, API clients, notification tracking). Loaded/created via `user_manager.py`.
-    *   Context Provision: Relevant context loaded via `AgentStateManager` and provided to the appropriate Agent. Routines use `SyncService` for context.
-    *   State Updates: Services update persistent stores and signal updates to in-memory state via `AgentStateManager`.
-    *   Synchronization (`SyncService`): Merges GCal events with WhatsTasker items (from DB) for context snapshots. **If a WhatsTasker-managed item (Task or Reminder linked to GCal) has different data in GCal (e.g., changed time, title), `SyncService` updates the corresponding record in the WhatsTasker database (`activity_db.py`).** External GCal events not originating from WhatsTasker are included in the context snapshot but not persisted as new items in the WhatsTasker DB by `SyncService`.
+---
 
-*   **Error Handling:** Tools/Services return status/messages. Pydantic validates tool parameters. Agents interpret tool failures via LLM. Bridge interface handles basic connection/ACK errors.
+## 1. Introduction
 
-**2. Architecture Overview**
-(Diagram concept remains similar, with the understanding that "tasks" now encompass "Reminders, Tasks, and ToDos" at a high level, with services handling their specific behaviors.)
-1.  **External Bridge (`wa_bridge.js`):** (No change)
-2.  **Interface Layer (Python - `whatsapp_interface.py` or `cli_interface.py`):** (No change)
-3.  **Routing Layer (`request_router.py`):** (No change in core routing logic based on status)
-4.  **Agent Layer (`onboarding_agent.py` or `orchestrator_agent.py`):**
-    *   Receives user message and context snapshot. Loads system prompt. Defines available Tools.
-    *   LLM Call 1 (Planner): Sends context, history, message, tools to LLM. LLM decides: Respond directly or call tool(s) (e.g., to create a Reminder, Task, or ToDo).
-5.  **Execution Layer:**
-    *   **If LLM Responds Directly:** Agent uses text.
-    *   **If LLM Calls Tool(s):**
-        *   Agent receives tool call request(s). Validates. Calls corresponding Tool function (`tool_definitions.py`).
-        *   Tool interacts with **Service Layer**.
-        *   Services perform logic (e.g., `TaskManager` creating a `type: "todo"` item in the DB), interact with **Data Layer** and external APIs. Update persistent data & signal memory state updates via `AgentStateManager`.
-        *   Tool returns result dict (`{"success": bool, ...}`).
-6.  **Agent Layer (Response Generation):** (No change)
-7.  **Response Flow:** (No change)
-8.  **Scheduled Tasks (`scheduler_service.py`):**
-    *   Runs independently via APScheduler.
-    *   Triggers jobs in `NotificationService` (check events for Reminders and Task sessions) and `RoutineService` (check triggers, daily cleanup).
-    *   Triggered routines (`check_routine_triggers`) get context via `SyncService` (which includes Reminders, Tasks, ToDos, and external GCal events), generate messages, and return them to the scheduler wrapper.
-    *   Scheduler wrapper calls `request_router.send_message` to queue generated routine messages.
+### 1.1 Purpose
 
-**3. Module & Function Breakdown**
-(Module list remains largely the same. Key changes are in the *functionality* within these modules, e.g., `tool_definitions.py` and `task_manager.py` now need to handle the three distinct item types.)
+This document outlines the System Requirements Specification (SRS) for WhatsTasker, a personal productivity assistant accessed via WhatsApp. It details functional and non-functional requirements for version 0.9.1, focusing on an LLM-driven agent control flow, multi-language support, Twilio-based WhatsApp integration, and enhanced Google Calendar status monitoring.
 
-*   **External Components:**
-    *   `wa_bridge.js`
-*   **Core Infrastructure:**
-    *   `main.py`
-    *   `bridge/whatsapp_interface.py`, `bridge/cli_interface.py`, `bridge/request_router.py`
-    *   `tools/logger.py`, `tools/encryption.py`, `tools/token_store.py`, `tools/activity_db.py` (replaces `metadata_store.py`), `tools/google_calendar_api.py`, `tools/calendar_tool.py`
-    *   `users/user_registry.py`, `users/user_manager.py`
-    *   `services/agent_state_manager.py`
-*   **Service Layer:**
-    *   `services/task_manager.py`: Core logic for creating, updating, and managing **Reminders, Tasks, and ToDos**, including scheduling sessions for Tasks. Interacts with `activity_db.py` and `GoogleCalendarAPI`.
-    *   `services/config_manager.py`
-    *   `services/task_query_service.py`: Data retrieval and formatting logic for **all item types** from `activity_db.py`.
-    *   `services/cheats.py`
-    *   `services/llm_interface.py`
-    *   `services/sync_service.py`: Provides merged context snapshots (WhatsTasker items from DB + GCal events). **Updates WhatsTasker item metadata in DB if corresponding GCal data has changed.**
-    *   `services/scheduler_service.py`
-    *   `services/notification_service.py`: Logic for checking and formatting event notifications (for timed Reminders and scheduled Task sessions).
-    *   `services/routine_service.py`: Logic for checking routine triggers (morning/evening) and generating summaries (which now include **ToDos**). Includes daily cleanup.
-*   **Agent Layer:**
-    *   `agents/orchestrator_agent.py`: Central reasoning hub for **active** users. Its prompt and logic must distinguish and handle creation/management of **Reminders, Tasks, and ToDos**.
-    *   `agents/onboarding_agent.py`: Central reasoning hub for **onboarding** users.
-    *   `agents/tool_definitions.py`: Pydantic models and Python functions for the toolset. Tools will exist to specifically handle `create_reminder`, `create_task` (for schedulable Tasks), and `create_todo`. The existing `create_task` tool might be adapted or a new one added for ToDos. The `update_item_details` and `update_item_status` tools will operate on any item type based on its ID.
-*   **(Obsolete Files):** `metadata_store.py` (functionality absorbed by `activity_db.py`), `agents/intention_agent.py`, etc. (as before).
+### 1.2 Scope
 
-**4. Configuration Files**
-*   `config/prompts.yaml`: Contains system prompts. `orchestrator_agent_system_prompt` must be updated to reflect the three item types and how the LLM should differentiate user intents to call the correct creation tools (e.g., for a Reminder, Task, or ToDo).
-*   `config/messages.yaml`
-*   `.env`
+WhatsTasker is designed as a Time Management Expert that helps users manage Tasks, ToDos, and Reminders through natural language on WhatsApp. It integrates with Google Calendar, uses a metadata store, and includes a Twilio bridge, improved GCal monitoring, and enhanced LLM decision-making.
 
-**5. Key Considerations / Future Work**
-*   **Prompt Engineering:** Critical for the `OrchestratorAgent` to accurately differentiate between Reminders, Tasks, and ToDos based on natural language input and guide the user appropriately if information is missing for a specific type (e.g., asking for duration if it seems like a Task).
-*   **Tooling for ToDos:** Ensure `tool_definitions.py` and `task_manager.py` clearly support creating items with `type="todo"`. This likely means:
-    *   Modifying the existing `create_task_tool` and its underlying `task_manager.create_task` function to accept an explicit `item_type` parameter (e.g., "task" or "todo") driven by the LLM's decision.
-    *   Or, introducing a distinct `create_todo_tool`.
-*   **Evening Review Logic:** `routine_service.generate_evening_review` needs to be updated to include active/due ToDos from the context.
-*   **WhatsApp Bridge Stability:** (No change)
-*   **Deployment Complexity:** (No change)
-*   **Error Handling:** (No change)
-*   **Security:** (No change)
-*   **Scalability:** (No change)
-*   **Synchronization (`SyncService`):** Behavior clarified: updates WT item metadata in DB if GCal data for that item changes. Full two-way sync for *newly discovered external GCal events* or *creating new GCal events from all WT items* is still deferred.
-*   **Testing:** End-to-end testing must cover the correct classification and handling of all three item types, including their representation in summaries and calendar interactions (or lack thereof for ToDos).
+### 1.3 Definitions, Acronyms, and Abbreviations
+
+* **LLM:** Large Language Model
+* **PRD:** Product Requirements Document
+* **SRS:** System Requirements Specification
+* **GCal:** Google Calendar
+* **Item:** Generic term for Tasks, ToDos, or Reminders
+* **Task:** Work item with a due date/time
+* **ToDo:** Simple memory aid
+* **Reminder:** Time-based alert
+* **Working Session:** Calendar block for Task
+* **UI:** User Interface
+* **API:** Application Programming Interface
+
+---
+
+## 2. Overall Description
+
+### 2.1 Product Perspective
+
+WhatsTasker is a backend system that interacts with users via messaging platforms. It uses LLMs for conversation management, Google Calendar APIs for scheduling, and internal storage for data.
+
+### 2.2 Product Features (v0.9.1)
+
+1. **Multi-User Support** (via phone number)
+2. **Multi-Bridge Interface:**
+
+   * WhatsApp via `whatsapp-web.js`
+   * WhatsApp via Twilio API
+   * CLI for testing
+3. **LLM-Driven Agent:**
+
+   * Multilingual understanding and intent recognition
+   * Proactive clarification and tool use
+4. **Item Management:**
+
+   * Creation, editing, filtering
+   * Distinction between Task, ToDo, and Reminder
+5. **Google Calendar Integration:**
+
+   * Syncs timed Reminders and Working Sessions
+   * Tracks GCal status: `not_integrated`, `pending_auth`, `connected`, `error`
+6. **Smart Task Scheduling:**
+
+   * Suggests calendar slots using duration and preferences
+7. **User Preferences:**
+
+   * Language, timezone, and work settings
+8. **Automated Summaries:**
+
+   * Morning and evening briefings
+9. **Notifications:**
+
+   * Pre-event alerts
+10. **Fallback Mode:**
+
+* Core task management without calendar
+
+### 2.3 User Characteristics
+
+Target users are individuals aiming to improve productivity using WhatsApp-based conversational tools.
+
+### 2.4 Operating Environment
+
+* Backend: Python
+* Bridges: Node.js (web.js) and Python (Twilio)
+* DB: SQLite
+* Services: OpenAI, Google Calendar API, Twilio
+
+### 2.5 Constraints
+
+* Dependent on LLM and external APIs
+* `whatsapp-web.js` instability
+* Secure handling of user data (tokens, preferences)
+* English and Hebrew support initially
+
+---
+
+## 3. System Features
+
+### 3.1 Interface Layer
+
+Supports interaction via WhatsApp (web.js and Twilio), CLI, with runtime-configurable active interface. User IDs normalized across bridges.
+
+### 3.2 Routing Layer
+
+Handles messages, determines user state, routes to onboarding or orchestrator agents, processes cheat/debug commands, supports internal events.
+
+### 3.3 Agent Layer
+
+Agents use full LLM control flow to:
+
+* Parse intent
+* Handle ambiguity
+* Use tools
+* Respond in preferred language
+* Manage onboarding, item creation, scheduling, and routines
+
+### 3.4 Tool Layer
+
+Pydantic-validated functions for:
+
+* Creating todos/reminders
+* Scheduling tasks
+* Updating preferences
+* Booking calendar slots
+
+### 3.5 Service Layer
+
+Encapsulates logic for:
+
+* Managing items and user config
+* GCal sync
+* Notification generation
+* Summarization routines
+
+### 3.6 Data Layer
+
+* SQLite: Items, logs
+* JSON: Preferences
+* Encrypted storage: Tokens
+* Enforced status values for GCal integration
+
+### 3.7 Scheduler
+
+Uses APScheduler for:
+
+* Notifications
+* Summaries
+* Cleanup routines
+
+### 3.8 Multi-Language Support
+
+All user-facing communication is generated in the user's preferred language.
+
+---
+
+## 4. External Interface Requirements
+
+### 4.1 User Interfaces
+
+* WhatsApp via `whatsapp-web.js`
+* WhatsApp via Twilio
+* CLI
+
+### 4.2 Hardware Interfaces
+
+* Standard server environments
+
+### 4.3 Software Interfaces
+
+* OpenAI API
+* Google Calendar API
+* Twilio API
+
+### 4.4 Communications Interfaces
+
+* Node.js and Python communicate over FastAPI HTTP
+* Webhooks and REST API used with Twilio
+* All external communications via HTTPS
+
+---
+
+## 5. Non-Functional Requirements
+
+### 5.1 Performance
+
+* LLM replies: 5–10 sec
+* Tool timeouts and optimization
+
+### 5.2 Security
+
+* Token encryption
+* Secure storage of API keys
+* HTTPS for all communications
+
+### 5.3 Reliability
+
+* Graceful failure handling
+* GCal error tracking and recovery
+* Twilio bridge as reliable fallback
+
+### 5.4 Usability
+
+* Intuitive conversation design
+* Clear error messages in user language
+
+### 5.5 Maintainability
+
+* Modular architecture
+* Typed code and documentation
+* Externalized config
+
+### 5.6 Portability
+
+* Python: Linux/Docker
+* Node.js: Required for `whatsapp-web.js`
+
+---
+
+## 6. Other Requirements
+
+### Logging
+
+System-wide logging of actions, messages, agent decisions, and errors is required and stored in `activity_db.py`.
+
+---
+
+**End of Document**

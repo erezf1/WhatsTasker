@@ -11,31 +11,34 @@ USER_REGISTRY_PATH = f"data/users/registry{DATA_SUFFIX}.json" # Dynamic path
 # --- UPDATED Default Preferences ---
 DEFAULT_PREFERENCES = {
     "status": "new", # 'new', 'onboarding', 'active'
+    # Language Preference
+    "Preferred_Language": None, # e.g., "en", "he"
     # Time & Scheduling Preferences
-    "TimeZone": None, # REQUIRED during onboarding (e.g., "Asia/Jerusalem", "America/New_York")
-    "Work_Start_Time": None, # REQUIRED during onboarding (HH:MM)
-    "Work_End_Time": None,   # REQUIRED during onboarding (HH:MM)
-    "Work_Days": ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday"], # Default, modifiable
-    "Working_Session_Length": "60", # REQUIRED during onboarding (e.g., "60m", "1.5h")
+    "TimeZone": None, # e.g., "Asia/Jerusalem"
+    "Work_Start_Time": None, # HH:MM
+    "Work_End_Time": None,   # HH:MM
+    "Work_Days": ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday"],
+    "Preferred_Session_Length": None, # e.g., "60m", "1.5h"
     # Routine Preferences
-    "Morning_Summary_Time": "09:00" , # User local time (HH:MM), default None
-    "Evening_Summary_Time": "18:00" , # User local time (HH:MM), default None
-    "Enable_Morning": True, # Default enabled if time is set
-    "Enable_Evening": True, # Default enabled if time is set
-    "Enable_Weekly_Reflection": False, # Future use
-    # Notification Preferences (NEW)
-    "Notification_Lead_Time": "15m", # Default lead time for event notifications
+    "Morning_Summary_Time": None ,
+    "Evening_Summary_Time": None ,
+    "Enable_Morning": True,
+    "Enable_Evening": True,
+    "Enable_Weekly_Reflection": False,
+    # Notification Preferences
+    "Notification_Lead_Time": "15m",
     # Calendar Integration
-    "Calendar_Enabled": False, # Flag if GCal connected
-    "Calendar_Type": "", # "Google" or potentially others later
-    "email": "", # User's Google email (extracted during auth)
-    "token_file": None, # Path to encrypted token file
+    "Calendar_Enabled": False,
+    "Calendar_Type": "", # "Google"
+    "gcal_integration_status": "not_integrated", # NEW: 'not_integrated', 'pending_auth', 'connected', 'error'
+    "email": "",
+    "token_file": None,
     # Internal Tracking
-    "Last_Sync": "", # ISO 8601 UTC timestamp (e.g., "2025-04-22T15:30:00Z")
-    "last_morning_trigger_date": "", # YYYY-MM-DD string
-    "last_evening_trigger_date": "", # YYYY-MM-DD string
+    "Last_Sync": "",
+    "last_morning_trigger_date": "",
+    "last_evening_trigger_date": "",
     # Misc/Future Use
-    "Holiday_Dates": [], # List of YYYY-MM-DD strings
+    "Holiday_Dates": [],
 }
 # --- END OF UPDATED DEFAULT PREFERENCES ---
 
@@ -144,7 +147,7 @@ def update_preferences(user_id, new_preferences):
 
         if not valid_updates:
              log_warning("user_registry", "update_preferences", f"No valid preference keys provided for update for user {user_id}.")
-             return False # Or True if ignoring invalid keys is considered success? Let's say False.
+             return False
 
         reg[user_id]["preferences"].update(valid_updates)
         save_registry() # Save after updating
@@ -174,7 +177,5 @@ def get_user_preferences(user_id):
 
 # Load registry into memory on module import.
 load_registry()
-
-# (Keep __main__ block for testing if desired)
 
 # --- END OF FILE users/user_registry.py ---

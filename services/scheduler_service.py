@@ -1,57 +1,68 @@
-# --- START OF services/scheduler_service.py ---
+# --- START OF FILE services/scheduler_service.py ---
 
-from typing import Dict, List, Tuple # Added List, Tuple
+from typing import Dict, List, Any # Keep Any for job data
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 import pytz
 from tools.logger import log_info, log_error, log_warning
-# --- ADD THIS IMPORT ---
-from bridge.request_router import send_message
-# ----------------------
 
-# ... (Global scheduler instance, constants, _job_listener) ...
+# --- MODIFIED: Import request_router function ---
+from bridge.request_router import handle_internal_system_event # NEWLY IMPORTED
+
 scheduler = None
-DEFAULT_TIMEZONE = 'UTC'
-NOTIFICATION_CHECK_INTERVAL_MINUTES = 60
-ROUTINE_CHECK_INTERVAL_MINUTES = 60
-DAILY_CLEANUP_HOUR_UTC = 0
-DAILY_CLEANUP_MINUTE_UTC = 5
+DEFAULT_TIMEZONE = 'UTC' # APScheduler's internal timezone for scheduling
+NOTIFICATION_CHECK_INTERVAL_MINUTES = 60 # Check every hour
+ROUTINE_CHECK_INTERVAL_MINUTES = 60    # Check every hour
+DAILY_CLEANUP_HOUR_UTC = 0             # Midnight UTC for daily cleanup
+DAILY_CLEANUP_MINUTE_UTC = 5           # A few minutes past midnight
 
 def _job_listener(event):
-    # ... (function remains the same) ...
-    fn_name = "_job_listener"
+    fn_name = "_job_listener_scheduler" # Unique name
     job = scheduler.get_job(event.job_id) if scheduler else None
     job_name = job.name if job else event.job_id
     if event.exception:
         log_error("scheduler_service", fn_name, f"Job '{job_name}' crashed:", event.exception)
         log_error("scheduler_service", fn_name, f"Traceback: {event.traceback}")
-    pass
+    # else:
+    #     log_info("scheduler_service", fn_name, f"Job '{job_name}' executed successfully.") # Can be verbose
 
-# --- NEW FUNCTION TO WRAP ROUTINE CHECK AND SENDING ---
-def _run_routine_check_and_send():
-    """Wrapper function called by scheduler to run checks and send messages."""
-    fn_name = "_run_routine_check_and_send"
-    #log_info("scheduler_service", fn_name, "Scheduler executing routine check job...")
+def _dispatch_routine_jobs():
+    """
+    Wrapper function called by scheduler.
+    Gets structured routine job data from routine_service and dispatches it
+    to the request_router as an internal system event.
+    """
+    fn_name = "_dispatch_routine_jobs"
+    # log_info("scheduler_service", fn_name, "Scheduler executing routine job dispatch...") # Can be verbose
     try:
-        # Import the check function here if not already imported globally
-        from services.routine_service import check_routine_triggers
-        messages_to_send = check_routine_triggers() # This now returns a list
+        from services.routine_service import check_routine_triggers # Import locally
+        
+        # This now returns List[Dict[str, Any]]
+        # Each dict is like: {"user_id": "X", "routine_type": "morning_summary_data", "data_for_llm": {...}}
+        routine_jobs_to_dispatch = check_routine_triggers() 
 
-        if messages_to_send:
-            log_info("scheduler_service", fn_name, f"Routine check generated {len(messages_to_send)} messages to send.")
-            for user_id, message_content in messages_to_send:
+        if routine_jobs_to_dispatch:
+            log_info("scheduler_service", fn_name, f"Routine check generated {len(routine_jobs_to_dispatch)} internal events to dispatch.")
+            for job_data in routine_jobs_to_dispatch:
+                user_id = job_data.get("user_id")
+                routine_type = job_data.get("routine_type")
+                if not user_id or not routine_type:
+                    log_warning("scheduler_service", fn_name, f"Skipping invalid routine job data: {job_data}")
+                    continue
                 try:
-                    send_message(user_id, message_content)
-                except Exception as send_err:
-                    log_error("scheduler_service", fn_name, f"Error sending routine message to user {user_id}", send_err)
-        else:
-            log_info("scheduler_service", fn_name, "Routine check completed, no messages to send.")
+                    # Call the new router function to handle this internal event
+                    handle_internal_system_event(job_data)
+                    log_info("scheduler_service", fn_name, f"Dispatched internal event '{routine_type}' for user {user_id} to router.")
+                except Exception as dispatch_err:
+                    log_error("scheduler_service", fn_name, f"Error dispatching internal event '{routine_type}' for user {user_id} via router", dispatch_err)
+        # else:
+            # log_info("scheduler_service", fn_name, "Routine check completed, no internal events to dispatch.") # Can be verbose
 
+    except ImportError:
+        log_error("scheduler_service", fn_name, "Failed to import routine_service.check_routine_triggers. Routine jobs skipped.")
     except Exception as job_err:
-        # Log errors occurring within the job execution itself
-        log_error("scheduler_service", fn_name, "Error during scheduled routine check execution", job_err)
-# --- END OF NEW WRAPPER FUNCTION ---
+        log_error("scheduler_service", fn_name, "Error during scheduled routine job dispatch execution", job_err)
 
 
 def start_scheduler() -> bool:
@@ -64,59 +75,57 @@ def start_scheduler() -> bool:
 
     try:
         log_info("scheduler_service", fn_name, "Initializing APScheduler...")
-        executors = {'default': ThreadPoolExecutor(10)}
-        job_defaults = {'coalesce': True, 'max_instances': 1}
+        executors = {'default': ThreadPoolExecutor(10)} # Max 10 concurrent jobs
+        job_defaults = {'coalesce': True, 'max_instances': 1} # Prevent job run overlap
         scheduler = BackgroundScheduler(
             executors=executors, job_defaults=job_defaults, timezone=pytz.timezone(DEFAULT_TIMEZONE)
         )
 
-        # --- Import Job Functions ---
-        check_event_notifications = None
-        # We don't import check_routine_triggers here anymore, it's called in the wrapper
-        daily_cleanup = None
+        # Import Job Functions
+        check_event_notifications_func = None
+        daily_cleanup_func = None
         try:
             from services.notification_service import check_event_notifications
+            check_event_notifications_func = check_event_notifications
         except ImportError as e:
-            log_error("scheduler_service", fn_name, f"Failed to import 'check_event_notifications': {e}. Notification job NOT scheduled.")
+            log_error("scheduler_service", fn_name, f"Import 'check_event_notifications' failed: {e}. Notification job NOT scheduled.")
         try:
-            # Keep import for daily_cleanup
             from services.routine_service import daily_cleanup
+            daily_cleanup_func = daily_cleanup
         except ImportError as e:
-             log_error("scheduler_service", fn_name, f"Failed to import 'daily_cleanup': {e}. Cleanup job NOT scheduled.")
-        # ----------------------------
-
-        # --- Schedule Jobs ---
+             log_error("scheduler_service", fn_name, f"Import 'daily_cleanup' failed: {e}. Cleanup job NOT scheduled.")
+        
         jobs_scheduled_count = 0
-        if check_event_notifications:
-            scheduler.add_job( check_event_notifications, trigger='interval', minutes=NOTIFICATION_CHECK_INTERVAL_MINUTES, id='event_notification_check', name='Check Event Notifications')
-            log_info("scheduler_service", fn_name, f"Scheduled 'check_event_notifications' job every {NOTIFICATION_CHECK_INTERVAL_MINUTES} minutes.")
+        if check_event_notifications_func:
+            scheduler.add_job(
+                check_event_notifications_func, 
+                trigger='interval', minutes=NOTIFICATION_CHECK_INTERVAL_MINUTES, 
+                id='event_notification_check', name='Check Event Notifications'
+            )
             jobs_scheduled_count += 1
-        else:
-             log_warning("scheduler_service", fn_name, "'check_event_notifications' job not scheduled.")
-
-        # --- MODIFIED: Schedule the WRAPPER function ---
+        
+        # Schedule the new routine dispatcher
         scheduler.add_job(
-            _run_routine_check_and_send, # Call the wrapper
-            trigger='interval',
-            minutes=ROUTINE_CHECK_INTERVAL_MINUTES,
-            id='routine_trigger_check',
-            name='Check Routine Triggers & Send' # Updated name slightly
+            _dispatch_routine_jobs, 
+            trigger='interval', minutes=ROUTINE_CHECK_INTERVAL_MINUTES, 
+            id='routine_job_dispatch', name='Dispatch Routine Jobs'
         )
-        log_info("scheduler_service", fn_name, f"Scheduled 'Routine Trigger Check & Send' job every {ROUTINE_CHECK_INTERVAL_MINUTES} minutes.")
-        jobs_scheduled_count += 1 # Assuming this job is always added
-        # -------------------------------------------------
+        jobs_scheduled_count += 1
 
-        if daily_cleanup:
-            scheduler.add_job( daily_cleanup, trigger='cron', hour=DAILY_CLEANUP_HOUR_UTC, minute=DAILY_CLEANUP_MINUTE_UTC, timezone=DEFAULT_TIMEZONE, id='daily_cleanup_job', name='Daily Cleanup')
-            log_info("scheduler_service", fn_name, f"Scheduled 'daily_cleanup' job daily at {DAILY_CLEANUP_HOUR_UTC:02d}:{DAILY_CLEANUP_MINUTE_UTC:02d} {DEFAULT_TIMEZONE}.")
+        if daily_cleanup_func:
+            scheduler.add_job(
+                daily_cleanup_func, 
+                trigger='cron', hour=DAILY_CLEANUP_HOUR_UTC, minute=DAILY_CLEANUP_MINUTE_UTC, 
+                id='daily_cleanup_job', name='Daily Cleanup'
+            )
             jobs_scheduled_count += 1
-        else:
-            log_warning("scheduler_service", fn_name, "'daily_cleanup' job not scheduled.")
+        
+        if jobs_scheduled_count == 0:
+            log_warning("scheduler_service", fn_name, "No jobs were scheduled. Scheduler might not be useful.")
 
-        # ... (rest of the start_scheduler function including listener, start, return True/False) ...
         scheduler.add_listener(_job_listener, EVENT_JOB_ERROR | EVENT_JOB_EXECUTED)
         scheduler.start()
-        log_info("scheduler_service", fn_name, "APScheduler started successfully.")
+        log_info("scheduler_service", fn_name, f"APScheduler started successfully with {jobs_scheduled_count} job(s).")
         return True
 
     except Exception as e:
@@ -124,23 +133,21 @@ def start_scheduler() -> bool:
         scheduler = None
         return False
 
-# --- (shutdown_scheduler function remains the same) ---
 def shutdown_scheduler():
-    # ... (shutdown logic) ...
     global scheduler
     fn_name = "shutdown_scheduler"
     if scheduler and scheduler.running:
         try:
             log_info("scheduler_service", fn_name, "Attempting to shut down scheduler...")
-            scheduler.shutdown(wait=False)
-            log_info("scheduler_service", fn_name, "Scheduler shut down complete.")
+            scheduler.shutdown(wait=False) # Don't wait for jobs to complete
+            log_info("scheduler_service", fn_name, "Scheduler shut down initiated.")
             scheduler = None
         except Exception as e:
             log_error("scheduler_service", fn_name, f"Error during scheduler shutdown: {e}", e)
-    elif scheduler:
+    elif scheduler: # Exists but not running
         log_info("scheduler_service", fn_name, "Scheduler found but was not running.")
         scheduler = None
-    else:
+    else: # No instance
         log_info("scheduler_service", fn_name, "No active scheduler instance to shut down.")
 
-# --- END OF services/scheduler_service.py ---
+# --- END OF FILE services/scheduler_service.py ---

@@ -1,70 +1,277 @@
-﻿WhatsTasker: Product Requirements (v0.8 - Orchestrator Focused)
+﻿WhatsTasker: PRD v0.9 - (LLM-Driven Agent)
 🧭 Overview
-WhatsTasker is a personal productivity assistant designed for individuals seeking to manage their daily items (tasks, reminders, and todos), improve focus, and reduce procrastination through a conversational interface. Accessed via WhatsApp, it functions as an intelligent Time Management Expert, integrating directly with the user's primary calendar (initially Google Calendar for scheduled Tasks and timed Reminders) and utilizing an internal metadata store for enhanced tracking of all items. WhatsTasker aims to streamline daily planning, facilitate frictionless capture of intentions, and support helpful routines.
+WhatsTasker is a personal productivity assistant accessed via WhatsApp. It acts as an intelligent Time Management Expert, helping users manage Tasks, ToDos, and Reminders through a natural language conversational interface in their preferred language. It integrates with the user's primary calendar (initially Google Calendar) and utilizes an internal metadata store for enhanced context and tracking. The system focuses on streamlined capture, flexible interaction, and proactive assistance guided by LLM reasoning.
+
 🌟 Core System Goal
-The system shall act as a proactive and intelligent Time Management Expert. It must understand user context (history, preferences, schedule, items), interpret requests accurately, facilitate effective item and schedule management, and anticipate user needs where feasible within the defined scope, moving beyond simple command execution.
+The system shall act as an intelligent and conversational Time Management Expert. It must:
+Accurately interpret user intent (e.g., create, update, list) from natural language messages in the user's selected language.
+Understand user context (history, preferences, existing Items from calendar and metadata).
+Independently manage the conversational flow to gather necessary information for Items, ask clarifying questions when input is ambiguous or incomplete, and execute actions via tools once requirements are met.
+Facilitate effective management of Tasks, ToDos, and Reminders.
+Leverage its understanding of the user's schedule and preferences to offer smart assistance, particularly for scheduling Tasks.
+Communicate with the user consistently in their chosen language.
 
 🔑 Core Functional Requirements
-1. Multi-User Support & Identification:
-   * Uniquely identify users via their WhatsApp phone number (user_id).
-   * Maintain consistent user_id linkage across all system components.
-2. Item & Reminder Management (Calendar-Based for some):
-   * **Supported Item Types:** The system will support three primary item types:
-      *   **Reminder:** An alert for a specific date and (optional) time. Timed Reminders are synchronized with the user's primary calendar. Untimed Reminders default to the user's work start time for listing purposes but do not create calendar events.
-      *   **Task:** An actionable item requiring dedicated effort and time, for which the system helps schedule work sessions in the user's primary calendar. Tasks have a description, due date/timeframe, and estimated total duration.
-      *   **ToDo:** A simple actionable item that the user wants to track, which may or may not have a due date and does not have system-scheduled calendar time. ToDos are managed within WhatsTasker's internal store.
-   * Direct Calendar Integration: Synchronize confirmed **Tasks** (as scheduled work sessions) and timed **Reminders** with the user's designated primary calendar (initially Google Calendar). **ToDos** are not synchronized with the calendar.
-   * Metadata Augmentation: Maintain an internal metadata store linked to calendar events (for Tasks/Reminders) or internal IDs (for ToDos and untimed Reminders) to track additional details crucial for system operation (e.g., item status [pending, in progress, completed, cancelled], type [task, reminder, todo], estimated effort [for tasks], project tags, timestamps, due dates).
-3. Natural Language Interaction (via WhatsApp):
-   * Conversational Interface: Enable users to interact using free-form, natural language commands and requests.
-   * Contextual Understanding: Maintain and utilize conversational context (recent history, user state) to understand follow-up questions, resolve ambiguities, and provide relevant, coherent responses.
-4. User Capabilities & Outcomes:
-   * Onboarding: Guide new users through an initial setup process to configure essential preferences (e.g., work parameters, calendar connection authorization) and activate their account.
-   * Item Capture & Classification:
-      * Allow users to efficiently capture intentions (tasks, reminders, todos) via natural language.
-      * Intelligently distinguish between simple **Reminders** (typically requiring only description and date/time), effortful **Tasks** (implying duration/effort and eligibility for scheduling work sessions), and basic **ToDos** (requiring only a description, with optional due date, but no scheduled work time).
-      * Reliably extract key details: description, due date/time, type (task, reminder, or todo), and estimated effort (for tasks).
-   * Item Modification: Enable users to accurately modify details of existing items (tasks, reminders, or todos) (e.g., description, due date/time, status, estimated effort for tasks) based on their requests.
-   * Item Status Updates: Allow users to easily update the status of items (e.g., mark as completed, pending), including handling interactive replies to system-generated lists.
-   * Item Viewing & Filtering: Enable users to view their items (tasks, reminders, and todos), with options to filter by relevant criteria such as date range, status (active, completed, etc.), or an associated project tag/label.
-   * Clarification Handling: Intelligently request clarification from the user when input is ambiguous, incomplete, or conflicts with existing information, guiding the user towards providing necessary details.
-   * Task Scheduling Assistance (for Type: Task only):
-      * Proactively offer to find and schedule dedicated work time in the calendar for newly created Tasks (unless scheduling was part of the initial request).
-      * Upon user request, propose suitable, potentially distributed, time slots for Tasks requiring work sessions, considering task requirements, user preferences, and calendar availability.
-      * Allow users to easily confirm and book proposed work session slots into their calendar.
-5. Automated Routines & Summaries:
-   * Morning Check-in: Provide a concise overview of the user's upcoming day, including scheduled calendar events, due **Tasks**, **Reminders**, and **ToDos**. Goal: Enhance daily awareness and readiness.
-   * Evening Review: Facilitate a quick end-of-day review:
-      * Present **Tasks**, **Reminders**, and **ToDos** scheduled for or due that day.
-      * Allow users to easily update the completion status of these items.
-      * For **Tasks** identified as incomplete, prompt the user (optionally asking for a reason) and proactively offer to reschedule the task or its remaining work, potentially suggesting new time slots. Goal: Prevent tasks from being dropped and adapt planning.
-   * 6. Fallback Operation:
-   * Support basic item management (capture, status updates, viewing lists for Reminders, Tasks, and ToDos) even without calendar integration. Smart scheduling proposals for Tasks, calendar-based summaries for Tasks/timed Reminders, and rescheduling offers for Tasks will be unavailable in this mode.
+1. Multi-User Support & Identification
+Uniquely identify users via their WhatsApp phone number (user_id).
+Maintain consistent user_id linkage across all system components.
+2. Calendar-Based Item & Context Management
+Item Types: Support three distinct Item types:
+Task: An effortful work item with a due date/timeframe, requiring dedicated Working Sessions allocated in the user's calendar.
+ToDo: A simple item the user needs to remember, tracked internally without dedicated scheduled time.
+Reminder: An alert for a specific date and optional time, potentially synced to the calendar.
+
+
+Direct Calendar Integration: Synchronize confirmed Reminders (with time) and booked Task Working Sessions with the user's designated primary calendar (initially Google Calendar).
+Metadata Augmentation: Maintain an internal metadata store linked to calendar events/internal IDs. This store is crucial context for the agent and tracks details like: Item status, type (Task, ToDo, Reminder), estimated effort (Tasks), project tags, timestamps, etc.
+3. Natural Language Interaction (via WhatsApp)
+Multi-language Conversational Interface: Enable users to interact using free-form, natural language commands and requests in their configured language. The system must respond in the same language.
+LLM-Driven Conversation Management: The core agent LLM is responsible for:
+Understanding user intent from the latest message within the context of the conversation history and current user state, considering the user's language.
+Determining the goal (e.g., create a Task, update a ToDo's description, list Reminders).
+Identifying the data required to fulfill that goal (based on Item type or action).
+Checking if the user's input provides all necessary data in a clear format in their language.
+Proactively asking clarifying questions if data is missing, ambiguous, or conflicts with existing information, formulated in the user's language. The LLM manages this clarification sub-flow until sufficient data is gathered.
+Deciding when to call the appropriate tool (e.g., create_task, update_item) after all necessary, validated data has been collected through the conversation.
+Formulating coherent and contextually relevant responses based on user input, history, and tool results, in the user's language.
+
+
+4. User Capabilities & Outcomes
+Onboarding: Guide new users through setting up essential preferences (including preferred language, timezone, work parameters, calendar auth).
+Item Capture & Management:
+Allow users to capture intentions (Tasks, ToDos, Reminders) via natural language.
+The agent intelligently classifies the intended Item type (Task, ToDo, Reminder).
+The agent identifies required fields for the action.
+The agent iteratively asks clarifying questions until all required fields for the specific Item type and action are collected and clear.
+Execute creation/update using specific tools (create_task, create_todo, create_reminder, update_item).
+
+
+Item Modification: Allow users to update details (description, date, time, duration, project, status) of existing Items. The agent identifies the Item, the desired change, asks for necessary info, and calls the update_item tool.
+Status Updates: Allow users to update Item status (e.g., mark as completed). The agent should interpret replies to lists (e.g., "done 1").
+Viewing & Filtering: Allow users to view Items filtered by date range, status, or project tag.
+Task Scheduling Assistance (for Type: Task):
+Proactively offer scheduling assistance for newly created Tasks.
+Upon user request (or proactively), invoke smart scheduling intelligence (via a tool like propose_task_slots). This intelligence considers Task requirements, user preferences, calendar availability, and natural language scheduling hints.
+Present proposed slot options to the user.
+Allow users to confirm/reject proposals. Confirmed slots are booked into the calendar via a tool (book_task_sessions).
+
+
+Preference Management: Allow users to view and update their configured preferences (including language) via natural language requests.
+5. Automated Routines & Summaries
+Morning Check-in: Provide a concise overview of the day's calendar events, due Tasks, and Reminders in the user's language.
+Evening Review:
+Present Reminders and Tasks scheduled/due today in the user's language.
+Allow users to interactively update completion status.
+For incomplete Tasks, the agent initiates a conversational sub-flow to prompt the user and proactively offer to reschedule, potentially suggesting new time slots using the smart scheduling intelligence, all in the user's language.
+
+
+6. Fallback Operation
+Support basic ToDo and Reminder management (capture, status, view) without calendar integration. Smart scheduling for Tasks, calendar-based summaries, and rescheduling offers are unavailable.
+
+🗣️ Key Terminology (English / Hebrew)
+This section defines key terms used throughout the document and their Hebrew equivalents to ensure clarity for multi-language support and development.
+English Term
+Hebrew Term
+Notes
+Task
+משימה
+(mesima) - The primary, effortful work item with a due date/timeframe, for which "Working Sessions" are scheduled.
+ToDo
+מטלה
+(matalah) - A simple item the user needs to remember, tracked internally without dedicated scheduled time.
+Reminder
+תזכורת
+(tizkoret) - An alert for a specific date and optional time.
+Item
+פריט
+(parit) - Inclusive term referring to any Task, ToDo, or Reminder managed by the system.
+Working Session
+זמן עבודה
+(zman avoda) - A block of time allocated in the user's calendar specifically to work on a Task.
+User
+משתמש
+(mishtamesh)
+Preference
+העדפה
+(ha'adafa)
+Settings
+הגדרות
+(hagdarot)
+Calendar
+לוח שנה
+(luach shana)
+Schedule
+לו"ז / תזמן
+(lu"z / tizmen - verb)
+Onboarding
+קליטה
+(klita)
+Update
+עדכון
+(idkun)
+Create
+יצירה
+(yetzira)
+View / List
+הצג / רשימה
+(hatzeg / reshima)
+Status
+סטטוס
+(status)
+Duration
+משך זמן
+(meshech zman)
+Due Date
+תאריך יעד
+(ta'arich ya'ad)
+Timeframe
+מסגרת זמן
+(misgeret zman)
+Morning Summary
+סיכום בוקר
+(sikum boker)
+Evening Review
+סקירת ערב
+(skirat erev)
+Notification
+התראה
+(hatra'a)
+Agent
+סוכן
+(sochen) - Refers to the LLM-driven intelligent assistant.
+Tool
+כלי
+(kli) - Refers to the functions the agent can call.
+
+
+📜 Sample Workflows (Illustrative)
+These examples illustrate the intended conversational flow managed by the LLM-driven agent, focusing on interaction patterns rather than exact phrasing. Assume the user's language is English for these examples.
+Workflow 1: Adding a Task (with Clarification)
+User: "I need to prepare the project alpha presentation, it should take about 4 hours."
+(Agent LLM Analysis: Intent=Create; Type likely Task due to duration mention; Missing=Timeframe/Due Date. Description='prepare the project alpha presentation'; Duration='4 hours'.)
+
+
+Agent: "Okay, I can help schedule time for 'prepare the project alpha presentation' (approx. 4 hours). When does this need to be completed by, or what timeframe should I look at (e.g., 'by Friday', 'next week')?"
+(Agent asks for the missing required field for a Task.)
+
+
+User: "Needs to be done by the end of next week."
+(Agent LLM Analysis: Timeframe='end of next week'. All required data for proposing slots is now available: Description, Duration, Timeframe.)
+
+
+Agent: "Got it. End of next week for the 4-hour 'project alpha presentation' Task. Would you like me to find and propose some specific Working Sessions in your calendar now?"
+(Agent confirms understanding and proactively offers the next logical step: proposing slots.)
+
+
+User: "Yes please, try to split it over two afternoons if possible."
+(Agent LLM Analysis: User confirms proposal. Adds Scheduling Hint: 'split over two afternoons'.)
+
+
+Agent: (Calls propose_task_slots tool with description, duration='4h', timeframe='end of next week', scheduling_hints='split over two afternoons'.)
+(Tool Execution) The propose_task_slots tool (using its smart scheduling logic/sub-LLM) receives the request for 4 hours total, with the hint to split over two afternoons. It determines this means finding two 2-hour slots and searches the calendar accordingly. It returns the proposed slots (e.g., [{"date": "Mon...", "time": "14:00", "end_time": "16:00"}, {"date": "Wed...", "time": "15:00", "end_time": "17:00"}]) and the search context.
+Agent: "Okay, based on your request to split the 4 hours over two afternoons, I found these two 2-hour sessions:
+Mon, May 12 @ 14:00 - 16:00 (2h)
+Wed, May 14 @ 15:00 - 17:00 (2h)
+This covers the total 4 hours. Does this work for you? Or would you like me to look for different options?"
+(Agent explicitly states how the hint was interpreted (two 2-hour sessions) and confirms the total requested time is covered before presenting the options.)
+
+
+User: "Looks good, confirm it."
+(Agent LLM Analysis: User confirms proposed slots.)
+
+
+Agent: (Calls book_task_sessions tool with the approved slots and the search context received from the propose_task_slots tool.)
+(Tool Execution) The tool creates the Task metadata in the DB and books the two 2-hour events (Working Sessions) into Google Calendar.
+Agent: "Great! I've scheduled the two Working Sessions for 'prepare the project alpha presentation' in your calendar."
+Workflow 2: Adding a ToDo (Simple Case)
+User: "add todo buy milk"
+(Agent LLM Analysis: Intent=Create; Keywords 'todo' indicate Type=ToDo. Description='buy milk'. No other details like duration/timeframe.)
+
+
+Agent: (Recognizes only description is needed for a basic ToDo. Calls create_todo tool with description='buy milk'.)
+(Tool Execution) The tool creates the ToDo Item metadata in the DB.
+Agent: "Okay, I've added 'buy milk' to your ToDo list."
+Workflow 3: Evening Review Interaction (Handling Incomplete Task)
+(Scheduler triggers Evening Review)
+Agent: (Calls sync_service to get context, then calls generate_evening_review logic.)
+Agent: "Good evening! 👋 Let's review your day (Mon, May 12). Here are the Items still marked as active:
+(Task) Prepare project alpha presentation [Est: 4h] on Mon, May 12 @ 14:00 - 16:00 (Working Session) [In Progress]
+(Reminder) Call insurance company on Mon, May 12 @ 10:00 [Pending]
+(ToDo) Send team update [Pending]
+How did it go? You can update Items by replying (e.g., 'complete 1, 2', 'done 3', 'cancel 2')."
+(Agent presents the list generated by the routine service.)
+
+
+User: "did 2 and 3. Didn't finish 1, got pulled into meetings."
+(Agent LLM Analysis: User wants to update status. Reply refers to list items. Item 1 (Task) is incomplete.)
+
+
+Agent: (Calls interpret_list_reply tool to map numbers to IDs. Then calls update_item_status tool twice: once for item ID of #2 (to 'completed'), once for item ID of #3 (to 'completed').)
+(Tool Execution) Tools update statuses in the DB.
+Agent: "Okay, marked 'Call insurance company' and 'Send team update' as completed. Understood about the presentation prep (#1) – things happen! Since that Task wasn't finished, would you like help rescheduling the remaining work?"
+(Agent confirms status updates and initiates conversational rescheduling for the incomplete Task, referencing it clearly.)
+
+
+User: "Yeah, can we find time tomorrow afternoon?"
+(Agent LLM Analysis: User wants to reschedule. Needs to determine remaining duration. Timeframe='tomorrow afternoon'.)
+
+
+Agent: "Sure. About how much time do you think is remaining for the presentation prep? (Or should I look for the original 4 hours again?)"
+(Agent asks for clarification on remaining effort needed for scheduling.)
+
+
+User: "Probably need another 2 hours."
+Agent: "Okay, 2 hours tomorrow afternoon. Let me look for slots..." (Proceeds to call propose_task_slots with updated duration and timeframe, then presents options, similar to Workflow 1, steps 6-12).
+
 💡 Future Capabilities (Beyond Initial Scope)
-* Advanced Scheduling Intelligence (Optimal times, breaks, conflict handling)
-* Proactive Time Management Advice & Goal Tracking
-* Weekly Reflection Module (Structured prompts, insight storage)
-* Recurring Item Support (Tasks, Reminders, ToDos)
-* Advanced Daily Planning Assistance ("Just One Thing", backlog suggestions)
-* Timed Pre-Event Notifications (Requires external scheduler) - *Applies to Reminders and scheduled Task sessions*
-* Shared/Team Task Collaboration Features
-* Expanded Calendar Integrations (Outlook, etc.)
-* User Subscription Tiers & Monetization
-⚠️ MVP Scope & Limitations (Initial Release)
-* Calendar: Integration only with Google Calendar; one active calendar per user.
-* Item Types: No built-in support for recurring items (tasks, reminders, todos).
-* Collaboration: No shared items or team features.
-* Proactivity: Limited to offering scheduling for new Tasks and rescheduling incomplete Tasks in the evening review. No broader unsolicited advice.
-* Notifications: Timed pre-event notifications are in scope for Reminders and scheduled Task sessions.
-* Reflection: Weekly reflection module is out of scope.
-* Monetization: No user plans or payments.
+Advanced Scheduling Intelligence (Optimal times, breaks, conflict handling enhancements)
+Proactive Time Management Advice & Goal Tracking
+Weekly Reflection Module
+Recurring Tasks/ToDos/Reminders Support
+Advanced Daily Planning Assistance ("Just One Thing", backlog suggestions)
+Shared/Team Collaboration Features
+Expanded Calendar Integrations (Outlook, etc.)
+User Subscription Tiers & Monetization
+
+⚠️ MVP Scope & Limitations (v0.9 Focus)
+Core Change: Focus on implementing the LLM-Driven Agent Control Flow.
+Calendar: Google Calendar only; one active calendar per user.
+Item Types: No built-in support for recurring Items.
+Collaboration: No shared Items or team features.
+Proactivity: Limited to offering scheduling for new Tasks and rescheduling incomplete Tasks in the evening review. No broader unsolicited advice.
+Language: Support for configured user language in interactions and routines.
+Notifications: Basic timed pre-event notifications for GCal events are in scope via NotificationService.
+Reflection: Weekly reflection module out of scope.
+Monetization: No user plans or payments.
+
 ✅ Acceptance Criteria (High-Level)
-* Users can successfully onboard, configure preferences, and connect their Google Calendar.
-* The system correctly distinguishes between **Tasks**, **Reminders**, and **ToDos** based on user input.
-* Users can reliably create, view (with date/status/project filters), update, and mark items (tasks, reminders, todos) as complete via natural language.
-* The system proactively offers scheduling for newly created **Tasks**.
-* The system can propose schedule slots for **Tasks** based on calendar availability and preferences, and book confirmed slots.
-* The system provides functional Morning Check-in and Evening Review summaries, which include relevant **ToDos**.
-* The Evening Review correctly identifies incomplete **Tasks** and offers rescheduling options.
-* The system handles clarifications when user input is ambiguous.
-* Basic reminder and ToDo functionality works without calendar integration. Task scheduling is degraded.
+Users can successfully onboard (setting preferred language) and connect Google Calendar.
+The agent correctly identifies user intent (create, update, list, etc.) and the target Item type (Task, ToDo, Reminder).
+The agent successfully manages conversational clarification in the user's language, asking relevant questions only when necessary data for the current goal is missing or ambiguous.
+Users can reliably create, view (with filters), update status, and modify details of Tasks, ToDos, and Reminders via natural language interaction in their language.
+The agent calls the correct specific tool only after gathering all necessary information through conversation.
+The system proactively offers scheduling for newly created Tasks.
+The system can propose schedule slots for Tasks based on calendar availability, preferences, and natural language hints.
+Confirmed Task Working Sessions are booked into the user's Google Calendar.
+Morning Check-in and Evening Review summaries are functional, accurate, and delivered in the user's language.
+The Evening Review correctly identifies incomplete Tasks and engages the user conversationally to offer rescheduling options in their language.
+Basic ToDo/Reminder functionality works without calendar integration.
+Pre-event notifications are delivered based on user preferences.
+
+📋 Summary of Changes from v0.8 to v0.9
+Core Agent Control Flow: Shifted from agents following detailed prompt steps to a more autonomous LLM-Driven Conversation Management approach. The LLM is now primarily responsible for understanding intent, managing conversational flow, gathering necessary data through clarification, and deciding when to call tools.
+Terminology Refinement:
+Task: Now refers to the primary, effortful, schedulable work item (previously "Mission" or "Working Task").
+ToDo: Remains a simple, non-scheduled task.
+Reminder: Remains an alert for a specific time.
+Item: Established as the inclusive term for any Task, ToDo, or Reminder.
+Working Session: Specifically refers to the calendar blocks scheduled for a Task.
+
+
+Multi-Language Support: Added requirement for the system to interact with users (including onboarding, prompts, responses, and routines) in their configured preferred language.
+Smart Scheduling Input: Explicitly added the requirement for Task scheduling (via propose_task_slots tool) to consider natural language hints provided by the user alongside structured data.
+Conversational Evening Review: The process for handling incomplete Tasks in the evening review is now defined as a more dynamic, LLM-driven conversational sub-flow rather than a fixed prompt sequence.
+Notifications: Timed pre-event notifications (previously future scope) are now explicitly included in the v0.9 scope, implemented via NotificationService.
+Focus: The MVP scope emphasizes the implementation of the new LLM-driven control flow and language support, along with the revised terminology.
+
+

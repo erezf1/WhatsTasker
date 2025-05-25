@@ -53,6 +53,7 @@ class CLIBridge:
             "message": message,
             "message_id": str(uuid.uuid4()) # Generate ID, might be used by mock sender ACK
         }
+        log_info("CLIBridge", "send_message", f"QUEUING for {user_id} (ID: {outgoing['message_id']}): '{message[:200]}'")
         with self.lock:
             self.message_queue.append(outgoing)
         # Log the queuing action

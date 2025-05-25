@@ -1,229 +1,287 @@
 # --- START OF FULL agents/orchestrator_agent.py ---
+
 import json
 import os
 import traceback
-from typing import Dict, List, Optional, Any # Retain Optional for Pydantic/OpenAI models
-from datetime import datetime
+from typing import Dict, List, Any
+from datetime import datetime, timezone # Added timezone
 import pytz
-import re
 
-# Instructor/LLM Imports
 from services.llm_interface import get_instructor_client
-from openai import OpenAI # Base client for types if needed
-from openai.types.chat import ChatCompletionMessage, ChatCompletionToolParam, ChatCompletionMessageToolCall
-from openai.types.chat.chat_completion_message_tool_call import Function
-from openai.types.shared_params import FunctionDefinition
+from openai import OpenAI
+from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
+from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall, Function as ToolCallFunction
+from openai.types.shared_params import FunctionDefinition # Keep this for tool definition
 
-# Tool Imports & Helpers
-# --- Uses the UPDATED tools from tool_definitions ---
 from .tool_definitions import AVAILABLE_TOOLS, TOOL_PARAM_MODELS
-# --------------------------------------------------
-import services.task_manager as task_manager # For parsing duration used in prompt prep
-
-# Utilities
 from tools.logger import log_info, log_error, log_warning
 import yaml
 import pydantic
 
-# --- Load Standard Messages ---
-_messages = {}
+# --- Database Logging Import for Orchestrator ---
+# We will use the revised log_message_db from activity_db
+_log_message_db_orch = None
 try:
-    messages_path = os.path.join("config", "messages.yaml")
-    if os.path.exists(messages_path):
-        with open(messages_path, 'r', encoding="utf-8") as f:
-             content = f.read()
-             if content.strip(): f.seek(0); _messages = yaml.safe_load(f) or {}
-             else: _messages = {}
-    else: log_warning("orchestrator_agent", "init", f"{messages_path} not found."); _messages = {}
-except Exception as e: log_error("orchestrator_agent", "init", f"Failed to load messages.yaml: {e}", e); _messages = {}
-GENERIC_ERROR_MSG = _messages.get("generic_error_message", "Sorry, an unexpected error occurred.")
+    from tools.activity_db import log_message_db as log_message_db_activity
+    _log_message_db_orch = log_message_db_activity
+    log_info("orchestrator_agent", "import", "Successfully linked activity_db.log_message_db for rich message logging.")
+except ImportError:
+    log_error("orchestrator_agent", "import", "activity_db.log_message_db not found. Rich message logging to DB will be skipped.")
 
+_messages_orchestrator = {}
+try:
+    messages_path_orch = os.path.join("config", "messages.yaml")
+    if os.path.exists(messages_path_orch):
+        with open(messages_path_orch, 'r', encoding="utf-8") as f_orch:
+            content_orch = f_orch.read()
+            _messages_orchestrator = yaml.safe_load(f_orch.seek(0) or f_orch) if content_orch.strip() else {}
+    else: _messages_orchestrator = {}
+except Exception as e_orch_msg_load:
+    _messages_orchestrator = {}; log_error("orchestrator_agent", "init", f"Failed to load messages.yaml: {e_orch_msg_load}", e_orch_msg_load)
+GENERIC_ERROR_MSG_ORCH = _messages_orchestrator.get("generic_error_message", "Sorry, an unexpected error occurred.")
 
-# --- Function to Load Prompt ---
-_PROMPT_CACHE: Dict[str, Optional[str]] = {}
-def load_orchestrator_prompt() -> Optional[str]:
-    """Loads the orchestrator system prompt from the YAML file, with simple caching."""
-    # This function remains the same, it just loads whatever prompt is in the file
-    prompts_path = os.path.join("config", "prompts.yaml"); cache_key = prompts_path
-    if cache_key in _PROMPT_CACHE: return _PROMPT_CACHE[cache_key]
-    prompt_text_result: Optional[str] = None
+_ORCH_PROMPT_CACHE: Dict[str, str] = {}
+def load_orchestrator_prompt() -> str:
+    prompts_path = os.path.join("config", "prompts.yaml"); cache_key = prompts_path + "_orchestrator_v099" # Ensure new prompt is loaded
+    if cache_key in _ORCH_PROMPT_CACHE: return _ORCH_PROMPT_CACHE[cache_key]
+    prompt_text_result: str = ""
     try:
         if not os.path.exists(prompts_path): raise FileNotFoundError(f"{prompts_path} not found.")
         with open(prompts_path, "r", encoding="utf-8") as f:
-            content = f.read();
-            if not content.strip(): raise ValueError("Prompts file is empty.")
-            f.seek(0); all_prompts = yaml.safe_load(f)
+            all_prompts = yaml.safe_load(f)
             if not all_prompts: raise ValueError("YAML parsing resulted in empty prompts.")
-            prompt_text = all_prompts.get("orchestrator_agent_system_prompt")
-            if not prompt_text or not prompt_text.strip(): log_error("orchestrator_agent", "load_orchestrator_prompt", "Key 'orchestrator_agent_system_prompt' NOT FOUND or EMPTY."); prompt_text_result = None
-            else: log_info("orchestrator_agent", "load_orchestrator_prompt", "Orchestrator prompt loaded successfully."); prompt_text_result = prompt_text
-    except Exception as e: log_error("orchestrator_agent", "load_orchestrator_prompt", f"CRITICAL: Failed to load/parse orchestrator prompt: {e}", e); prompt_text_result = None
-    _PROMPT_CACHE[cache_key] = prompt_text_result; return prompt_text_result
+            prompt_text = all_prompts.get("orchestrator_agent_system_prompt") # Use V0.9.9
+            if not prompt_text or not prompt_text.strip(): 
+                log_error("orchestrator_agent", "load_prompt", "Orchestrator prompt missing or empty.")
+            else: prompt_text_result = prompt_text
+    except Exception as e_load: 
+        log_error("orchestrator_agent", "load_prompt", f"CRITICAL: Failed load orchestrator prompt: {e_load}", e_load)
+    _ORCH_PROMPT_CACHE[cache_key] = prompt_text_result; return prompt_text_result
+
+def _reconstruct_llm_history_from_rich_state(
+    conversation_history_from_state: List[Dict[str, Any]]
+) -> List[ChatCompletionMessageParam]:
+    """
+    Reconstructs history for LLM API from the rich AgentStateManager history.
+    Parses JSON strings in 'content' (for tool results) or 'tool_calls_json_str' (for assistant tool requests)
+    back into Python objects for the OpenAI API.
+    """
+    llm_api_history: List[ChatCompletionMessageParam] = []
+    for entry in conversation_history_from_state:
+        role = entry.get("role")
+        content = entry.get("content") # For user text, assistant text, or JSON string of tool result
+        
+        msg_for_api: Dict[str, Any] = {"role": role}
+
+        if role == "user":
+            msg_for_api["content"] = content if content is not None else ""
+        elif role == "assistant":
+            msg_for_api["content"] = content # Can be None if only tool_calls
+            tool_calls_json_str = entry.get("tool_calls_json_str")
+            if tool_calls_json_str:
+                try:
+                    tool_calls_list = json.loads(tool_calls_json_str)
+                    # Ensure it's a list of dicts as expected by OpenAI API for tool_calls
+                    if isinstance(tool_calls_list, list) and all(isinstance(tc, dict) for tc in tool_calls_list):
+                        msg_for_api["tool_calls"] = tool_calls_list
+                    else:
+                        log_warning("orchestrator_agent", "_reconstruct_history", f"Parsed tool_calls_json_str is not a list of dicts: {tool_calls_list}")
+                except json.JSONDecodeError:
+                    log_error("orchestrator_agent", "_reconstruct_history", f"Failed to parse tool_calls_json_str: {tool_calls_json_str}")
+            # If content is None and there are no tool_calls, ensure content is at least an empty string for some models
+            if msg_for_api.get("content") is None and "tool_calls" not in msg_for_api:
+                msg_for_api["content"] = ""
+
+        elif role == "tool":
+            msg_for_api["tool_call_id"] = entry.get("tool_call_id")
+            msg_for_api["name"] = entry.get("name")
+            msg_for_api["content"] = content # This is already the JSON string of the tool result
+        
+        else: # Should not happen if roles are validated upstream
+            log_warning("orchestrator_agent", "_reconstruct_history", f"Unknown role in history entry: {role}")
+            continue
+            
+        llm_api_history.append(msg_for_api) # type: ignore
+    return llm_api_history
 
 
-# --- Main Handler Function (Core logic remains the same) ---
 def handle_user_request(
-    user_id: str, message: str, history: List[Dict], preferences: Dict,
+    user_id: str, message: str, history: List[Dict[str, Any]], preferences: Dict, # history is now rich
     task_context: List[Dict], calendar_context: List[Dict]
 ) -> str:
-    """
-    Handles the user's request using the Orchestrator pattern with Instructor/Tool Use.
-    Relies purely on the LLM for conversational flow and tool invocation decisions.
-    Handles multiple tool calls requested by the LLM in a single turn.
-    """
     fn_name = "handle_user_request"
-    log_info("orchestrator_agent", fn_name, f"Processing request for {user_id}: '{message[:50]}...'")
-
     orchestrator_system_prompt = load_orchestrator_prompt()
-    if not orchestrator_system_prompt:
-         log_error("orchestrator_agent", fn_name, "Orchestrator system prompt could not be loaded.")
-         return GENERIC_ERROR_MSG
+    if not orchestrator_system_prompt: return GENERIC_ERROR_MSG_ORCH
 
-    client: Optional[OpenAI] = get_instructor_client()
-    if not client:
-        log_error("orchestrator_agent", fn_name, "LLM client unavailable.")
-        return GENERIC_ERROR_MSG
+    client: OpenAI | None = get_instructor_client()
+    if not client: return GENERIC_ERROR_MSG_ORCH
 
-    # --- Prepare Context for Prompt (No change needed here) ---
+    # Log incoming user message to DB
+    if _log_message_db_orch:
+        _log_message_db_orch(
+            user_id=user_id, role="user", message_type="user_text",
+            content_text=message, # user_message_timestamp_iso can be added if bridge provides it
+        )
+
     try:
-        user_timezone_str = preferences.get("TimeZone", "UTC"); user_timezone = pytz.utc
-        try: user_timezone = pytz.timezone(user_timezone_str)
-        except pytz.UnknownTimeZoneError: log_warning("orchestrator_agent", fn_name, f"Unknown timezone '{user_timezone_str}'. Defaulting UTC.")
+        user_timezone_str = preferences.get("TimeZone", "UTC")
+        user_timezone = pytz.timezone(user_timezone_str) if user_timezone_str else pytz.utc
         now = datetime.now(user_timezone)
         current_date_str, current_time_str, current_day_str = now.strftime("%Y-%m-%d"), now.strftime("%H:%M"), now.strftime("%A")
-        history_limit, item_context_limit, calendar_context_limit = 30, 20, 20
-        limited_history = history[-(history_limit*2):]; history_str = "\n".join([f"{m['sender'].capitalize()}: {m['content']}" for m in limited_history])
-        def prepare_item(item):
-             key_fields = ['event_id', 'item_id', 'title', 'description', 'date', 'time', 'type', 'status', 'estimated_duration', 'project']
-             prep = {k: item.get(k) for k in key_fields if item.get(k) is not None}; prep['item_id'] = item.get('item_id', item.get('event_id'))
-             if 'event_id' in prep and prep['event_id'] == prep['item_id']: del prep['event_id']
-             return prep
-        item_context_str = json.dumps([prepare_item(item) for item in task_context[:item_context_limit]], indent=2, default=str)
-        calendar_context_str = json.dumps(calendar_context[:calendar_context_limit], indent=2, default=str)
-        prefs_str = json.dumps(preferences, indent=2, default=str)
-    except Exception as e: log_error("orchestrator_agent", fn_name, f"Error preparing context strings: {e}", e); return GENERIC_ERROR_MSG
+        
+        # History from AgentStateManager is already limited and contains rich objects
+        # We need to reconstruct it for the LLM API call
+        llm_context_history = _reconstruct_llm_history_from_rich_state(history)
+        
+        def prepare_item_for_llm(item_dict: Dict) -> Dict:
+             essential_fields = ['item_id', 'type', 'title', 'description', 'date', 'time', 'status', 'estimated_duration', 'project', 'gcal_start_datetime']
+             prepared = {k: item_dict.get(k) for k in essential_fields if item_dict.get(k) is not None}
+             if 'event_id' in item_dict and 'item_id' not in prepared: prepared['item_id'] = item_dict['event_id']
+             return prepared
+        active_items_str = json.dumps([prepare_item_for_llm(item) for item in task_context[:25]], indent=2, default=str)
+        calendar_events_str = json.dumps(calendar_context[:25], indent=2, default=str)
+        user_prefs_str = json.dumps(preferences, indent=2, default=str)
+    except Exception as e_ctx_prep: 
+        log_error("orchestrator_agent", fn_name, f"Error preparing context for {user_id}: {e_ctx_prep}", e_ctx_prep,user_id=user_id); return GENERIC_ERROR_MSG_ORCH
 
-    # --- Construct Initial Messages for LLM (No change needed here) ---
-    messages: List[Dict[str, Any]] = [
+    system_context_summary_msg = f"User State Context Summary (user {user_id}):\n" \
+                                 f"1. Current Time/Date ({user_timezone_str}): {current_date_str}, {current_day_str}, {current_time_str}.\n" \
+                                 f"2. User Preferences: {user_prefs_str}\n" \
+                                 f"3. Active Items (DB Snapshot): {active_items_str}\n" \
+                                 f"4. Calendar Events (Live GCal if connected): {calendar_events_str}\n" \
+                                 f"Full conversation history (including your tool use) follows."
+
+    messages_for_api: List[ChatCompletionMessageParam] = [ # type: ignore
         {"role": "system", "content": orchestrator_system_prompt},
-        {"role": "system", "content": f"Current Reference Time ({user_timezone_str}): Date: {current_date_str}, Day: {current_day_str}, Time: {current_time_str}. Use this."},
-        {"role": "system", "content": f"User Preferences:\n{prefs_str}"},
-        {"role": "system", "content": f"History:\n{history_str}"},
-        {"role": "system", "content": f"Active Items:\n{item_context_str}"},
-        {"role": "system", "content": f"Calendar Events:\n{calendar_context_str}"},
+        {"role": "system", "content": system_context_summary_msg},
+        *llm_context_history, # Unpack the reconstructed rich history
         {"role": "user", "content": message}
     ]
 
-    # --- Define Tools (Uses the UPDATED tools from tool_definitions) ---
-    tools_for_llm: List[ChatCompletionToolParam] = []
-    for tool_name, model in TOOL_PARAM_MODELS.items():
-        if tool_name not in AVAILABLE_TOOLS: continue # Check against updated AVAILABLE_TOOLS
-        func = AVAILABLE_TOOLS.get(tool_name)
-        description = func.__doc__.strip() if func and func.__doc__ else f"Executes {tool_name}"
-        try:
-            params_schema = model.model_json_schema();
-            # Allow empty schema for tools with no params
-            if not params_schema.get('properties') and not model.model_fields: params_schema = {}
-            elif not params_schema.get('properties'):
-                 log_warning("orchestrator_agent", fn_name, f"Model {model.__name__} for tool {tool_name} has fields but generated empty properties schema.")
-                 params_schema = {} # Default to empty if unexpected
+    tools_for_llm_list: List[Dict[str, Any]] = []
+    if AVAILABLE_TOOLS and TOOL_PARAM_MODELS:
+        for tool_name, model_class in TOOL_PARAM_MODELS.items():
+            tool_func = AVAILABLE_TOOLS.get(tool_name)
+            if not tool_func: continue
+            description = tool_func.__doc__.strip() if tool_func.__doc__ else f"Executes {tool_name}"
+            try:
+                params_schema = model_class.model_json_schema()
+                if not params_schema.get('properties') and not model_class.model_fields: params_schema = {} 
+                func_def: FunctionDefinition = {"name": tool_name, "description": description, "parameters": params_schema}
+                tools_for_llm_list.append({"type": "function", "function": func_def})
+            except Exception as e_schema: log_error("orchestrator_agent", fn_name, f"Schema gen error tool {tool_name}: {e_schema}", e_schema,user_id=user_id)
+    
+    final_tools_for_llm = tools_for_llm_list if tools_for_llm_list else None
+    tool_choice_val: str | None = "auto" if final_tools_for_llm else None
 
-            func_def: FunctionDefinition = {"name": tool_name, "description": description, "parameters": params_schema}
-            tool_param: ChatCompletionToolParam = {"type": "function", "function": func_def}; tools_for_llm.append(tool_param)
-        except Exception as e: log_error("orchestrator_agent", fn_name, f"Schema error for tool {tool_name}: {e}", e)
-    if not tools_for_llm: log_error("orchestrator_agent", fn_name, "No tools defined for LLM."); return GENERIC_ERROR_MSG
-
-    # --- Interaction Loop (No structural change needed) ---
     try:
-        log_info("orchestrator_agent", fn_name, f"Invoking LLM for {user_id} (Initial Turn)...")
         response = client.chat.completions.create(
-            model="gpt-4o", # Or other capable model
-            messages=messages, # type: ignore
-            tools=tools_for_llm,
-            tool_choice="auto",
+            model="gpt-4o", messages=messages_for_api,
+            tools=final_tools_for_llm, tool_choice=tool_choice_val, # type: ignore
             temperature=0.1,
         )
         response_message = response.choices[0].message
-        tool_calls = response_message.tool_calls
+        llm_text_content = response_message.content # Text part of LLM's response
+        tool_calls_from_llm: List[ChatCompletionMessageToolCall] | None = response_message.tool_calls
 
-        # --- Scenario 1: LLM Responds Directly ---
-        if not tool_calls:
-            if response_message.content:
-                log_info("orchestrator_agent", fn_name, "LLM responded directly (no tool call).")
-                return response_message.content
-            else:
-                log_warning("orchestrator_agent", fn_name, "LLM response had no tool calls and no content.")
-                return "Sorry, I couldn't process that request fully. Could you try rephrasing?"
+        # Log LLM's response (assistant's turn) to DB
+        if _log_message_db_orch:
+            tool_calls_json_str_for_db = None
+            if tool_calls_from_llm:
+                try: tool_calls_json_str_for_db = json.dumps([tc.model_dump() for tc in tool_calls_from_llm])
+                except Exception as e_tc_json: log_error("orchestrator_agent", fn_name, f"Error serializing tool_calls for DB log: {e_tc_json}", e_tc_json)
+            
+            _log_message_db_orch(
+                user_id=user_id, role="assistant",
+                message_type="agent_tool_call_request" if tool_calls_from_llm else "agent_text_response",
+                content_text=llm_text_content,
+                tool_calls_json=tool_calls_json_str_for_db
+            )
 
-        # --- Scenario 2: LLM Calls One or More Tools ---
-        log_info("orchestrator_agent", fn_name, f"LLM requested {len(tool_calls)} tool call(s).")
-        messages.append(response_message.model_dump(exclude_unset=True)) # Add assistant's tool call request
-        tool_results_messages = []
+        if not tool_calls_from_llm: # LLM responded directly with text
+            if llm_text_content: return llm_text_content
+            else: return "I'm not sure how to respond to that. Can you try rephrasing?" # Fallback
 
-        for tool_call in tool_calls:
+        # --- Tool Execution Loop ---
+        # Add assistant's message (with tool_calls) to messages list for the next LLM call
+        current_turn_assistant_message: ChatCompletionMessageParam = {"role": "assistant", "content": llm_text_content} # type: ignore
+        if tool_calls_from_llm: # Ensure tool_calls is present if not None
+            current_turn_assistant_message["tool_calls"] = [tc.model_dump(exclude_unset=True) for tc in tool_calls_from_llm]
+        messages_for_api.append(current_turn_assistant_message)
+        
+        tool_results_for_llm_api: List[ChatCompletionMessageParam] = [] # type: ignore
+
+        for tool_call in tool_calls_from_llm:
             tool_name = tool_call.function.name
             tool_call_id = tool_call.id
             tool_args_str = tool_call.function.arguments
-            tool_result_content = GENERIC_ERROR_MSG # Default
+            tool_result_dict_from_py: Dict = {"success": False, "message": GENERIC_ERROR_MSG_ORCH} # Default
 
-            log_info("orchestrator_agent", fn_name, f"Processing Tool Call ID: {tool_call_id}, Name: {tool_name}, Args: {tool_args_str[:150]}...")
-
-            # Use updated AVAILABLE_TOOLS and TOOL_PARAM_MODELS here
             if tool_name not in AVAILABLE_TOOLS:
-                log_warning("orchestrator_agent", fn_name, f"LLM tried unknown tool: {tool_name}. Sending error result back.")
-                tool_result_content = json.dumps({"success": False, "message": f"Error: Unknown action '{tool_name}' requested."})
+                tool_result_dict_from_py = {"success": False, "message": f"Error: Unknown action '{tool_name}'."}
             else:
-                tool_func = AVAILABLE_TOOLS[tool_name]
-                param_model = TOOL_PARAM_MODELS[tool_name]
+                tool_func_py = AVAILABLE_TOOLS[tool_name]
+                param_model_py = TOOL_PARAM_MODELS[tool_name]
                 try:
-                    tool_args_dict = {}
-                    if tool_args_str and tool_args_str.strip() != '{}': tool_args_dict = json.loads(tool_args_str)
-                    elif not param_model.model_fields: tool_args_dict = {} # Handle no-arg tools
-
-                    validated_params = param_model(**tool_args_dict)
-                    tool_result_dict = tool_func(user_id, validated_params) # Call the tool
-                    log_info("orchestrator_agent", fn_name, f"Tool {tool_name} (ID: {tool_call_id}) executed. Result: {tool_result_dict}")
-                    tool_result_content = json.dumps(tool_result_dict)
-
+                    tool_args_dict_py = {}
+                    if tool_args_str and tool_args_str.strip() and tool_args_str.strip() != '{}':
+                        tool_args_dict_py = json.loads(tool_args_str)
+                    elif not param_model_py.model_fields: tool_args_dict_py = {}
+                    
+                    validated_params_py = param_model_py(**tool_args_dict_py)
+                    tool_result_dict_from_py = tool_func_py(user_id, validated_params_py)
                 except json.JSONDecodeError:
-                    log_error("orchestrator_agent", fn_name, f"Failed parse JSON args for {tool_name} (ID: {tool_call_id}): {tool_args_str}");
-                    tool_result_content = json.dumps({"success": False, "message": f"Error: Invalid arguments provided for {tool_name}."})
-                except pydantic.ValidationError as e:
-                    log_error("orchestrator_agent", fn_name, f"Arg validation failed for {tool_name} (ID: {tool_call_id}). Err: {e.errors()}. Args: {tool_args_str}", e)
-                    err_summary = "; ".join([f"{err['loc'][0] if err.get('loc') else 'param'}: {err['msg']}" for err in e.errors()])
-                    tool_result_content = json.dumps({"success": False, "message": f"Error: Invalid parameters for {tool_name} - {err_summary}"})
-                except Exception as e:
-                    log_error("orchestrator_agent", fn_name, f"Error executing tool {tool_name} (ID: {tool_call_id}). Trace:\n{traceback.format_exc()}", e);
-                    tool_result_content = json.dumps({"success": False, "message": f"Error performing action {tool_name}."})
+                    tool_result_dict_from_py = {"success": False, "message": f"Error: Invalid arguments format for {tool_name}."}
+                except pydantic.ValidationError as e_val:
+                    err_summary = "; ".join([f"{err['loc'][0] if err.get('loc') else 'param'}: {err['msg']}" for err in e_val.errors()])
+                    tool_result_dict_from_py = {"success": False, "message": f"Error: Invalid parameters for {tool_name}: {err_summary}"}
+                except Exception as e_tool_exec:
+                    log_error("orchestrator_agent", fn_name, f"Error executing tool {tool_name} (ID: {tool_call_id}). Trace:\n{traceback.format_exc()}", e_tool_exec, user_id=user_id)
+                    tool_result_dict_from_py = {"success": False, "message": f"Error performing action {tool_name}: {str(e_tool_exec)[:100]}"} # Truncate long errors
 
-            tool_results_messages.append({
+            # Log tool execution result to DB
+            tool_result_json_str_for_db = json.dumps(tool_result_dict_from_py, default=str)
+            if _log_message_db_orch:
+                _log_message_db_orch(
+                    user_id=user_id, role="tool", message_type="tool_execution_result",
+                    content_text=tool_result_json_str_for_db, # Store full JSON result as content_text for role 'tool'
+                    tool_name=tool_name, associated_tool_call_id=tool_call_id
+                )
+            
+            tool_results_for_llm_api.append({
                 "tool_call_id": tool_call_id, "role": "tool",
-                "name": tool_name, "content": tool_result_content,
+                "name": tool_name, "content": tool_result_json_str_for_db, # Pass JSON string to LLM
             })
 
-        messages.extend(tool_results_messages) # Add all tool results
+        messages_for_api.extend(tool_results_for_llm_api)
 
-        # --- Make SECOND LLM call with ALL tool results ---
-        log_info("orchestrator_agent", fn_name, f"Invoking LLM again for {user_id} with {len(tool_results_messages)} tool result(s)...")
         second_response = client.chat.completions.create(
-            model="gpt-4o", # Use the same model
-            messages=messages, # type: ignore
-            # No tools needed here
+            model="gpt-4o", messages=messages_for_api, temperature=0.1,
         )
-        second_response_message = second_response.choices[0].message
+        final_text_response = second_response.choices[0].message.content
 
-        if second_response_message.content:
-            log_info("orchestrator_agent", fn_name, "LLM generated final response after processing tool result(s).")
-            return second_response_message.content
-        else:
-            log_warning("orchestrator_agent", fn_name, "LLM provided no content after processing tool result(s).")
-            try: fallback_msg = json.loads(tool_results_messages[0]['content']).get("message", GENERIC_ERROR_MSG)
-            except: fallback_msg = GENERIC_ERROR_MSG
-            return fallback_msg
+        # Log agent's final text response (after tool use) to DB
+        if _log_message_db_orch and final_text_response:
+            _log_message_db_orch(
+                user_id=user_id, role="assistant", message_type="agent_text_response",
+                content_text=final_text_response
+            )
 
-    # --- Outer Exception Handling ---
-    except Exception as e:
+        if final_text_response: 
+            log_info("orchestrator_agent", fn_name, f"USER_ID [{user_id}] FINAL RESPONSE TO BE SENT: '{str(final_text_response)[:500]}'") 
+            return final_text_response
+        else: # Fallback if LLM gives no text after tool
+            try:
+                first_tool_result_parsed = json.loads(tool_results_for_llm_api[0]['content']) # type: ignore
+                return first_tool_result_parsed.get("message", GENERIC_ERROR_MSG_ORCH)
+            except: return GENERIC_ERROR_MSG_ORCH
+
+    except Exception as e_outer_loop:
         tb_str = traceback.format_exc()
-        log_error("orchestrator_agent", fn_name, f"Core error in orchestrator logic for {user_id}. Traceback:\n{tb_str}", e)
-        return GENERIC_ERROR_MSG
+        log_error("orchestrator_agent", fn_name, f"Core error in orchestrator for {user_id}. Trace:\n{tb_str}", e_outer_loop, user_id=user_id)
+        # Log this system-level error to user in DB
+        if _log_message_db_orch:
+            _log_message_db_orch(user_id=user_id, role="system_internal", message_type="system_error_to_user", content_text=GENERIC_ERROR_MSG_ORCH)
+        return GENERIC_ERROR_MSG_ORCH
+
 # --- END OF FULL agents/orchestrator_agent.py ---

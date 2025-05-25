@@ -33,6 +33,6 @@ instructor>=0.5.2,<1.0.0  # Or similar version specifier
 openai>=1.0.0,<2.0.0     # Instructor depends on OpenAI v1+
 # Optional: If using pandas checks (e.g., pd.isna) - uncomment if needed
 # pandas>=2.0.0,<3.0.0
-
+twilio>=7.0.0,<8.0.0 # For Twilio API integration
 Flask>=2.0.0,<4.0.0
 # --- END OF FILE requirements.txt ---

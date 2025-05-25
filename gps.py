@@ -12,7 +12,7 @@ FILES_TO_DUMP = [
     "WhatsTasker_SRS_08.txt",
     "requirements.txt",
     "package.json", # Include package.json for Node dependencies
-    ".env.example", # Include example environment file
+    "env.example", # Include example environment file
     ".gitignore",   # Include gitignore configuration
     "wa_bridge.js",
     "monitor_whatstasker.sh",
@@ -23,6 +23,7 @@ FILES_TO_DUMP = [
     "config/settings.yaml", # Include even if empty
     "main.py",
     "bridge/request_router.py",
+    "bridge/twilio_interface.py",
     "bridge/cli_interface.py",
     "bridge/whatsapp_interface.py",
     "agents/orchestrator_agent.py",
@@ -56,7 +57,7 @@ FILES_TO_DUMP = [
 ]
 
 # Output filename pattern
-OUTPUT_FILENAME_PATTERN = "project_v0.8_dump_{timestamp}.txt"
+OUTPUT_FILENAME_PATTERN = "project_v0.8_dump.txt"
 
 # Separator
 SEPARATOR = "=" * 80

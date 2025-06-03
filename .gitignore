@@ -79,6 +79,7 @@ mock_output.txt
 *.dump*.txt
 viewer_messages.db
 *.tmp
+project_v0.8_dump.txt
 
 # --- Editors/IDE ---
 # VS Code
@@ -99,3 +100,4 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 last_*.txt
+project_v0.8_dump.txt

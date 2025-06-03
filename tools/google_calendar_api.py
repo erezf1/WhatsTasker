@@ -20,16 +20,8 @@ except ImportError:
     log_info = logging.info; log_error = logging.error; log_warning = logging.warning
     log_error("google_calendar_api", "import", "Failed to import project logger.")
 
-# --- config_manager import for setting GCal status ---
-CONFIG_MANAGER_IMPORTED = False
-_set_gcal_status_func = None
-try:
-    from services.config_manager import set_gcal_integration_status
-    _set_gcal_status_func = set_gcal_integration_status
-    CONFIG_MANAGER_IMPORTED = True
-except ImportError:
-    log_error("google_calendar_api", "import", "Failed to import config_manager.set_gcal_integration_status. GCal status updates on API error will be skipped.")
-# --- End config_manager import ---
+# --- config_manager import is now done locally within functions ---
+CONFIG_MANAGER_IMPORTED = True # Assume it can be imported when needed. Actual check done in functions.
 
 try:
     from google.oauth2.credentials import Credentials as ImportedCredentials
@@ -57,14 +49,14 @@ except ImportError as e:
 
 if TYPE_CHECKING:
     from googleapiclient.discovery import Resource
-    if Credentials:
-        from google.oauth2.credentials import Credentials
+    if Credentials: # type: ignore
+        from google.oauth2.credentials import Credentials # type: ignore
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 if not GOOGLE_CLIENT_ID: log_error("google_calendar_api", "config", "CRITICAL: GOOGLE_CLIENT_ID not set.")
 if not GOOGLE_CLIENT_SECRET: log_error("google_calendar_api", "config", "CRITICAL: GOOGLE_CLIENT_SECRET not set.")
-DEFAULT_TIMEZONE = "Asia/Jerusalem"
+DEFAULT_TIMEZONE = "Asia/Jerusalem" # You might want to get this from user prefs eventually
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 
@@ -72,14 +64,21 @@ class GoogleCalendarAPI:
     def __init__(self, user_id: str):
         fn_name = "__init__"
         self.user_id = user_id
-        self.service: Any = None # Use Any if Resource is not available
-        self.user_timezone = DEFAULT_TIMEZONE
+        self.service: Any = None 
+        self.user_timezone = DEFAULT_TIMEZONE # Default, can be updated from user preferences
 
-        # log_info("GoogleCalendarAPI", fn_name, f"Initializing for user {self.user_id}") # Verbose
+        _set_gcal_status_func_local = None
+        try:
+            from services.config_manager import set_gcal_integration_status
+            _set_gcal_status_func_local = set_gcal_integration_status
+        except ImportError:
+            log_error("GoogleCalendarAPI", fn_name, "Failed to import set_gcal_integration_status for init.")
+
+
         if not GOOGLE_LIBS_AVAILABLE:
             log_error("GoogleCalendarAPI", fn_name, "Google API libraries not available. Initialization skipped.")
-            if CONFIG_MANAGER_IMPORTED and _set_gcal_status_func:
-                 _set_gcal_status_func(self.user_id, "error") # Cannot connect if libs missing
+            if _set_gcal_status_func_local:
+                 _set_gcal_status_func_local(self.user_id, "error")
             return
 
         credentials = self._load_credentials()
@@ -89,50 +88,45 @@ class GoogleCalendarAPI:
                 if build is None:
                     raise ImportError("Build function ('googleapiclient.discovery.build') not available.")
                 self.service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
-                # log_info("GoogleCalendarAPI", fn_name, f"GCal service built successfully for {self.user_id}") # Verbose
-                # If service builds successfully, we assume 'connected' for now.
-                # Actual API calls will test this and can set to 'error' if they fail.
-                # Only set to 'connected' if status was 'pending_auth' or 'not_integrated'.
-                # This check is tricky here as we don't have direct access to current status easily.
-                # Let's assume that if we get this far, an attempt to connect is being made.
-                # The calling function (e.g. user_manager) might set 'connected' if is_active() is true.
             except ImportError as e:
                 log_error("GoogleCalendarAPI", fn_name, f"Import error during service build: {e}", e)
                 self.service = None
-                if CONFIG_MANAGER_IMPORTED and _set_gcal_status_func: _set_gcal_status_func(self.user_id, "error")
+                if _set_gcal_status_func_local: _set_gcal_status_func_local(self.user_id, "error")
             except Exception as e:
                 log_error("GoogleCalendarAPI", fn_name, f"Failed to build GCal service: {e}", e)
                 self.service = None
-                if CONFIG_MANAGER_IMPORTED and _set_gcal_status_func: _set_gcal_status_func(self.user_id, "error")
+                if _set_gcal_status_func_local: _set_gcal_status_func_local(self.user_id, "error")
         else:
-            # _load_credentials already logs and sets status to 'error' on failure
             log_warning("GoogleCalendarAPI", fn_name, f"Initialization incomplete for {self.user_id} due to credential failure.")
             self.service = None
-            # No need to set status here again, _load_credentials handles it
+            # _load_credentials already logs and sets status to 'error' on failure
 
-    def _load_credentials(self) -> Any: # Return type Credentials | None
+    def _load_credentials(self) -> Any: 
         fn_name = "_load_credentials"
-        # log_info("GoogleCalendarAPI", fn_name, f"Attempting credentials load for {self.user_id}") # Verbose
+        _set_gcal_status_func_local = None
+        try:
+            from services.config_manager import set_gcal_integration_status
+            _set_gcal_status_func_local = set_gcal_integration_status
+        except ImportError:
+            log_error("GoogleCalendarAPI", fn_name, "Failed to import set_gcal_integration_status for cred load.")
 
         if not GOOGLE_LIBS_AVAILABLE or Credentials is None:
             log_error("GoogleCalendarAPI", fn_name, "Google libraries or Credentials class not available.")
-            if CONFIG_MANAGER_IMPORTED and _set_gcal_status_func: _set_gcal_status_func(self.user_id, "error")
+            if _set_gcal_status_func_local: _set_gcal_status_func_local(self.user_id, "error")
             return None
 
         if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
             log_error("GoogleCalendarAPI", fn_name, "Client ID or Secret missing in environment config.")
-            if CONFIG_MANAGER_IMPORTED and _set_gcal_status_func: _set_gcal_status_func(self.user_id, "error")
+            if _set_gcal_status_func_local: _set_gcal_status_func_local(self.user_id, "error")
             return None
 
         token_data = get_user_token(self.user_id)
         if token_data is None:
-            # log_info("GoogleCalendarAPI", fn_name, f"No token data found for user {self.user_id}.") # Verbose
-            # Not necessarily an error state yet, could be first time.
             return None
 
         if "refresh_token" not in token_data:
             log_error("GoogleCalendarAPI", fn_name, f"FATAL: refresh_token missing in stored data for {self.user_id}. Re-auth needed.")
-            if CONFIG_MANAGER_IMPORTED and _set_gcal_status_func: _set_gcal_status_func(self.user_id, "error")
+            if _set_gcal_status_func_local: _set_gcal_status_func_local(self.user_id, "error")
             return None
 
         credential_info_for_lib = {
@@ -140,33 +134,31 @@ class GoogleCalendarAPI:
             'token_uri': GOOGLE_TOKEN_URI, 'client_id': GOOGLE_CLIENT_ID,
             'client_secret': GOOGLE_CLIENT_SECRET, 'scopes': token_data.get('scopes', [])
         }
-        if isinstance(credential_info_for_lib['scopes'], str):
-            credential_info_for_lib['scopes'] = credential_info_for_lib['scopes'].split()
+        if isinstance(credential_info_for_lib['scopes'], str): # type: ignore
+            credential_info_for_lib['scopes'] = credential_info_for_lib['scopes'].split() # type: ignore
 
         creds = None
         try:
-            creds = Credentials.from_authorized_user_info(credential_info_for_lib)
-            if not creds.valid:
+            creds = Credentials.from_authorized_user_info(credential_info_for_lib) # type: ignore
+            if not creds.valid: # type: ignore
                 log_warning("GoogleCalendarAPI", fn_name, f"Credentials invalid/expired for {self.user_id}. Checking refresh token.")
-                if creds.refresh_token:
-                    # log_info("GoogleCalendarAPI", fn_name, f"Attempting explicit token refresh for {self.user_id}...") # Verbose
+                if creds.refresh_token: # type: ignore
                     try:
                         if GoogleAuthRequest is None: raise ImportError("GoogleAuthRequest class not available for refresh.")
-                        creds.refresh(GoogleAuthRequest())
-                        # log_info("GoogleCalendarAPI", fn_name, f"Token refresh successful for {self.user_id}.") # Verbose
+                        creds.refresh(GoogleAuthRequest()) # type: ignore
                         refreshed_token_data_to_save = {
-                            'access_token': creds.token, 'refresh_token': creds.refresh_token,
-                            'token_uri': creds.token_uri, 'client_id': creds.client_id,
-                            'client_secret': creds.client_secret, 'scopes': creds.scopes,
-                            'expiry_iso': creds.expiry.isoformat() if creds.expiry else None
+                            'access_token': creds.token, 'refresh_token': creds.refresh_token, # type: ignore
+                            'token_uri': creds.token_uri, 'client_id': creds.client_id, # type: ignore
+                            'client_secret': creds.client_secret, 'scopes': creds.scopes, # type: ignore
+                            'expiry_iso': creds.expiry.isoformat() if creds.expiry else None # type: ignore
                         }
-                        if save_user_token_encrypted is None:
+                        if save_user_token_encrypted is None: # type: ignore
                             log_error("GoogleCalendarAPI", fn_name, "save_user_token_encrypted function not available.")
-                        elif not save_user_token_encrypted(self.user_id, refreshed_token_data_to_save):
+                        elif not save_user_token_encrypted(self.user_id, refreshed_token_data_to_save): # type: ignore
                             log_warning("GoogleCalendarAPI", fn_name, f"Failed to save refreshed token for {self.user_id}.")
                     except RefreshError as refresh_err:
                         log_error("GoogleCalendarAPI", fn_name, f"Token refresh FAILED for {self.user_id} (RefreshError): {refresh_err}. Re-authentication required.", refresh_err)
-                        if CONFIG_MANAGER_IMPORTED and _set_gcal_status_func: _set_gcal_status_func(self.user_id, "error")
+                        if _set_gcal_status_func_local: _set_gcal_status_func_local(self.user_id, "error")
                         token_file_path = os.path.join("data", "tokens", f"tokens_{self.user_id}{os.getenv('DATA_SUFFIX', '')}.json.enc")
                         if os.path.exists(token_file_path):
                             log_warning("GoogleCalendarAPI", fn_name, f"Deleting invalid token file due to refresh failure: {token_file_path}")
@@ -175,27 +167,26 @@ class GoogleCalendarAPI:
                         return None
                     except ImportError as imp_err:
                         log_error("GoogleCalendarAPI", fn_name, f"Import error during refresh for {self.user_id}: {imp_err}")
-                        if CONFIG_MANAGER_IMPORTED and _set_gcal_status_func: _set_gcal_status_func(self.user_id, "error")
+                        if _set_gcal_status_func_local: _set_gcal_status_func_local(self.user_id, "error")
                         return None
                     except Exception as refresh_err_unexp:
                         log_error("GoogleCalendarAPI", fn_name, f"Unexpected error during token refresh for {self.user_id}: {refresh_err_unexp}", refresh_err_unexp)
-                        if CONFIG_MANAGER_IMPORTED and _set_gcal_status_func: _set_gcal_status_func(self.user_id, "error")
+                        if _set_gcal_status_func_local: _set_gcal_status_func_local(self.user_id, "error")
                         return None
                 else:
                     log_error("GoogleCalendarAPI", fn_name, f"Credentials invalid for {self.user_id}, and no refresh token available. Re-authentication needed.")
-                    if CONFIG_MANAGER_IMPORTED and _set_gcal_status_func: _set_gcal_status_func(self.user_id, "error")
+                    if _set_gcal_status_func_local: _set_gcal_status_func_local(self.user_id, "error")
                     return None
 
-            if creds and creds.valid:
-                # log_info("GoogleCalendarAPI", fn_name, f"Credentials loaded and valid for {self.user_id}.") # Verbose
-                return creds
+            if creds and creds.valid: # type: ignore
+                return creds # type: ignore
             else:
                 log_error("GoogleCalendarAPI", fn_name, f"Failed to obtain valid credentials for {self.user_id} after potential refresh.")
-                if CONFIG_MANAGER_IMPORTED and _set_gcal_status_func: _set_gcal_status_func(self.user_id, "error")
+                if _set_gcal_status_func_local: _set_gcal_status_func_local(self.user_id, "error")
                 return None
         except Exception as e:
             log_error("GoogleCalendarAPI", fn_name, f"Error creating/validating credentials object for {self.user_id}: {e}", e)
-            if CONFIG_MANAGER_IMPORTED and _set_gcal_status_func: _set_gcal_status_func(self.user_id, "error")
+            if _set_gcal_status_func_local: _set_gcal_status_func_local(self.user_id, "error")
             return None
 
     def is_active(self):
@@ -203,14 +194,19 @@ class GoogleCalendarAPI:
 
     def create_event(self, event_data: Dict) -> str | None:
         fn_name = "create_event"
+        _set_gcal_status_func_local = None
+        try:
+            from services.config_manager import set_gcal_integration_status
+            _set_gcal_status_func_local = set_gcal_integration_status
+        except ImportError:
+            log_error("GoogleCalendarAPI", fn_name, "Failed to import set_gcal_integration_status for create_event.")
+
         if not self.is_active():
             log_error("GoogleCalendarAPI", fn_name, f"Service not active for user {self.user_id}.")
-            # No status change here as it's likely already 'error' or 'not_integrated' if service isn't active
             return None
         assert self.service is not None
 
         try:
-            # ... (event parsing logic remains the same as before) ...
             event_date = event_data.get('date'); event_time = event_data.get('time'); duration_minutes = None
             if event_data.get('duration'):
                 try:
@@ -244,15 +240,14 @@ class GoogleCalendarAPI:
                 "summary": event_data.get("title", event_data.get("description", "New Item")),
                 "description": event_data.get("description", ""), "start": start_obj, "end": end_obj
             }
-            # log_info("GoogleCalendarAPI", fn_name, f"Creating GCal event for user {self.user_id}: {google_event_body.get('summary')}") # Verbose
             created_event = self.service.events().insert(calendarId='primary', body=google_event_body).execute()
             google_event_id = created_event.get("id")
             if google_event_id: return google_event_id
             else: log_error("GoogleCalendarAPI", fn_name, f"GCal API response missing 'id'. Response: {created_event}"); return None
-        except HttpError as http_err:
-            log_error("GoogleCalendarAPI", fn_name, f"HTTP error creating event for user {self.user_id}: Status {http_err.resp.status}", http_err)
-            if http_err.resp.status in [401, 403] and CONFIG_MANAGER_IMPORTED and _set_gcal_status_func: # Unauthorized or Forbidden
-                _set_gcal_status_func(self.user_id, "error")
+        except HttpError as http_err: # type: ignore
+            log_error("GoogleCalendarAPI", fn_name, f"HTTP error creating event for user {self.user_id}: Status {http_err.resp.status}", http_err) # type: ignore
+            if http_err.resp.status in [401, 403] and _set_gcal_status_func_local: # type: ignore
+                _set_gcal_status_func_local(self.user_id, "error")
             return None
         except Exception as e:
             log_error("GoogleCalendarAPI", fn_name, f"Unexpected error creating event for user {self.user_id}", e)
@@ -260,17 +255,23 @@ class GoogleCalendarAPI:
 
     def update_event(self, event_id: str, updates: Dict) -> bool:
         fn_name = "update_event"
+        _set_gcal_status_func_local = None
+        try:
+            from services.config_manager import set_gcal_integration_status
+            _set_gcal_status_func_local = set_gcal_integration_status
+        except ImportError:
+            log_error("GoogleCalendarAPI", fn_name, "Failed to import set_gcal_integration_status for update_event.")
+
         if not self.is_active():
             log_error("GoogleCalendarAPI", fn_name, f"Service not active for user {self.user_id}, cannot update event {event_id}.")
             return False
         assert self.service is not None
         try:
-            # ... (existing logic to fetch event and prepare update_payload remains the same) ...
             try: existing_event = self.service.events().get(calendarId='primary', eventId=event_id).execute()
-            except HttpError as get_err:
-                if get_err.resp.status == 404: return False # Event not found
-                log_error("GoogleCalendarAPI", fn_name, f"HTTP error getting event {event_id} before update: {get_err}", get_err)
-                if get_err.resp.status in [401, 403] and CONFIG_MANAGER_IMPORTED and _set_gcal_status_func: _set_gcal_status_func(self.user_id, "error")
+            except HttpError as get_err: # type: ignore
+                if get_err.resp.status == 404: return False # type: ignore
+                log_error("GoogleCalendarAPI", fn_name, f"HTTP error getting event {event_id} before update: {get_err}", get_err) # type: ignore
+                if get_err.resp.status in [401, 403] and _set_gcal_status_func_local: _set_gcal_status_func_local(self.user_id, "error") # type: ignore
                 return False
             update_payload = {}; needs_update = False; time_zone = self.user_timezone
             if "title" in updates: update_payload["summary"] = updates["title"]; needs_update = True
@@ -306,18 +307,17 @@ class GoogleCalendarAPI:
                             end_date_dt = start_dt_date + timedelta(days=1)
                             update_payload["start"] = {"date": start_dt_date.strftime("%Y-%m-%d")}
                             update_payload["end"] = {"date": end_date_dt.strftime("%Y-%m-%d")}
-                            if 'dateTime' in update_payload.get("start",{}): del update_payload["start"]["dateTime"]
-                            if 'dateTime' in update_payload.get("end",{}): del update_payload["end"]["dateTime"]
+                            if 'dateTime' in update_payload.get("start",{}): del update_payload["start"]["dateTime"] # type: ignore
+                            if 'dateTime' in update_payload.get("end",{}): del update_payload["end"]["dateTime"] # type: ignore
                             needs_update = True
                         except ValueError as e: log_error("GoogleCalendarAPI", fn_name, f"Invalid date '{target_date_str}' for all-day update: {e}")
             if not needs_update: return True
-            # log_info("GoogleCalendarAPI", fn_name, f"Patching GCal event {event_id} for user {self.user_id}. Fields: {list(update_payload.keys())}") # Verbose
             self.service.events().patch(calendarId='primary', eventId=event_id, body=update_payload).execute()
             return True
-        except HttpError as http_err:
-            log_error("GoogleCalendarAPI", fn_name, f"HTTP error updating event {event_id}: Status {http_err.resp.status}", http_err)
-            if http_err.resp.status in [401, 403] and CONFIG_MANAGER_IMPORTED and _set_gcal_status_func:
-                _set_gcal_status_func(self.user_id, "error")
+        except HttpError as http_err: # type: ignore
+            log_error("GoogleCalendarAPI", fn_name, f"HTTP error updating event {event_id}: Status {http_err.resp.status}", http_err) # type: ignore
+            if http_err.resp.status in [401, 403] and _set_gcal_status_func_local: # type: ignore
+                _set_gcal_status_func_local(self.user_id, "error")
             return False
         except Exception as e:
             log_error("GoogleCalendarAPI", fn_name, f"Unexpected error updating event {event_id}", e)
@@ -325,22 +325,28 @@ class GoogleCalendarAPI:
 
     def delete_event(self, event_id: str) -> bool:
         fn_name = "delete_event"
+        _set_gcal_status_func_local = None
+        try:
+            from services.config_manager import set_gcal_integration_status
+            _set_gcal_status_func_local = set_gcal_integration_status
+        except ImportError:
+            log_error("GoogleCalendarAPI", fn_name, "Failed to import set_gcal_integration_status for delete_event.")
+
         if not self.is_active():
             log_error("GoogleCalendarAPI", fn_name, f"Service not active for user {self.user_id}, cannot delete event {event_id}.")
             return False
         assert self.service is not None
         try:
-            # log_info("GoogleCalendarAPI", fn_name, f"Attempting delete GCal event {event_id} for user {self.user_id}") # Verbose
             self.service.events().delete(calendarId='primary', eventId=event_id, sendNotifications=False).execute()
             return True
-        except HttpError as http_err:
-            if http_err.resp.status in [404, 410]:
-                log_warning("GoogleCalendarAPI", fn_name, f"GCal event {event_id} not found or already gone (Status {http_err.resp.status}). Assuming deleted.")
+        except HttpError as http_err: # type: ignore
+            if http_err.resp.status in [404, 410]: # type: ignore
+                log_warning("GoogleCalendarAPI", fn_name, f"GCal event {event_id} not found or already gone (Status {http_err.resp.status}). Assuming deleted.") # type: ignore
                 return True
             else:
-                log_error("GoogleCalendarAPI", fn_name, f"HTTP error deleting event {event_id}: Status {http_err.resp.status}", http_err)
-                if http_err.resp.status in [401, 403] and CONFIG_MANAGER_IMPORTED and _set_gcal_status_func:
-                    _set_gcal_status_func(self.user_id, "error")
+                log_error("GoogleCalendarAPI", fn_name, f"HTTP error deleting event {event_id}: Status {http_err.resp.status}", http_err) # type: ignore
+                if http_err.resp.status in [401, 403] and _set_gcal_status_func_local: # type: ignore
+                    _set_gcal_status_func_local(self.user_id, "error")
                 return False
         except Exception as e:
             log_error("GoogleCalendarAPI", fn_name, f"Unexpected error deleting event {event_id}", e)
@@ -348,6 +354,13 @@ class GoogleCalendarAPI:
 
     def list_events(self, start_date: str, end_date: str) -> List[Dict]:
         fn_name = "list_events"
+        _set_gcal_status_func_local = None
+        try:
+            from services.config_manager import set_gcal_integration_status
+            _set_gcal_status_func_local = set_gcal_integration_status
+        except ImportError:
+            log_error("GoogleCalendarAPI", fn_name, "Failed to import set_gcal_integration_status for list_events.")
+
         if not self.is_active():
             log_error("GoogleCalendarAPI", fn_name, f"Service not active for user {self.user_id}, cannot list events.")
             return []
@@ -369,12 +382,11 @@ class GoogleCalendarAPI:
                 items = events_result.get("items", []); all_items.extend(items)
                 page_token = events_result.get('nextPageToken')
                 if not page_token: break
-            # log_info("GoogleCalendarAPI", fn_name, f"Found {len(all_items)} GCal events for user {self.user_id} in range.") # Verbose
             return [self._parse_google_event(e) for e in all_items]
-        except HttpError as http_err:
-            log_error("GoogleCalendarAPI", fn_name, f"HTTP error listing events for user {self.user_id}: Status {http_err.resp.status}", http_err)
-            if http_err.resp.status in [401, 403] and CONFIG_MANAGER_IMPORTED and _set_gcal_status_func: # Unauthorized or Forbidden
-                _set_gcal_status_func(self.user_id, "error")
+        except HttpError as http_err: # type: ignore
+            log_error("GoogleCalendarAPI", fn_name, f"HTTP error listing events for user {self.user_id}: Status {http_err.resp.status}", http_err) # type: ignore
+            if http_err.resp.status in [401, 403] and _set_gcal_status_func_local: # type: ignore
+                _set_gcal_status_func_local(self.user_id, "error")
             return []
         except Exception as e:
             log_error("GoogleCalendarAPI", fn_name, f"Unexpected error listing events for user {self.user_id}", e)
@@ -382,17 +394,24 @@ class GoogleCalendarAPI:
 
     def _get_single_event(self, event_id: str) -> Dict | None:
         fn_name = "_get_single_event"
+        _set_gcal_status_func_local = None
+        try:
+            from services.config_manager import set_gcal_integration_status
+            _set_gcal_status_func_local = set_gcal_integration_status
+        except ImportError:
+            log_error("GoogleCalendarAPI", fn_name, "Failed to import set_gcal_integration_status for _get_single_event.")
+
         if not self.is_active(): return None
         assert self.service is not None
         try:
             event = self.service.events().get(calendarId='primary', eventId=event_id).execute()
             return event
-        except HttpError as http_err:
-            if http_err.resp.status in [404, 410]: return None
+        except HttpError as http_err: # type: ignore
+            if http_err.resp.status in [404, 410]: return None # type: ignore
             else:
-                log_error("GoogleCalendarAPI", fn_name, f"HTTP error getting event {event_id}: Status {http_err.resp.status}", http_err)
-                if http_err.resp.status in [401, 403] and CONFIG_MANAGER_IMPORTED and _set_gcal_status_func: # Unauthorized or Forbidden
-                     _set_gcal_status_func(self.user_id, "error")
+                log_error("GoogleCalendarAPI", fn_name, f"HTTP error getting event {event_id}: Status {http_err.resp.status}", http_err) # type: ignore
+                if http_err.resp.status in [401, 403] and _set_gcal_status_func_local: # type: ignore
+                     _set_gcal_status_func_local(self.user_id, "error")
                 return None
         except Exception as e:
             log_error("GoogleCalendarAPI", fn_name, f"Unexpected error getting event {event_id}", e)

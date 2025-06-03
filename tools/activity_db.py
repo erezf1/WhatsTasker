@@ -166,31 +166,60 @@ def delete_task(event_id: str) -> bool:
     except sqlite3.Error as e: log_error("activity_db", "delete_task", f"DB error delete task {event_id}: {e}", e); return False
 
 def list_tasks_for_user(user_id: str, status_filter: List[str] | None = None, date_range: Tuple[str, str] | None = None, project_filter: str | None = None, type_filter: List[str] | None = None) -> List[Dict]:
-    sql = "SELECT * FROM users_tasks WHERE user_id = ?"; params: List[Any] = [user_id]; conditions = []
+    # Define the effective_date_expression once to be used in WHERE and ORDER BY
+    effective_date_expression = "COALESCE(CASE WHEN gcal_start_datetime IS NOT NULL AND LENGTH(gcal_start_datetime) >= 10 THEN SUBSTR(gcal_start_datetime, 1, 10) END, date)"
+    
+    sql = f"SELECT * FROM users_tasks WHERE user_id = ?"
+    params: List[Any] = [user_id]
+    conditions = []
+
     if status_filter:
         clean_statuses = [s.lower().strip() for s in status_filter if isinstance(s, str) and s.strip()]
-        if clean_statuses: conditions.append(f"status IN ({','.join('?'*len(clean_statuses))})"); params.extend(clean_statuses)
+        if clean_statuses:
+            conditions.append(f"status IN ({','.join('?'*len(clean_statuses))})")
+            params.extend(clean_statuses)
+    
     if type_filter:
         clean_types = [t.lower().strip() for t in type_filter if isinstance(t, str) and t.strip()]
-        if clean_types: conditions.append(f"type IN ({','.join('?'*len(clean_types))})"); params.extend(clean_types)
+        if clean_types:
+            conditions.append(f"type IN ({','.join('?'*len(clean_types))})")
+            params.extend(clean_types)
+
     if date_range and len(date_range) == 2 and date_range[0] and date_range[1]:
-        conditions.append("COALESCE(CASE WHEN gcal_start_datetime IS NOT NULL AND LENGTH(gcal_start_datetime) >= 10 THEN SUBSTR(gcal_start_datetime, 1, 10) END, date) BETWEEN ? AND ?")
+        # Include items if their effective date is in range OR if they have no effective date (are dateless)
+        conditions.append(f"(({effective_date_expression} BETWEEN ? AND ?) OR ({effective_date_expression} IS NULL))")
         params.extend([date_range[0], date_range[1]])
-    if project_filter and project_filter.strip(): conditions.append("LOWER(project) = LOWER(?)"); params.append(project_filter.strip())
-    if conditions: sql += " AND " + " AND ".join(conditions)
-    sql += " ORDER BY COALESCE(CASE WHEN gcal_start_datetime IS NOT NULL AND LENGTH(gcal_start_datetime) >= 10 THEN SUBSTR(gcal_start_datetime, 1, 10) END, date) ASC, COALESCE(CASE WHEN gcal_start_datetime IS NOT NULL AND INSTR(gcal_start_datetime, 'T') > 0 THEN SUBSTR(gcal_start_datetime, INSTR(gcal_start_datetime, 'T') + 1, 5) END, time) ASC, created_at ASC"
+    
+    if project_filter and project_filter.strip():
+        conditions.append("LOWER(project) = LOWER(?)")
+        params.append(project_filter.strip())
+    
+    if conditions:
+        sql += " AND " + " AND ".join(conditions)
+    
+    # Use the same effective_date_expression for ordering
+    # Order by: items with dates first (sorted by date/time), then dateless items (sorted by creation)
+    sql += f" ORDER BY CASE WHEN {effective_date_expression} IS NULL THEN 1 ELSE 0 END, {effective_date_expression} ASC, COALESCE(CASE WHEN gcal_start_datetime IS NOT NULL AND INSTR(gcal_start_datetime, 'T') > 0 THEN SUBSTR(gcal_start_datetime, INSTR(gcal_start_datetime, 'T') + 1, 5) END, time) ASC, created_at ASC"
+    
     results = []
     try:
         with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=10) as conn:
-            conn.row_factory = _dict_factory; cursor = conn.cursor(); cursor.execute(sql, params)
+            conn.row_factory = _dict_factory
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
             for row in cursor.fetchall():
                 if 'session_event_ids' in row:
-                    try: row['session_event_ids'] = json.loads(row['session_event_ids']) if isinstance(row['session_event_ids'], str) else (row['session_event_ids'] or [])
-                    except: row['session_event_ids'] = []
+                    try:
+                        row['session_event_ids'] = json.loads(row['session_event_ids']) if isinstance(row['session_event_ids'], str) else (row['session_event_ids'] or [])
+                    except:
+                        row['session_event_ids'] = []
                 results.append(row)
+        # log_info("activity_db", "list_tasks_for_user", f"User {user_id} query returned {len(results)} items. SQL: {sql} PARAMS: {params}")
         return results
-    except sqlite3.Error as e: log_error("activity_db", "list_tasks_for_user", f"DB error list items for {user_id}: {e}", e); return []
-
+    except sqlite3.Error as e:
+        log_error("activity_db", "list_tasks_for_user", f"DB error list items for {user_id}: {e}", e)
+        return []
+        
 def update_task_fields(event_id: str, updates: Dict[str, Any]) -> bool:
     if not event_id or not updates: return False
     allowed_fields = {f for f in TASK_FIELDS if f != 'event_id'}; update_cols_setters = []; update_params_values = []

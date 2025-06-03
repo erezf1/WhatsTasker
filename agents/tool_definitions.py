@@ -52,7 +52,65 @@ from openai.types.chat.chat_completion_message_param import ChatCompletionMessag
 from tools.logger import log_info, log_error, log_warning
 import pydantic # Keep pydantic import for ValidationError
 
+# --- Load Standard Messages ---
+_messages_tool_def = {} # For messages needed by tools, e.g., onboarding completion
+try:
+    messages_path_tools = os.path.join("config", "messages.yaml")
+    if os.path.exists(messages_path_tools):
+        with open(messages_path_tools, 'r', encoding="utf-8") as f_tools_msg:
+            content_tools_msg = f_tools_msg.read()
+            if content_tools_msg.strip(): # Ensure file is not empty
+                f_tools_msg.seek(0) # Reset cursor
+                _messages_tool_def = yaml.safe_load(f_tools_msg) or {}
+            else:
+                _messages_tool_def = {} # File is empty or whitespace only
+    else:
+        log_warning("tool_definitions", "init", f"{messages_path_tools} not found for tool messages.")
+        _messages_tool_def = {}
+except Exception as e_load_msg_tools:
+    _messages_tool_def = {}
+    log_error("tool_definitions", "init", f"Failed to load messages.yaml for tools: {e_load_msg_tools}", e_load_msg_tools)
+# --- End Load Standard Messages ---
+
+
 # --- Helper Functions ---
+
+# --- Helper function to load the new single scheduler prompt ---
+_COMPREHENSIVE_SCHEDULER_PROMPT_CACHE: str | None = None # Cache for the single prompt string
+
+def _load_comprehensive_scheduler_prompt() -> str:
+    global _COMPREHENSIVE_SCHEDULER_PROMPT_CACHE
+    fn_name = "_load_comprehensive_scheduler_prompt"
+    
+    if _COMPREHENSIVE_SCHEDULER_PROMPT_CACHE is not None:
+        return _COMPREHENSIVE_SCHEDULER_PROMPT_CACHE
+
+    prompt_key = "comprehensive_task_scheduler_prompt"
+    prompts_path = os.path.join("config", "prompts.yaml")
+    
+    prompt_text: str = ""
+    try:
+        if not os.path.exists(prompts_path):
+            raise FileNotFoundError(f"{prompts_path} not found.")
+        with open(prompts_path, "r", encoding="utf-8") as f:
+            all_prompts = yaml.safe_load(f)
+        if not all_prompts:
+            raise ValueError("YAML prompts file loaded as empty.")
+        
+        prompt_text_temp = all_prompts.get(prompt_key)
+        if not prompt_text_temp or not prompt_text_temp.strip():
+            log_error("tool_definitions", fn_name, f"Prompt '{prompt_key}' missing or empty in {prompts_path}.")
+        else:
+            prompt_text = prompt_text_temp
+            _COMPREHENSIVE_SCHEDULER_PROMPT_CACHE = prompt_text # Cache it
+            log_info("tool_definitions", fn_name, f"Successfully loaded '{prompt_key}'.")
+
+    except Exception as e:
+        log_error("tool_definitions", fn_name, f"Failed to load scheduler prompt '{prompt_key}': {e}", e)
+        # Return an empty string or a default fallback if critical
+        # For now, an empty string will cause the tool to fail gracefully later.
+    
+    return prompt_text
 
 def _get_calendar_api_from_state(user_id: str) -> Any: # Returns GoogleCalendarAPI instance or None
     fn_name = "_get_calendar_api_from_state_tooldef"
@@ -65,9 +123,6 @@ def _get_calendar_api_from_state(user_id: str) -> Any: # Returns GoogleCalendarA
             api = state.get("calendar")
             if isinstance(api, GoogleCalendarAPI_class_ref) and api.is_active():
                 return api
-            # Optional: More complex logic to re-initialize if status is 'connected' but API object is missing/inactive
-            # This might involve calling user_manager functions, which could create circular dependencies if not careful.
-            # For now, rely on agent state having the correct, active API object if GCal is connected.
         # else: log_warning if state is None (agent_state_manager should handle this)
     except Exception as e:
         log_error("tool_definitions", fn_name, f"Error getting calendar API from state for {user_id}", e, user_id=user_id)
@@ -339,6 +394,11 @@ class UpdateUserPreferencesParams(BaseModel):
         return v
 
 class InitiateCalendarConnectionParams(BaseModel): pass
+
+class SendOnboardingCompletionMessageParams(BaseModel):
+    """Tool to retrieve the standard onboarding completion message."""
+    pass # No parameters needed for this tool
+
 class InterpretListReplyParams(BaseModel): # This tool may become obsolete
     user_reply: str = Field(...)
     list_mapping: dict = Field(...)
@@ -385,107 +445,144 @@ def create_reminder_tool(user_id: str, params: CreateReminderParams) -> Dict:
     except Exception as e: log_error("tool_definitions", fn_name, f"Error: {e}", e); return {"success": False, "item_id": None, "message": f"Error creating Reminder: {e}"}
 
 # --- Task Scheduling Tools (Revised) ---
+# --- Revised propose_task_slots_tool ---
 def propose_task_slots_tool(user_id: str, params: ProposeTaskSlotsParams) -> Dict:
     fn_name = "propose_task_slots_tool"
     log_info("tool_definitions", fn_name, f"User {user_id}, NLP Req: '{params.natural_language_scheduling_request[:60]}...', ReschedID: {params.item_id_to_reschedule or 'N/A'}")
 
-    fail_result = {
+    fail_result = { # Default failure response
         "success": False, "proposed_slots": [],
         "message": "Sorry, I encountered an issue trying to propose schedule slots.",
         "search_context": {
             "original_request": params.natural_language_scheduling_request,
             "item_id_to_reschedule": params.item_id_to_reschedule,
-            "parsed_task_details_from_llm": None
+            "parsed_task_details_from_llm": None # Keep this structure for consistency
         }
     }
-    system_prompt, human_prompt_template = _load_scheduler_prompts()
-    if not system_prompt or not human_prompt_template:
-        log_error("tool_definitions", fn_name, "Scheduler prompts not loaded.", user_id=user_id)
-        fail_result["message"] = "Internal error: Scheduler configuration missing."
+
+    comprehensive_prompt_template = _load_comprehensive_scheduler_prompt()
+    if not comprehensive_prompt_template:
+        log_error("tool_definitions", fn_name, "Comprehensive scheduler prompt not loaded. Cannot proceed.", user_id=user_id)
+        fail_result["message"] = "Internal error: Scheduler prompt configuration missing."
         return fail_result
 
     agent_state = get_agent_state(user_id)
     if not agent_state:
         log_error("tool_definitions", fn_name, f"Agent state not found for {user_id}.", user_id=user_id)
-        fail_result["message"] = "Internal error: User context unavailable."
+        fail_result["message"] = "Internal error: User context unavailable for scheduling."
         return fail_result
 
     preferences = agent_state.get("preferences", {})
     user_tz_str = preferences.get("TimeZone", "UTC")
-    try: user_timezone = pytz.timezone(user_tz_str)
-    except pytz.UnknownTimeZoneError: user_timezone = pytz.utc; user_tz_str = "UTC"
+    try:
+        user_timezone = pytz.timezone(user_tz_str)
+    except pytz.UnknownTimeZoneError:
+        log_warning("tool_definitions", fn_name, f"Unknown timezone '{user_tz_str}' for user {user_id}. Using UTC.", user_id=user_id)
+        user_timezone = pytz.utc
+        user_tz_str = "UTC" # Correct the string if it was invalid
+
     now_user_tz = datetime.now(user_timezone)
-    search_start_user_tz = now_user_tz.date()
-    search_end_user_tz = search_start_user_tz + timedelta(weeks=4) # Default search window
+    # Define a reasonable search window, e.g., from today up to 4 weeks
+    search_start_user_tz_date = now_user_tz.date()
+    search_end_user_tz_date = search_start_user_tz_date + timedelta(weeks=4)
 
     live_gcal_events = []
     if preferences.get("gcal_integration_status") == "connected":
-        calendar_api = _get_calendar_api_from_state(user_id)
+        calendar_api = _get_calendar_api_from_state(user_id) # Your existing helper
         if calendar_api:
             try:
                 live_gcal_events = calendar_api.list_events(
-                    search_start_user_tz.strftime("%Y-%m-%d"),
-                    search_end_user_tz.strftime("%Y-%m-%d")
+                    search_start_user_tz_date.strftime("%Y-%m-%d"),
+                    search_end_user_tz_date.strftime("%Y-%m-%d")
                 )
-            except Exception as e_cal: log_error("tool_definitions", fn_name, f"Error fetching GCal events for {user_id}", e_cal, user_id=user_id)
-        else: log_warning("tool_definitions", fn_name, f"GCal API not init for {user_id} despite 'connected' status.", user_id=user_id)
-
-    existing_task_details_json = "{}"
-    if params.item_id_to_reschedule and DB_IMPORTED and activity_db_module_ref:
+            except Exception as e_cal:
+                log_error("tool_definitions", fn_name, f"Error fetching GCal events for {user_id}", e_cal, user_id=user_id)
+                # Proceed without live events, LLM will be informed list is empty
+        # else: log GCal API not init was handled in the previous log snippet analysis
+    
+    existing_task_details_json_str = "{}" # Default empty JSON object as string
+    if params.item_id_to_reschedule and DB_IMPORTED and activity_db_module_ref: # Check DB_IMPORTED
         existing_task_data = activity_db_module_ref.get_task(params.item_id_to_reschedule)
         if existing_task_data:
-            relevant_details = {k: existing_task_data.get(k) for k in ["title", "description", "estimated_duration", "date", "project", "status", "session_event_ids"]}
-            existing_task_details_json = json.dumps(relevant_details, default=str)
-    
-    human_prompt_filled = human_prompt_template.format(
-        natural_language_scheduling_request=params.natural_language_scheduling_request,
-        existing_task_id=params.item_id_to_reschedule or "N/A",
-        existing_task_details_json=existing_task_details_json,
-        user_id=user_id,
-        user_preferred_session_length=preferences.get("Preferred_Session_Length", "1h"),
-        user_working_days=json.dumps(preferences.get("Work_Days", ["Mon", "Tue", "Wed", "Thu", "Fri"])),
-        user_work_start_time=preferences.get("Work_Start_Time", "09:00"),
-        user_work_end_time=preferences.get("Work_End_Time", "17:00"),
-        user_timezone=user_tz_str,
-        current_date_user_tz=now_user_tz.strftime("%Y-%m-%d"),
-        search_start_date_user_tz=search_start_user_tz.strftime("%Y-%m-%d"),
-        search_end_date_user_tz=search_end_user_tz.strftime("%Y-%m-%d"),
-        live_calendar_events_json=json.dumps(live_gcal_events, default=str)
-    )
+            relevant_details = {
+                k: existing_task_data.get(k) for k in 
+                ["title", "description", "estimated_duration", "date", "project", "status", "session_event_ids"]
+                if existing_task_data.get(k) is not None # Only include non-null values
+            }
+            existing_task_details_json_str = json.dumps(relevant_details, default=str)
+
+    # Prepare all values for formatting the prompt
+    prompt_format_values = {
+        "natural_language_scheduling_request": params.natural_language_scheduling_request,
+        "existing_task_id": params.item_id_to_reschedule or "N/A",
+        "existing_task_details_json": existing_task_details_json_str,
+        "user_id": user_id,
+        "user_preferred_session_length": preferences.get("Preferred_Session_Length", "1h"),
+        "user_working_days": json.dumps(preferences.get("Work_Days", ["Mon", "Tue", "Wed", "Thu", "Fri"])), # Send as JSON string
+        "user_work_start_time": preferences.get("Work_Start_Time", "09:00"),
+        "user_work_end_time": preferences.get("Work_End_Time", "17:00"),
+        "user_timezone": user_tz_str,
+        "current_date_user_tz": now_user_tz.strftime("%Y-%m-%d"),
+        "search_start_date_user_tz": search_start_user_tz_date.strftime("%Y-%m-%d"),
+        "search_end_date_user_tz": search_end_user_tz_date.strftime("%Y-%m-%d"),
+        "live_calendar_events_json": json.dumps(live_gcal_events, default=str)
+    }
+
+    try:
+        formatted_prompt_for_llm = comprehensive_prompt_template.format(**prompt_format_values)
+    except KeyError as e_fmt:
+        log_error("tool_definitions", fn_name, f"Missing key '{e_fmt}' when formatting comprehensive scheduler prompt for {user_id}.", e_fmt, user_id=user_id)
+        fail_result["message"] = "Internal error: Scheduler prompt formatting failed."
+        return fail_result
+
+    # For OpenAI API, the detailed instructions and data often go into the "user" message,
+    # after a very brief system message.
     messages_for_llm: List[ChatCompletionMessageParam] = [ # type: ignore
-        {"role": "system", "content": system_prompt}, {"role": "user", "content": human_prompt_filled}
+        {"role": "system", "content": "You are an expert Internal Scheduling Assistant. Follow the instructions and use the data provided in the user message to generate your JSON response."},
+        {"role": "user", "content": formatted_prompt_for_llm}
     ]
+    
     client = get_instructor_client()
     if not client:
-        log_error("tool_definitions", fn_name, "LLM client unavailable.", user_id=user_id)
-        fail_result["message"] = "Internal error: AI scheduling service unavailable."
+        log_error("tool_definitions", fn_name, "LLM client unavailable for scheduling sub-task.", user_id=user_id)
+        fail_result["message"] = "Internal error: AI scheduling service client unavailable."
         return fail_result
+
     try:
-        # log_info("tool_definitions", fn_name, f"Invoking Scheduling LLM for {user_id}...") # Verbose
+        log_info("tool_definitions", fn_name, f"Invoking Scheduling LLM for {user_id} with combined prompt...")
         response = client.chat.completions.create(
-            model="gpt-4o", messages=messages_for_llm,
-            response_format={"type": "json_object"}, temperature=0.2,
+            model="gpt-4o", # Or your preferred model for this sub-task
+            messages=messages_for_llm,
+            response_format={"type": "json_object"}, # Crucial for getting JSON back
+            temperature=0.1, # Low temperature for deterministic JSON generation
         )
         llm_raw_output = response.choices[0].message.content
-        if not llm_raw_output: raise ValueError("LLM returned empty content.")
+        if not llm_raw_output:
+            raise ValueError("Scheduling LLM returned empty content.")
+            
     except Exception as e_llm:
         log_error("tool_definitions", fn_name, f"Error invoking Scheduling LLM for {user_id}", e_llm, user_id=user_id)
-        fail_result["message"] = "AI scheduler encountered an issue. Please try again."
+        fail_result["message"] = "AI scheduler sub-task encountered an issue. Please try again."
         return fail_result
 
-    parsed_llm_data = _parse_comprehensive_schedule_response(llm_raw_output, user_id)
+    # Parse the JSON output from the LLM
+    parsed_llm_data = _parse_comprehensive_schedule_response(llm_raw_output, user_id) # Your existing parser
     if not parsed_llm_data:
-        fail_result["message"] = "AI scheduler returned an unexpected format. Please rephrase."
+        log_error("tool_definitions", fn_name, f"Failed to parse valid JSON from scheduling LLM for {user_id}. Raw: {llm_raw_output[:500]}")
+        fail_result["message"] = "AI scheduler returned an unexpected format. Please rephrase your request."
         return fail_result
 
+    # Construct the final result for the main orchestrator
     return {
         "success": True,
         "proposed_slots": parsed_llm_data.get("proposed_sessions", []),
-        "message": parsed_llm_data.get("response_message", "Slots proposed."),
-        "search_context": {
+        "message": parsed_llm_data.get("response_message", "Slots proposed by sub-agent."), # Message from the sub-agent
+        "search_context": { # This is what the main orchestrator needs
             "original_request": params.natural_language_scheduling_request,
             "item_id_to_reschedule": params.item_id_to_reschedule,
             "parsed_task_details_from_llm": parsed_llm_data.get("parsed_task_details_for_finalization")
+            # Add any other context from prompt_format_values if needed by finalize_task_and_book_sessions
+            # e.g., "user_preferred_session_length": prompt_format_values["user_preferred_session_length"]
         }
     }
 
@@ -561,15 +658,16 @@ def update_item_details_tool(user_id: str, params: UpdateItemDetailsParams) -> D
             message_parts.append(status_update_message)
             if not status_update_success: overall_success = False
         
-        if updates_for_details and overall_success:
+        if updates_for_details and overall_success: # Only try to update details if status update (if any) succeeded
             updated_item_obj = task_manager.update_item_details(user_id, params.item_id, updates_for_details)
             if updated_item_obj: message_parts.append("Other details updated.")
             else: message_parts.append("Failed to update other details."); overall_success = False
-        elif not updates_for_details and not status_to_set:
+        elif not updates_for_details and not status_to_set: # No status change and no other details
              return {"success": False, "message": "No updates provided."}
 
         final_message = "Item update: " + "; ".join(message_parts) if message_parts else "No specific updates."
-        if not overall_success and not message_parts: final_message = "Failed to update item status."
+        if not overall_success and not message_parts: # e.g. only status update was attempted and failed
+            final_message = "Failed to update item status."
         return {"success": overall_success, "message": final_message}
     except pydantic.ValidationError as e: return {"success": False, "message": f"Invalid update params: {e.errors()}"}
     except Exception as e: log_error("tool_definitions", fn_name, f"Error: {e}", e); return {"success": False, "message": f"Error updating: {e}."}
@@ -611,6 +709,30 @@ def initiate_calendar_connection_tool(user_id: str, params: InitiateCalendarConn
         return result_dict
     except Exception as e: log_error("tool_definitions", fn_name, f"Error: {e}", e); return {"success": False, "status": "error", "message": f"Error initiating GCal: {e}."}
 
+def send_onboarding_completion_message_tool(user_id: str, params: SendOnboardingCompletionMessageParams) -> Dict:
+    """Retrieves the standard onboarding completion message in the user's preferred language."""
+    fn_name = "send_onboarding_completion_message_tool"
+    try:
+        agent_state = get_agent_state(user_id)
+        if not agent_state or not agent_state.get("preferences"):
+            log_warning("tool_definitions", fn_name, f"Cannot get preferences for user {user_id} to determine language.")
+            return {"success": False, "message_to_send": "Onboarding complete! (Could not load detailed welcome)."}
+
+        user_lang = agent_state["preferences"].get("Preferred_Language", "en") # Default to English
+        
+        completion_message_structure = _messages_tool_def.get("onboarding_completion_message", {})
+        message_text = completion_message_structure.get(user_lang, completion_message_structure.get("en"))
+
+        if not message_text:
+            log_error("tool_definitions", fn_name, f"Onboarding completion message not found for lang '{user_lang}' or default 'en'.")
+            return {"success": False, "message_to_send": "You're all set up! Welcome to WhatsTasker."}
+
+        return {"success": True, "message_to_send": message_text}
+    except Exception as e:
+        log_error("tool_definitions", fn_name, f"Error retrieving onboarding completion message: {e}", e)
+        return {"success": False, "message_to_send": "Onboarding process finished. Welcome!"}
+
+
 def interpret_list_reply_tool(user_id: str, params: InterpretListReplyParams) -> Dict: # Potentially obsolete
     fn_name = "interpret_list_reply_tool"
     try:
@@ -633,23 +755,25 @@ def interpret_list_reply_tool(user_id: str, params: InterpretListReplyParams) ->
 AVAILABLE_TOOLS = {
     "create_todo": create_todo_tool,
     "create_reminder": create_reminder_tool,
-    "propose_task_slots": propose_task_slots_tool, # Uses revised logic
-    "finalize_task_and_book_sessions": finalize_task_and_book_sessions_tool, # Uses revised logic
+    "propose_task_slots": propose_task_slots_tool,
+    "finalize_task_and_book_sessions": finalize_task_and_book_sessions_tool,
     "update_item_details": update_item_details_tool,
     "format_list_for_display": format_list_for_display_tool,
     "update_user_preferences": update_user_preferences_tool,
     "initiate_calendar_connection": initiate_calendar_connection_tool,
-    "interpret_list_reply": interpret_list_reply_tool, # Kept for now, but Orchestrator aims to supersede
+    "send_onboarding_completion_message": send_onboarding_completion_message_tool, # New Tool
+    "interpret_list_reply": interpret_list_reply_tool,
 }
 TOOL_PARAM_MODELS = {
     "create_todo": CreateToDoParams,
     "create_reminder": CreateReminderParams,
-    "propose_task_slots": ProposeTaskSlotsParams, # Pydantic model itself doesn't change much externally
-    "finalize_task_and_book_sessions": FinalizeTaskAndBookSessionsParams, # Pydantic model updated
+    "propose_task_slots": ProposeTaskSlotsParams,
+    "finalize_task_and_book_sessions": FinalizeTaskAndBookSessionsParams,
     "update_item_details": UpdateItemDetailsParams,
     "format_list_for_display": FormatListForDisplayParams,
     "update_user_preferences": UpdateUserPreferencesParams,
     "initiate_calendar_connection": InitiateCalendarConnectionParams,
+    "send_onboarding_completion_message": SendOnboardingCompletionMessageParams, # New Tool
     "interpret_list_reply": InterpretListReplyParams,
 }
 # --- END OF FULL agents/tool_definitions.py ---

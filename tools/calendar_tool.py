@@ -1,186 +1,251 @@
-# --- START OF FULL tools/calendar_tool.py ---
-
+# --- START OF FULL tools/calendar_tool.py (Corrected SyntaxError) ---
+# tools/calendar_tool.py
 import os
-import requests
-import json
-from fastapi import APIRouter, Request, Response
-from fastapi.responses import HTMLResponse
+import requests 
+import json     
+import yaml     
+from fastapi import APIRouter, Request 
+from fastapi.responses import HTMLResponse 
 from tools.logger import log_info, log_error, log_warning
-from tools.encryption import encrypt_data
-import jwt
-import requests.compat
-from datetime import datetime
+import jwt 
+import requests.compat 
 
-# --- Import config_manager locally within functions where needed ---
-# --- This avoids circular dependency issues at module load time ---
+from tools.token_store import save_user_token_encrypted, get_user_token 
+from services.agent_state_manager import update_agent_state_key, get_agent_state 
+from tools.google_calendar_api import GoogleCalendarAPI 
+from bridge.request_router import send_message as send_chat_message 
+from typing import Dict
+
+log_info("calendar_tool", "module_load", "Starting module load.")
 
 router = APIRouter()
 
+_calendar_tool_messages: Dict = {}
+
+def _load_messages_from_yaml():
+    global _calendar_tool_messages 
+    fn_name = "_load_messages_from_yaml_calendar_tool"
+    try:
+        _messages_path = os.path.join("config", "messages.yaml")
+        if os.path.exists(_messages_path):
+            with open(_messages_path, 'r', encoding="utf-8") as f_msg:
+                _yaml_content = f_msg.read()
+                if _yaml_content.strip():
+                    f_msg.seek(0)
+                    loaded_messages = yaml.safe_load(f_msg)
+                    if isinstance(loaded_messages, dict):
+                        _calendar_tool_messages = loaded_messages
+                        log_info("calendar_tool", fn_name, "Successfully loaded messages from messages.yaml.")
+                        return 
+                    else:
+                        log_warning("calendar_tool", fn_name, "messages.yaml content is not a dictionary.")
+                else:
+                    log_warning("calendar_tool", fn_name, "messages.yaml is empty.")
+        else:
+            log_warning("calendar_tool", fn_name, f"messages.yaml not found at {_messages_path}.")
+    except Exception as e_msg_load:
+        log_error("calendar_tool", fn_name, f"Failed to load messages.yaml: {e_msg_load}", e_msg_load)
+    
+    _calendar_tool_messages = {} 
+    log_warning("calendar_tool", fn_name, "Using empty messages for calendar_tool due to loading issue.")
+
+_load_messages_from_yaml()
+
+def _get_message(message_key: str, user_lang: str = "en", **kwargs) -> str:
+    default_lang = "en"
+    message_obj = _calendar_tool_messages.get(message_key, {}) 
+    
+    if isinstance(message_obj, dict):
+        message_template = message_obj.get(user_lang, message_obj.get(default_lang, f"MsgKeyNotFound: {message_key}"))
+    elif isinstance(message_obj, str):
+        message_template = message_obj
+    else:
+        message_template = f"MsgKeyNotFoundOrInvalid: {message_key} (Type: {type(message_obj)})"
+        log_warning("calendar_tool", "_get_message", f"Message object for key '{message_key}' is not dict or str.")
+
+    try:
+        return message_template.format(**kwargs) if kwargs else message_template
+    except KeyError as e_format:
+        log_warning("calendar_tool", "_get_message", f"Missing key '{e_format}' for formatting msg_key '{message_key}'")
+        return message_template
+    except Exception as e_general_format:
+        log_error("calendar_tool", "_get_message", f"General error formatting msg_key '{message_key}': {e_general_format}")
+        return message_template
+
+def _get_html_response_page(page_title_key: str, message_body_key: str, user_lang: str = "en", **kwargs) -> str:
+    page_title = _get_message(page_title_key, user_lang) 
+    body_content = _get_message(message_body_key, user_lang, **kwargs)
+    return f"""
+    <html>
+    <head><title>{page_title}</title></head>
+    <body>
+        <h1>{page_title}</h1>
+        <p>{body_content}</p>
+    </body>
+    </html>
+    """
+
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
-REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
-SCOPE = "https://www.googleapis.com/auth/calendar"
+REDIRECT_URI_BASE_ENV = os.getenv("GOOGLE_REDIRECT_URI")
+SCOPE = "https://www.googleapis.com/auth/calendar.events"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 AUTH_URL_BASE = "https://accounts.google.com/o/oauth2/auth"
 
 if not GOOGLE_CLIENT_SECRET or not CLIENT_ID:
-    log_error("calendar_tool", "config", "CRITICAL: GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET env var not set.")
+    log_error("calendar_tool", "config_check", "CRITICAL: GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET env var not set.")
 
-log_info("calendar_tool", "config", f"Calendar Tool loaded. Client ID starts with: {str(CLIENT_ID)[:10]}")
 
 def authenticate(user_id: str, prefs: dict) -> dict:
-    log_info("calendar_tool", "authenticate", f"Checking auth status for user {user_id}")
-    from tools.token_store import get_user_token
+    from services.config_manager import set_gcal_integration_status 
+    fn_name = "authenticate"
+    log_info("calendar_tool", fn_name, f"Checking auth status for user {user_id}")
+    
+    actual_redirect_uri = REDIRECT_URI_BASE_ENV
+    if not actual_redirect_uri:
+        log_error("calendar_tool", fn_name, "GOOGLE_REDIRECT_URI not configured for this instance.")
+        return {"status": "fails", "message": "Server configuration error (redirect URI missing)."}
+
     token_data = get_user_token(user_id)
     calendar_enabled = prefs.get("Calendar_Enabled", False)
     gcal_status = prefs.get("gcal_integration_status", "not_integrated")
 
-    # If already connected and enabled, no need to re-auth unless status is error
     if token_data is not None and calendar_enabled and gcal_status == "connected":
-        log_info("calendar_tool", "authenticate", f"GCal token exists, enabled, and status 'connected' for {user_id}.")
-        return {"status": "token_exists", "message": "Calendar already connected and credentials seem valid."}
+        return {"status": "token_exists", "message": "Calendar already connected."}
     
-    # If status is 'error', or not 'connected' but token exists and enabled, or no token: proceed to auth URL
-    log_info("calendar_tool", "authenticate", f"Proceeding to generate auth URL for {user_id}. Current GCal status: {gcal_status}, Token: {'Yes' if token_data else 'No'}, Enabled: {calendar_enabled}")
+    log_info("calendar_tool", fn_name, f"Proceeding to generate auth URL for {user_id}. GCal status: {gcal_status}, Redirect: {actual_redirect_uri}")
 
-    if not CLIENT_ID or not REDIRECT_URI:
-        log_error("calendar_tool", "authenticate", f"Client ID or Redirect URI missing for auth URL generation.")
-        return {"status": "fails", "message": "Server configuration error prevents authentication."}
+    if not CLIENT_ID:
+        log_error("calendar_tool", fn_name, f"Client ID missing.")
+        return {"status": "fails", "message": "Server configuration error."}
 
-    normalized_state = user_id.replace("@c.us", "").replace("+","")
     params = {
-        "client_id": CLIENT_ID, "redirect_uri": REDIRECT_URI, "scope": SCOPE,
-        "response_type": "code", "access_type": "offline", "state": normalized_state, "prompt": "consent"
+        "client_id": CLIENT_ID, "redirect_uri": actual_redirect_uri, "scope": SCOPE,
+        "response_type": "code", "access_type": "offline", "state": user_id, "prompt": "consent"
     }
     try:
         encoded_params = requests.compat.urlencode(params)
         auth_url = f"{AUTH_URL_BASE}?{encoded_params}"
-        log_info("calendar_tool", "authenticate", f"Generated auth URL for {user_id}")
-        
-        # --- Import config_manager locally ---
-        try:
-            from services.config_manager import set_gcal_integration_status
-            set_gcal_integration_status(user_id, "pending_auth")
-        except ImportError:
-            log_error("calendar_tool", "authenticate", "Failed to import config_manager to set 'pending_auth' status.")
-        except Exception as e_cfg:
-            log_error("calendar_tool", "authenticate", f"Error setting 'pending_auth' status for {user_id}", e_cfg)
-
-        return {"status": "pending", "message": f"Please authenticate your calendar by visiting this URL: {auth_url}"}
+        log_info("calendar_tool", fn_name, f"Generated auth URL for {user_id}")
+        set_gcal_integration_status(user_id, "pending_auth") 
+        return {"status": "pending", "message": f"Please authenticate by visiting: {auth_url}"}
     except Exception as url_e:
-        log_error("calendar_tool", "authenticate", f"Failed to build auth URL for {user_id}", url_e)
+        log_error("calendar_tool", fn_name, f"Failed to build auth URL for {user_id}", url_e)
+        set_gcal_integration_status(user_id, "error")
         return {"status": "fails", "message": "Failed to generate authentication URL."}
 
 
 @router.get("/oauth2callback", response_class=HTMLResponse)
 async def oauth2callback(request: Request, code: str | None = None, state: str | None = None, error: str | None = None):
-    config_manager_imported_locally = False
-    set_gcal_status_func = None
-    update_prefs_func = None # For Calendar_Enabled and email
+    from services.config_manager import set_gcal_integration_status, update_preferences
+    fn_name = "oauth2callback"
+    user_id_from_state = state
+    user_lang = "en" 
 
-    try:
-        from services.config_manager import set_gcal_integration_status, update_preferences
-        set_gcal_status_func = set_gcal_integration_status
-        update_prefs_func = update_preferences
-        config_manager_imported_locally = True
-    except ImportError:
-        # Fallback to direct registry update for Calendar_Enabled and email
-        from users.user_registry import update_preferences as update_prefs_direct_registry
-        update_prefs_func = update_prefs_direct_registry
-        log_warning("calendar_tool", "oauth2callback", "ConfigManager not found for prefs update, using direct registry update. GCal status may not be optimally set on error.")
-    except Exception as e_import:
-        log_error("calendar_tool", "oauth2callback", f"Unexpected error importing config_manager: {e_import}")
+    if user_id_from_state:
+        agent_s = get_agent_state(user_id_from_state)
+        if agent_s and agent_s.get("preferences"):
+            user_lang = agent_s.get("preferences").get("Preferred_Language", "en")
 
+    current_instance_redirect_uri = REDIRECT_URI_BASE_ENV
+    if not current_instance_redirect_uri:
+        log_error("calendar_tool", fn_name, "FATAL: GOOGLE_REDIRECT_URI not set. Cannot process OAuth callback.")
+        return HTMLResponse(content=_get_html_response_page("oauth_browser_page_title", "oauth_browser_error_message", user_lang, details="Server Misconfiguration"), status_code=500)
 
-    html_error_template = "<html><body><h1>Authentication Error</h1><p>Details: {details}</p><p>Please try authenticating again or contact support if the issue persists.</p></body></html>"
-    html_success_template = "<html><body><h1>Authentication Successful!</h1><p>Your credentials have been saved. You can close this window and return to the chat.</p></body></html>"
+    if not user_id_from_state:
+        log_error("calendar_tool", fn_name, "Callback missing state (user_id).")
+        return HTMLResponse(content=_get_html_response_page("oauth_browser_page_title", "oauth_browser_error_message", user_lang, details="Invalid response from Google (missing user identifier)"), status_code=400)
 
-    if not state: # User ID must be present in state
-        log_error("calendar_tool", "oauth2callback", "Callback missing state (user_id).")
-        return HTMLResponse(content=html_error_template.format(details="Invalid response received from Google (missing user identifier)."), status_code=400)
-    
-    user_id = state # state is the user_id
+    log_info("calendar_tool", fn_name, f"Callback received for user_id: {user_id_from_state}. Code: {'Present' if code else 'Missing'}. Error: {error or 'None'}.")
+
+    failure_chat_msg = _get_message("oauth_failure_chat_message_retry", user_lang)
+    browser_error_html = _get_html_response_page("oauth_browser_page_title", "oauth_browser_error_message", user_lang, details="Authentication process could not be completed.")
 
     if error:
-        log_error("calendar_tool", "oauth2callback", f"OAuth error received from Google for user {user_id}: {error}")
-        if set_gcal_status_func: set_gcal_status_func(user_id, "error")
-        else: log_error("calendar_tool", "oauth2callback", "Cannot set GCal status to 'error' due to missing config_manager.set_gcal_integration_status function.")
-        return HTMLResponse(content=html_error_template.format(details=f"Google reported an error: {error}"), status_code=400)
+        log_error("calendar_tool", fn_name, f"Google OAuth error for user {user_id_from_state}: {error}")
+        set_gcal_integration_status(user_id_from_state, "error")
+        try: send_chat_message(user_id_from_state, failure_chat_msg)
+        except Exception as send_e: log_error("calendar_tool", fn_name, f"Failed to send chat error to {user_id_from_state}", send_e)
+        return HTMLResponse(content=_get_html_response_page("oauth_browser_page_title", "oauth_browser_error_message", user_lang, details=f"Google reported an error: {error}"), status_code=400)
     
     if not code:
-        log_error("calendar_tool", "oauth2callback", f"Callback missing authorization code for user {user_id}.")
-        if set_gcal_status_func: set_gcal_status_func(user_id, "error")
-        else: log_error("calendar_tool", "oauth2callback", "Cannot set GCal status to 'error' due to missing config_manager.set_gcal_integration_status function.")
-        return HTMLResponse(content=html_error_template.format(details="Invalid response received from Google (missing authorization code)."), status_code=400)
-
-    log_info("calendar_tool", "oauth2callback", f"Callback received for user {user_id}.")
+        log_error("calendar_tool", fn_name, f"Callback missing authorization code for {user_id_from_state}.")
+        set_gcal_integration_status(user_id_from_state, "error") 
+        try: send_chat_message(user_id_from_state, failure_chat_msg)
+        except Exception as send_e: log_error("calendar_tool", fn_name, f"Failed to send chat error to {user_id_from_state}", send_e)
+        return HTMLResponse(content=_get_html_response_page("oauth_browser_page_title","oauth_browser_error_message", user_lang, details="Invalid response from Google (missing authorization code)"), status_code=400)
 
     if not GOOGLE_CLIENT_SECRET or not CLIENT_ID:
-        log_error("calendar_tool", "oauth2callback", "Server configuration error: Client ID/Secret not set.")
-        if set_gcal_status_func: set_gcal_status_func(user_id, "error") # Potentially set status to error
-        return HTMLResponse(content=html_error_template.format(details="Server configuration error."), status_code=500)
+        log_error("calendar_tool", fn_name, "Server config error: Client ID/Secret not set for token exchange.")
+        set_gcal_integration_status(user_id_from_state, "error") 
+        return HTMLResponse(content=browser_error_html, status_code=500)
 
     try:
         payload = {
             "code": code, "client_id": CLIENT_ID, "client_secret": GOOGLE_CLIENT_SECRET,
-            "redirect_uri": REDIRECT_URI, "grant_type": "authorization_code"
+            "redirect_uri": current_instance_redirect_uri, 
+            "grant_type": "authorization_code"
         }
-        log_info("calendar_tool", "oauth2callback", f"Exchanging authorization code for tokens for user {user_id}.")
         token_response = requests.post(TOKEN_URL, data=payload)
-        token_response.raise_for_status()
+        token_response.raise_for_status() 
         tokens = token_response.json()
-        log_info("calendar_tool", "oauth2callback", f"Tokens received successfully for {user_id}. Keys: {list(tokens.keys())}")
 
         if 'access_token' not in tokens:
-            log_error("calendar_tool", "oauth2callback", f"Access token *NOT* received for user {user_id}.")
-            if set_gcal_status_func: set_gcal_status_func(user_id, "error")
-            return HTMLResponse(content=html_error_template.format(details="Failed to obtain access token from Google."), status_code=500)
+            log_error("calendar_tool", fn_name, f"Access token NOT received for {user_id_from_state}. Response: {tokens}")
+            set_gcal_integration_status(user_id_from_state, "error") 
+            try: send_chat_message(user_id_from_state, failure_chat_msg)
+            except Exception as send_e: log_error("calendar_tool", fn_name, f"Failed to send chat error to {user_id_from_state}", send_e)
+            return HTMLResponse(content=browser_error_html, status_code=500)
         
-        email = ""
+        user_email_from_google = ""
         id_token = tokens.get("id_token")
         if id_token:
             try:
-                decoded = jwt.decode(id_token, options={"verify_signature": False, "verify_aud": False})
-                email = decoded.get("email", "")
-                log_info("calendar_tool", "oauth2callback", f"Extracted email '{email}' for user {user_id}.")
+                decoded_id_token = jwt.decode(id_token, options={"verify_signature": False, "verify_aud": False})
+                user_email_from_google = decoded_id_token.get("email", "")
             except jwt.exceptions.DecodeError as jwt_e:
-                log_warning("calendar_tool", "oauth2callback", f"Failed decode id_token for {user_id}, proceeding without email.", jwt_e)
-
-        from tools.token_store import save_user_token_encrypted
-        if not save_user_token_encrypted(user_id, tokens):
-            log_error("calendar_tool", "oauth2callback", f"Failed to save token via token_store for {user_id}.")
-            if set_gcal_status_func: set_gcal_status_func(user_id, "error")
-            return HTMLResponse(content=html_error_template.format(details="Failed to save credentials securely."), status_code=500)
-        log_info("calendar_tool", "oauth2callback", f"Tokens stored successfully via token_store for {user_id}.")
-
-        prefs_update = { "email": email, "Calendar_Enabled": True }
-        pref_update_success = False
-        if update_prefs_func: # This will be either config_manager.update_preferences or the direct registry one
-            pref_update_success = update_prefs_func(user_id, prefs_update)
+                log_warning("calendar_tool", fn_name, f"Failed to decode id_token for {user_id_from_state}, no email. Error: {jwt_e}")
         
-        if pref_update_success:
-            log_info("calendar_tool", "oauth2callback", f"Preferences updated (Calendar_Enabled, email) for {user_id}.")
-            if set_gcal_status_func: 
-                set_gcal_status_func(user_id, "connected") # Set status to connected
-            else: 
-                log_error("calendar_tool", "oauth2callback", "config_manager.set_gcal_integration_status not available to set 'connected'.")
-            return HTMLResponse(content=html_success_template, status_code=200)
+        if not save_user_token_encrypted(user_id_from_state, tokens):
+            log_error("calendar_tool", fn_name, f"Failed to save token securely for {user_id_from_state}.")
+            set_gcal_integration_status(user_id_from_state, "error") 
+            try: send_chat_message(user_id_from_state, failure_chat_msg)
+            except Exception as send_e: log_error("calendar_tool", fn_name, f"Failed to send chat error to {user_id_from_state}", send_e)
+            return HTMLResponse(content=browser_error_html, status_code=500)
+
+        prefs_to_update = {"Calendar_Enabled": True, "gcal_integration_status": "connected"}
+        if user_email_from_google: prefs_to_update["email"] = user_email_from_google
+        update_preferences(user_id_from_state, prefs_to_update) 
+        log_info("calendar_tool", fn_name, f"Preferences updated for {user_id_from_state}: GCal connected, email set.")
+
+        gcal_api_instance = GoogleCalendarAPI(user_id_from_state) 
+        if gcal_api_instance.is_active():
+            update_agent_state_key(user_id_from_state, "calendar", gcal_api_instance) 
+            success_chat_msg = _get_message("oauth_success_chat_message", user_lang)
+            try: send_chat_message(user_id_from_state, success_chat_msg)
+            except Exception as send_e: log_error("calendar_tool", fn_name, f"Failed to send success chat msg to {user_id_from_state}", send_e)
+            return HTMLResponse(content=_get_html_response_page("oauth_browser_page_title","oauth_browser_processing_message", user_lang), status_code=200)
         else:
-            log_error("calendar_tool", "oauth2callback", f"Failed to update Calendar_Enabled/email preferences for {user_id} after token save.")
-            if set_gcal_status_func: set_gcal_status_func(user_id, "error") # Still an error in setup
-            return HTMLResponse(content=html_error_template.format(details="Credentials saved, but failed to update user profile. Contact support."), status_code=500)
+            log_error("calendar_tool", fn_name, f"GCal API instance NOT active for {user_id_from_state} post-OAuth.")
+            set_gcal_integration_status(user_id_from_state, "error") 
+            try: send_chat_message(user_id_from_state, failure_chat_msg)
+            except Exception as send_e: log_error("calendar_tool", fn_name, f"Failed to send chat error to {user_id_from_state}", send_e)
+            return HTMLResponse(content=browser_error_html, status_code=500)
 
     except requests.exceptions.HTTPError as http_e:
-        response_text = http_e.response.text; status_code = http_e.response.status_code
-        error_details = f"Error {status_code} during token exchange."
-        try: error_json = http_e.response.json(); error_details = error_json.get('error_description', error_json.get('error', f"HTTP {status_code}"))
-        except ValueError: pass
-        log_error("calendar_tool", "oauth2callback", f"HTTP error {status_code} during token exchange for {user_id}. Details: {error_details}", http_e)
-        if set_gcal_status_func: set_gcal_status_func(user_id, "error")
-        return HTMLResponse(content=html_error_template.format(details=f"Could not get authorization from Google: {error_details}."), status_code=status_code)
+        error_details_google = f"Error {http_e.response.status_code if http_e.response else 'N/A'} from Google during token exchange."
+        log_error("calendar_tool", fn_name, f"HTTP error token exchange for {user_id_from_state}. Details: {error_details_google}", http_e)
+        set_gcal_integration_status(user_id_from_state, "error") 
+        try: send_chat_message(user_id_from_state, failure_chat_msg)
+        except Exception as send_e: log_error("calendar_tool", fn_name, f"Failed to send chat error to {user_id_from_state}", send_e)
+        return HTMLResponse(content=_get_html_response_page("oauth_browser_page_title","oauth_browser_error_message", user_lang, details=error_details_google), status_code=http_e.response.status_code if http_e.response else 500)
     except Exception as e:
-        log_error("calendar_tool", "oauth2callback", f"Generic unexpected error during callback for {user_id}", e)
-        if set_gcal_status_func: set_gcal_status_func(user_id, "error")
-        return HTMLResponse(content=html_error_template.format(details=f"An unexpected server error occurred: {e}."), status_code=500)
+        import traceback 
+        log_error("calendar_tool", fn_name, f"Generic unexpected error during callback for {user_id_from_state}. Trace: {traceback.format_exc()}", e)
+        set_gcal_integration_status(user_id_from_state, "error") 
+        try: send_chat_message(user_id_from_state, failure_chat_msg)
+        except Exception as send_e: log_error("calendar_tool", fn_name, f"Failed to send chat error to {user_id_from_state}", send_e)
+        return HTMLResponse(content=browser_error_html, status_code=500)
 
-# --- END OF FULL tools/calendar_tool.py ---
+log_info("calendar_tool", "module_load", "Finished module load.")
+# --- END OF FULL tools/calendar_tool.py (Corrected SyntaxError) ---

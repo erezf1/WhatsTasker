@@ -8,7 +8,7 @@ from typing import Dict, List # <--- ADD Dict and List HERE (List might be neede
 from tools.logger import log_info, log_error, log_warning
 from users.user_registry import get_registry
 from services.sync_service import get_synced_context_snapshot # To get current items
-from services.agent_state_manager import get_notified_event_ids, add_notified_event_id
+from services.agent_state_manager import get_notified_event_ids, add_notified_event_id, get_agent_state
 from bridge.request_router import send_message 
 from services.task_manager import _parse_duration_to_minutes # Re-use for lead time
 import re # <--- ADDED FOR TITLE PARSING IN NOTIFICATION

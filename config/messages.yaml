@@ -97,4 +97,22 @@ generic_error_message: "Sorry, an unexpected error occurred. Please try again."
 intent_parse_error_message: "Sorry, I had trouble understanding the structure of that request."
 intent_unknown_message: "Sorry, I'm not sure how to help with that. You can ask me to add tasks, list tasks, or change settings."
 intent_clarify_message: "Sorry, I didn't quite understand that. Could you please rephrase?"
-# ... add any other messages you have ...
+
+# --- OAuth Callback Messages (Simplified) ---
+oauth_browser_page_title: "Google Calendar Connection" # Title for the browser tab
+
+oauth_browser_processing_message: # Shown while processing in browser
+  en: "Processing your Google Calendar connection... Please check your chat app for updates shortly."
+  he: "חיבור יומן גוגל שלך מתבצע... אנא בדוק את אפליקציית הצ'אט שלך לעדכונים בקרוב."
+
+oauth_browser_error_message: # Shown in browser on error, directs to chat
+  en: "There was an issue with the Google Calendar connection. Please check your chat app for more details or to try again."
+  he: "אירעה בעיה בחיבור יומן גוגל. אנא בדוק את אפליקציית הצ'אט שלך לפרטים נוספים או כדי לנסות שוב."
+
+oauth_success_chat_message: # Sent to user in chat on success
+  en: "Great! Your Google Calendar has been successfully connected. ✨ You can now schedule Tasks and sync Reminders!"
+  he: "מעולה! יומן גוגל שלך חובר בהצלחה. ✨ עכשיו תוכל לתזמן משימות ולסנכרן תזכורות!"
+
+oauth_failure_chat_message_retry: # Generic failure message sent to user in chat, prompting retry
+  en: "Sorry, there was an issue connecting your Google Calendar at this time. Would you like to try initiating the connection again?"
+  he: "מצטערים, אירעה בעיה בחיבור יומן גוגל שלך כעת. האם תרצה לנסות ליזום את החיבור מחדש?"

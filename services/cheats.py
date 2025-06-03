@@ -1,17 +1,23 @@
-# --- START OF FILE services/cheats.py ---
+# --- START OF FULL services/cheats.py ---
 
 import json
 from typing import List, Dict, Any
 from datetime import datetime, timedelta
-import pytz # Added for timezone formatting in cheats
+import pytz
 
 # Service Imports
-from services import task_query_service
-from services import task_manager
+from services import task_query_service # For context snapshot
+from services import task_manager       # Though not directly used in these modified cheats
 from services import agent_state_manager
 from services import sync_service
-from services import routine_service # Import the module
+from services import routine_service
 from users.user_registry import get_user_preferences
+
+# --- NEW IMPORTS ---
+from agents.orchestrator_agent import handle_user_request as call_orchestrator_agent
+# We need get_context_snapshot to provide the same context the orchestrator would get
+from services.task_query_service import get_context_snapshot
+# --- END NEW IMPORTS ---
 
 try:
     import tools.activity_db as activity_db
@@ -19,14 +25,18 @@ try:
 except ImportError:
     print("[ERROR] [cheats:import] activity_db not found. /clear command may fail.")
     DB_IMPORTED = False
-    class activity_db:
+    class activity_db: # Dummy
         @staticmethod
         def list_tasks_for_user(*args, **kwargs): return []
+        @staticmethod
+        def get_task(*args, **kwargs): return None
+
 
 from tools.logger import log_info, log_error, log_warning
 
-ROUTINE_CONTEXT_HISTORY_DAYS = 1
-ROUTINE_CONTEXT_FUTURE_DAYS = 14
+# These constants are used by the cheat handlers when they call get_synced_context_snapshot
+ROUTINE_CONTEXT_HISTORY_DAYS_CHEAT = 1
+ROUTINE_CONTEXT_FUTURE_DAYS_CHEAT = 14 # Ensure this matches or is wider than routine_service's own context fetch if it differs
 
 # --- Private Handler Functions ---
 
@@ -36,8 +46,8 @@ def _handle_help() -> str:
 /list [status] - List items (status: active*, pending, completed, all)
 /memory - Show summary of current agent in-memory state
 /clear - !! DANGER !! Mark all user's items as cancelled
-/morning - Generate and show today's morning summary data (raw structured output)
-/evening - Generate and show today's evening review data (raw structured output)"""
+/morning - Trigger morning summary generation (LLM creates user message)
+/evening - Trigger evening review generation (LLM creates user message)"""
 
 
 def _handle_list(user_id: str, args: List[str]) -> str:
@@ -49,12 +59,12 @@ def _handle_list(user_id: str, args: List[str]) -> str:
         return f"Invalid status '{status_filter}'. Use one of: {', '.join(allowed_statuses)}"
     try:
         prefs = get_user_preferences(user_id) or {}
-        user_tz_str = prefs.get("TimeZone", "UTC")
+        # user_tz_str = prefs.get("TimeZone", "UTC") # Not directly used in the message here
         list_body, mapping = task_query_service.get_formatted_list(
             user_id=user_id, status_filter=status_filter,
         )
         if list_body:
-            list_intro = f"Items with status '{status_filter}' (Times relative to {user_tz_str}):\n---\n"
+            list_intro = f"Items with status '{status_filter}':\n---\n" # Timezone info removed as it's in item lines
             return list_intro + list_body
         else:
             return f"No items found with status '{status_filter}'."
@@ -64,20 +74,23 @@ def _handle_list(user_id: str, args: List[str]) -> str:
 
 
 def _handle_memory(user_id: str) -> str:
-    # (No changes needed for this function)
     fn_name = "_handle_memory_cheat"
     try:
         agent_state = agent_state_manager.get_agent_state(user_id)
         if agent_state:
-            state_summary = {
-                "user_id": agent_state.get("user_id"),
-                "preferences_keys": list(agent_state.get("preferences", {}).keys()),
-                "history_count": len(agent_state.get("conversation_history", [])),
-                "context_item_count": len(agent_state.get("active_tasks_context", [])),
-                "calendar_object_present": agent_state.get("calendar") is not None,
-                "notified_ids_today_count": len(agent_state.get("notified_event_ids_today", set()))
-            }
-            return f"Agent Memory Summary:\n```json\n{json.dumps(state_summary, indent=2)}\n```"
+            # Make a copy for modification and sensitive data removal if needed
+            state_copy = json.loads(json.dumps(agent_state, default=str)) # Deep copy & ensure serializable
+            if "calendar" in state_copy: # Don't dump full calendar object
+                state_copy["calendar_object_present"] = state_copy["calendar"] is not None
+                del state_copy["calendar"]
+            if "conversation_history" in state_copy:
+                state_copy["conversation_history_count"] = len(state_copy.pop("conversation_history"))
+            if "active_tasks_context" in state_copy:
+                state_copy["active_tasks_context_count"] = len(state_copy.pop("active_tasks_context"))
+            if "notified_event_ids_today" in state_copy:
+                state_copy["notified_event_ids_today_count"] = len(state_copy.pop("notified_event_ids_today"))
+
+            return f"Agent Memory Summary (User: {user_id}):\n```json\n{json.dumps(state_copy, indent=2)}\n```"
         else:
             return "Error: Agent state not found in memory."
     except Exception as e:
@@ -86,7 +99,6 @@ def _handle_memory(user_id: str) -> str:
 
 
 def _handle_clear(user_id: str) -> str:
-    # (No changes needed for this function)
     fn_name = "_handle_clear_cheat"
     log_warning("cheats", fn_name, f"!! Initiating /clear command for user {user_id} !!")
     cancelled_count = 0; failed_count = 0; errors = []
@@ -107,106 +119,112 @@ def _handle_clear(user_id: str) -> str:
         log_error("cheats", fn_name, f"Critical error during /clear for {user_id}", e, user_id=user_id)
         return "A critical error occurred during the clear operation."
 
-
-def _format_routine_data_for_cheat_display(routine_data: Dict | None, routine_type: str, user_tz_str: str) -> str:
-    """Simple formatter for routine data for cheat code display."""
-    if not routine_data:
-        return f"No data generated for {routine_type}."
-
-    user_tz = pytz.timezone(user_tz_str) if user_tz_str else pytz.utc
-    lines = [f"--- {routine_type.replace('_data','').replace('_', ' ').title()} Data (User TZ: {user_tz_str}) ---"]
-
-    if routine_type == "morning_summary_data":
-        for key, item_list in routine_data.items():
-            lines.append(f"\n**{key.replace('_',' ').title()}:**")
-            if not item_list: lines.append("  (None)")
-            for item in item_list:
-                title = item.get('title', 'N/A')
-                time_info = ""
-                if item.get('is_all_day'): time_info = "(All Day)"
-                elif item.get('gcal_start_datetime'):
-                    try:
-                        dt_aware = datetime.fromisoformat(item['gcal_start_datetime'].replace('Z', '+00:00'))
-                        time_info = dt_aware.astimezone(user_tz).strftime('%H:%M')
-                        if item.get('gcal_end_datetime'):
-                             dt_end_aware = datetime.fromisoformat(item['gcal_end_datetime'].replace('Z', '+00:00'))
-                             time_info += dt_end_aware.astimezone(user_tz).strftime('-%H:%M')
-                    except: time_info = "(Time Error)"
-                elif item.get('time'): time_info = item.get('time')
-
-                lines.append(f"  - {title} @ {time_info if time_info else item.get('date','No Date')} [Type: {item.get('type','N/A')}, Status: {item.get('status','N/A')}]")
-    
-    elif routine_type == "evening_review_data":
-        items = routine_data.get("items_for_review", [])
-        if not items: lines.append("  (No items for review)")
-        for i, item in enumerate(items):
-            title = item.get('title', 'N/A')
-            time_info = ""
-            if item.get('is_all_day'): time_info = "(All Day)"
-            elif item.get('gcal_start_datetime'):
-                try:
-                    dt_aware = datetime.fromisoformat(item['gcal_start_datetime'].replace('Z', '+00:00'))
-                    time_info = dt_aware.astimezone(user_tz).strftime('%H:%M')
-                    if item.get('gcal_end_datetime'):
-                         dt_end_aware = datetime.fromisoformat(item['gcal_end_datetime'].replace('Z', '+00:00'))
-                         time_info += dt_end_aware.astimezone(user_tz).strftime('-%H:%M')
-                except: time_info = "(Time Error)"
-            elif item.get('time'): time_info = item.get('time')
-
-            incomplete_flag = " [INCOMPLETE TASK]" if item.get('is_incomplete_task') else ""
-            lines.append(f"  {i+1}. {title} @ {time_info if time_info else item.get('date','No Date')} [Type: {item.get('type','N/A')}, Status: {item.get('status','N/A')}]{incomplete_flag}")
-            
-    return "\n".join(lines)
-
-
+# --- MODIFIED _handle_morning ---
 def _handle_morning(user_id: str) -> str:
     fn_name = "_handle_morning_cheat"
-    log_info("cheats", fn_name, f"Executing /morning cheat for {user_id}")
+    log_info("cheats", fn_name, f"Executing /morning cheat for {user_id} (LLM will generate final message)")
     try:
-        prefs = get_user_preferences(user_id)
-        if not prefs: return "Error: Could not retrieve user preferences."
-        user_tz_str = prefs.get("TimeZone", "UTC")
-        now_local = routine_service._get_local_time(user_tz_str) # Use helper from routine_service
-        
-        context_start_date = (now_local - timedelta(days=ROUTINE_CONTEXT_HISTORY_DAYS)).strftime("%Y-%m-%d")
-        context_end_date = (now_local + timedelta(days=ROUTINE_CONTEXT_FUTURE_DAYS)).strftime("%Y-%m-%d")
+        agent_full_state = agent_state_manager.get_agent_state(user_id)
+        if not agent_full_state: return "Error: Could not retrieve full agent state."
+        prefs = agent_full_state.get("preferences")
+        if not prefs: return "Error: Could not retrieve user preferences from agent state."
 
-        aggregated_context = sync_service.get_synced_context_snapshot(user_id, context_start_date, context_end_date)
+        user_tz_str = prefs.get("TimeZone", "UTC")
+        now_local = routine_service._get_local_time(user_tz_str)
+
+        context_start_date_cheat = (now_local.date() - timedelta(days=ROUTINE_CONTEXT_HISTORY_DAYS_CHEAT)).strftime("%Y-%m-%d")
+        context_end_date_cheat = (now_local.date() + timedelta(days=ROUTINE_CONTEXT_FUTURE_DAYS_CHEAT)).strftime("%Y-%m-%d")
         
-        # Call the new data generation function
-        summary_data = routine_service.generate_morning_summary_data(user_id, aggregated_context)
+        # 1. Get the aggregated context (DB items + GCal items)
+        # This context is what routine_service functions use.
+        aggregated_context_for_routine_fn = sync_service.get_synced_context_snapshot(user_id, context_start_date_cheat, context_end_date_cheat)
         
-        # Format this data for cheat display
-        return _format_routine_data_for_cheat_display(summary_data, "morning_summary_data", user_tz_str)
+        # 2. Generate the raw data payload using the actual routine service function
+        summary_data_payload = routine_service.generate_morning_summary_data(user_id, aggregated_context_for_routine_fn)
+        
+        if not summary_data_payload:
+            return "No data generated by routine_service.generate_morning_summary_data. Orchestrator would not be triggered."
+
+        # 3. Prepare the system trigger message for the Orchestrator
+        system_trigger_input_for_llm = {
+            "trigger_type": "morning_summary_data", # This matches what scheduler_service would send
+            "payload": summary_data_payload
+        }
+        message_for_orchestrator_llm = json.dumps(system_trigger_input_for_llm)
+
+        # 4. Get the current full context for the Orchestrator agent
+        #    (as if the Orchestrator was being called normally)
+        #    The history_weeks and future_weeks here define the Orchestrator's general view,
+        #    which might be different from the routine's specific data payload context window.
+        #    Let's use the Orchestrator's default context window.
+        wt_items_ctx_for_orch, gcal_events_ctx_for_orch = get_context_snapshot(user_id) # Uses default history/future weeks
+        
+        # For a cheat code triggering a routine, the history fed to orchestrator is usually minimal/empty,
+        # as it's a system-initiated event, not a direct continuation of user chat.
+        history_for_orchestrator: List[Dict[str, Any]] = [] 
+
+        # 5. Call the Orchestrator Agent
+        log_info("cheats", fn_name, f"Calling orchestrator agent for user {user_id} with morning summary payload.")
+        user_facing_message = call_orchestrator_agent(
+            user_id=user_id,
+            message=message_for_orchestrator_llm, # The system trigger JSON
+            history=history_for_orchestrator,
+            preferences=prefs,
+            task_context=wt_items_ctx_for_orch,
+            calendar_context=gcal_events_ctx_for_orch
+        )
+        return f"--- Morning Summary (as user would see it) ---\n{user_facing_message}"
 
     except Exception as e:
-        log_error("cheats", fn_name, f"Error generating morning summary data via cheat for {user_id}", e, user_id=user_id)
-        return "An error occurred while generating the morning summary data."
+        log_error("cheats", fn_name, f"Error generating morning summary via cheat (LLM path) for {user_id}", e, user_id=user_id)
+        return f"An error occurred while generating the morning summary via LLM: {str(e)}"
 
-
+# --- MODIFIED _handle_evening ---
 def _handle_evening(user_id: str) -> str:
     fn_name = "_handle_evening_cheat"
-    log_info("cheats", fn_name, f"Executing /evening cheat for {user_id}")
+    log_info("cheats", fn_name, f"Executing /evening cheat for {user_id} (LLM will generate final message)")
     try:
-        prefs = get_user_preferences(user_id)
-        if not prefs: return "Error: Could not retrieve user preferences."
-        user_tz_str = prefs.get("TimeZone", "UTC")
-        now_local = routine_service._get_local_time(user_tz_str) # Use helper from routine_service
+        agent_full_state = agent_state_manager.get_agent_state(user_id)
+        if not agent_full_state: return "Error: Could not retrieve full agent state."
+        prefs = agent_full_state.get("preferences")
+        if not prefs: return "Error: Could not retrieve user preferences from agent state."
 
-        context_start_date = (now_local - timedelta(days=ROUTINE_CONTEXT_HISTORY_DAYS)).strftime("%Y-%m-%d")
-        context_end_date = (now_local + timedelta(days=ROUTINE_CONTEXT_FUTURE_DAYS)).strftime("%Y-%m-%d")
+        user_tz_str = prefs.get("TimeZone", "UTC")
+        now_local = routine_service._get_local_time(user_tz_str)
+
+        context_start_date_cheat = (now_local.date() - timedelta(days=ROUTINE_CONTEXT_HISTORY_DAYS_CHEAT)).strftime("%Y-%m-%d")
+        context_end_date_cheat = (now_local.date() + timedelta(days=ROUTINE_CONTEXT_FUTURE_DAYS_CHEAT)).strftime("%Y-%m-%d")
+
+        aggregated_context_for_routine_fn = sync_service.get_synced_context_snapshot(user_id, context_start_date_cheat, context_end_date_cheat)
         
-        aggregated_context = sync_service.get_synced_context_snapshot(user_id, context_start_date, context_end_date)
-        
-        # Call the new data generation function
-        review_data = routine_service.generate_evening_review_data(user_id, aggregated_context)
-        
-        # Format this data for cheat display
-        return _format_routine_data_for_cheat_display(review_data, "evening_review_data", user_tz_str)
+        review_data_payload = routine_service.generate_evening_review_data(user_id, aggregated_context_for_routine_fn)
+
+        if not review_data_payload:
+            return "No data generated by routine_service.generate_evening_review_data. Orchestrator would not be triggered."
+
+        system_trigger_input_for_llm = {
+            "trigger_type": "evening_review_data",
+            "payload": review_data_payload
+        }
+        message_for_orchestrator_llm = json.dumps(system_trigger_input_for_llm)
+
+        wt_items_ctx_for_orch, gcal_events_ctx_for_orch = get_context_snapshot(user_id)
+        history_for_orchestrator: List[Dict[str, Any]] = []
+
+        log_info("cheats", fn_name, f"Calling orchestrator agent for user {user_id} with evening review payload.")
+        user_facing_message = call_orchestrator_agent(
+            user_id=user_id,
+            message=message_for_orchestrator_llm,
+            history=history_for_orchestrator,
+            preferences=prefs,
+            task_context=wt_items_ctx_for_orch,
+            calendar_context=gcal_events_ctx_for_orch
+        )
+        return f"--- Evening Review (as user would see it) ---\n{user_facing_message}"
 
     except Exception as e:
-        log_error("cheats", fn_name, f"Error generating evening review data via cheat for {user_id}", e, user_id=user_id)
-        return "An error occurred while generating the evening review data."
+        log_error("cheats", fn_name, f"Error generating evening review via cheat (LLM path) for {user_id}", e, user_id=user_id)
+        return f"An error occurred while generating the evening review via LLM: {str(e)}"
 
 
 # --- Main Dispatcher ---
@@ -220,4 +238,4 @@ def handle_cheat_command(user_id: str, command: str, args: List[str]) -> str:
     elif command == "/evening": return _handle_evening(user_id)
     else: return f"Unknown command: '{command}'. Try /help."
 
-# --- END OF FILE services/cheats.py ---
+# --- END OF FULL services/cheats.py ---

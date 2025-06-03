@@ -156,9 +156,11 @@ def create_item(user_id: str, item_params: Dict[str, Any]) -> Dict | None:
             else: # No time, or no date, or no GCal API
                 item_data_to_save["event_id"] = f"local_reminder_{uuid.uuid4()}"
                 if has_time and not item_data_to_save.get("date"):
-                    log_info("task_manager", fn_name, f"Reminder for {user_id} has time but no date. Not syncing to GCal.", user_id=user_id)
+                    log_info("task_manager", fn_name, f"Reminder for user {user_id} has time but no date. Not syncing to GCal.") # Corrected log_info
                 elif has_time and (calendar_api is None or not calendar_api.is_active()):
-                    log_info("task_manager", fn_name, f"Timed reminder for {user_id} will not be synced to GCal (API inactive/unavailable).", user_id=user_id)
+                    # --- THIS IS THE CORRECTED LINE ---
+                    log_info("task_manager", fn_name, f"Timed reminder for user {user_id} will not be synced to GCal (API inactive/unavailable).")
+                    # --- END CORRECTION ---
         
         elif item_type == "task":
             item_data_to_save["estimated_duration"] = item_params.get("estimated_duration")
@@ -192,7 +194,6 @@ def create_item(user_id: str, item_params: Dict[str, Any]) -> Dict | None:
              try: calendar_api.delete_event(gcal_event_id_for_reminder)
              except Exception as rb_err_gen: log_error("task_manager", fn_name, f"GCal reminder rollback on general error failed for {gcal_event_id_for_reminder}", rb_err_gen, user_id=user_id)
         return None
-
 def update_item_details(user_id: str, item_id: str, updates: Dict[str, Any]) -> Dict | None:
     fn_name = "update_item_details"
     if not DB_IMPORTED or activity_db_module_ref is None : return None

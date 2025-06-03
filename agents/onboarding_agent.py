@@ -19,6 +19,7 @@ from .tool_definitions import (
     TOOL_PARAM_MODELS,
     UpdateUserPreferencesParams,
     InitiateCalendarConnectionParams,
+    SendOnboardingCompletionMessageParams
 )
 
 # Utilities
@@ -206,7 +207,7 @@ def handle_onboarding_request(
 
     # --- Interaction Loop (Two-Step LLM Call) ---
     try:
-        log_info("onboarding_agent", fn_name, f"Invoking Onboarding LLM for {user_id} (Initial Turn)...")
+        log_info("onboarding_agent", fn_name, f"Invoking Onboarding LLM for {user_id} (Initial Turn).\n {messages}  \n .{final_tools_for_llm}.")
         response = client.chat.completions.create(
             model="gpt-4o", 
             messages=messages, # type: ignore
